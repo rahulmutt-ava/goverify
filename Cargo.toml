@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+prost = "0.13"
+prost-build = "0.13"
+clap = { version = "4", features = ["derive"] }
+blake3 = "1"
+tempfile = "3"
+goverify-extract = { path = "crates/goverify-extract" }

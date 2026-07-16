@@ -1,0 +1,16 @@
+[package]
+name = "goverify-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "goverify"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+goverify-extract.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Secret scan of staged changes; see docs/threat-model.md (repo hygiene).
+set -e
+gitleaks protect --staged --redact

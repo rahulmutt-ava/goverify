@@ -1,0 +1,54 @@
+[tools]
+go = "1.25.10"
+rust = "1.97.1"
+protoc = "35.1"
+buf = "1.71.0"
+gitleaks = "8.30.1"
+"cargo:cargo-audit" = "0.22.2"
+"cargo:cargo-fuzz" = "0.13.2"
+"go:google.golang.org/protobuf/cmd/protoc-gen-go" = "1.36.11"
+
+[tasks.build]
+description = "build all workspace crates"
+run = "cargo build --workspace"
+
+[tasks.test]
+description = "unit + integration tests"
+run = "cargo test --workspace"
+
+[tasks.lint]
+description = "blocking-tier static checks"
+run = [
+  "cargo fmt --all --check",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "buf lint",
+  "sh -c 'cd extractor && gofmt -l . && go vet ./...'",
+]
+
+[tasks.fmt]
+description = "format Rust and Go sources"
+run = ["cargo fmt --all", "sh -c 'cd extractor && gofmt -w .'"]
+
+[tasks.corpus]
+description = "corpus + determinism suite (full extractor pipeline)"
+run = "cargo test -p goverify-extract --test extract_integration"
+
+[tasks.bench]
+description = "benchmark suite (populated in phase 5)"
+run = "cargo bench --workspace"
+
+[tasks.audit]
+description = "dependency CVE scan (Cargo.lock)"
+run = "cargo audit"
+
+[tasks.secrets]
+description = "secret scan of the repo"
+run = "gitleaks detect --redact"
+
+[tasks.proto-gen]
+description = "regenerate Go protobuf bindings (commit the output)"
+run = "protoc --go_out=extractor --go_opt=module=goverify.dev/extractor proto/gvir/v1/gvir.proto"
+
+[tasks.setup]
+description = "one-time dev setup: git hooks"
+run = "git config core.hooksPath .githooks"

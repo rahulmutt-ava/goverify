@@ -26,12 +26,14 @@ jobs:
       - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: mise run lint
+      # `test` runs the full workspace, which already includes the corpus
+      # + determinism integration test — no separate `mise run corpus` step.
       - run: mise run test
-      - run: mise run corpus
 
   secrets:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Headroom for cold mise tool caches (cargo-audit builds from source).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -41,7 +43,8 @@ jobs:
 
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Headroom for cold mise tool caches (cargo-audit builds from source).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2

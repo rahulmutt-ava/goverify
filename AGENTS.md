@@ -14,7 +14,8 @@ Run `mise tasks` to list them. The ones you'll need: `build`, `test`,
 `lint` (blocking-tier static checks), `fmt`, `corpus` (full
 extractor→.gvir pipeline + determinism suite), `audit`, `secrets`,
 `proto-gen` (regenerate Go protobuf bindings — commit the output).
-CI runs exactly `lint` + `test` + `corpus`; run those before pushing.
+Blocking CI runs `lint` + `test` (which includes the corpus determinism
+suite) plus `secrets` + `audit`; run those before pushing.
 
 ## Rules that will bite you
 

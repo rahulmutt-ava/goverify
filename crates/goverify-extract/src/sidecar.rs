@@ -45,10 +45,16 @@ impl Sidecar {
         let bin = build_dir.join(format!("goverify-extractor-{}", &hash[..16]));
         if !bin.exists() {
             fs::create_dir_all(build_dir)?;
-            // Build to a temp name, then rename: concurrent builders
-            // race benignly to an identical artifact.
+            // Build to a temp name, then rename: concurrent builders race
+            // benignly to an identical artifact, across both processes AND
+            // threads. std::process::id() alone isn't enough — cargo test
+            // runs multiple Sidecar::build calls as threads within one
+            // process, so they'd share a pid and collide on the same tmp
+            // path; add a per-thread/per-call counter to disambiguate.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let tmp = build_dir.join(format!(
-                "goverify-extractor-{}.tmp{}",
+                "goverify-extractor-{}.tmp{}.{n}",
                 &hash[..16],
                 std::process::id()
             ));

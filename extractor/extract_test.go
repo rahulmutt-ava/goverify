@@ -96,3 +96,83 @@ func keys[V any](m map[string]*V) []string {
 	}
 	return out
 }
+
+func findFunc(t *testing.T, p *gvirpb.Package, id string) *gvirpb.Function {
+	t.Helper()
+	for _, f := range p.GetFunctions() {
+		if f.GetId() == id {
+			return f
+		}
+	}
+	ids := make([]string, 0, len(p.GetFunctions()))
+	for _, f := range p.GetFunctions() {
+		ids = append(ids, f.GetId())
+	}
+	t.Fatalf("function %q not found; have %v", id, ids)
+	return nil
+}
+
+func TestExtractHelloFunctions(t *testing.T) {
+	pkgs := extractCorpus(t, helloDir, false)
+	p := pkgs["example.com/hello"]
+
+	add := findFunc(t, p, "example.com/hello.Add")
+	if len(add.GetParams()) != 2 || add.GetParams()[0].GetId() != 1 || add.GetParams()[1].GetId() != 2 {
+		t.Errorf("Add params = %v, want ids 1,2", add.GetParams())
+	}
+	if len(add.GetBlocks()) == 0 {
+		t.Error("Add has no basic blocks")
+	}
+
+	findFunc(t, p, "(*example.com/hello.Counter).Inc")
+	findFunc(t, p, "example.com/hello.Spawn$1") // the goroutine closure
+
+	// Every instruction register/operand id must resolve to a param,
+	// aux value, or another instruction's register.
+	for _, fn := range p.GetFunctions() {
+		defined := map[uint32]bool{}
+		for _, pa := range fn.GetParams() {
+			defined[pa.GetId()] = true
+		}
+		for _, a := range fn.GetAux() {
+			defined[a.GetId()] = true
+		}
+		for _, b := range fn.GetBlocks() {
+			for _, ins := range b.GetInstrs() {
+				if r := ins.GetRegister(); r != 0 {
+					defined[r] = true
+				}
+			}
+		}
+		for _, b := range fn.GetBlocks() {
+			for _, ins := range b.GetInstrs() {
+				for _, op := range ins.GetOperands() {
+					if op != 0 && !defined[op] {
+						t.Errorf("%s: %s references undefined value id %d", fn.GetId(), ins.GetKind(), op)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestSpawnHasGoAndSendInstructions(t *testing.T) {
+	pkgs := extractCorpus(t, helloDir, false)
+	p := pkgs["example.com/hello"]
+
+	kinds := func(fn *gvirpb.Function) map[string]bool {
+		out := map[string]bool{}
+		for _, b := range fn.GetBlocks() {
+			for _, ins := range b.GetInstrs() {
+				out[ins.GetKind()] = true
+			}
+		}
+		return out
+	}
+	if !kinds(findFunc(t, p, "example.com/hello.Spawn"))["Go"] {
+		t.Error("Spawn: no Go instruction")
+	}
+	if !kinds(findFunc(t, p, "example.com/hello.Spawn$1"))["Send"] {
+		t.Error("Spawn$1: no Send instruction")
+	}
+}

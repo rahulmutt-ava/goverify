@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"go/token"
 	"go/types"
 	"os"
@@ -46,8 +47,10 @@ func extractPackage(fset *token.FileSet, p *packages.Package, sp *ssa.Package, f
 		},
 	}
 	e.emitFiles()
-	_ = sp
-	_ = fns // Task 4: function emission; Task 5: method sets, pragmas, canonicalize
+	for _, fn := range fns {
+		e.out.Functions = append(e.out.Functions, e.emitFunction(fn))
+	}
+	_ = sp // Task 5: method sets, pragmas, canonicalize
 	return e.out
 }
 
@@ -110,5 +113,111 @@ func (e *emitter) position(pos token.Pos) *gvirpb.Position {
 		File: e.fileIDs[e.relPath(p.Filename)], // 0 if not a package file
 		Line: uint32(p.Line),
 		Col:  uint32(p.Column),
+	}
+}
+
+// emitFunction serializes one ssa.Function using the value-numbering
+// scheme documented in gvir.proto: params, free vars, value-producing
+// instructions (two passes so phi nodes can reference later blocks),
+// then aux values at first operand encounter.
+func (e *emitter) emitFunction(fn *ssa.Function) *gvirpb.Function {
+	f := &gvirpb.Function{
+		Id:   fn.String(),
+		Name: fn.Name(),
+		Type: e.typeID(fn.Signature),
+		Pos:  e.position(fn.Pos()),
+	}
+	ids := map[ssa.Value]uint32{}
+	next := uint32(1)
+	assign := func(v ssa.Value) uint32 {
+		id := next
+		ids[v] = id
+		next++
+		return id
+	}
+	for _, p := range fn.Params {
+		f.Params = append(f.Params, &gvirpb.Param{
+			Id:   assign(p),
+			Name: p.Name(),
+			Type: e.typeID(p.Type()),
+		})
+	}
+	for _, fv := range fn.FreeVars {
+		f.Aux = append(f.Aux, &gvirpb.AuxValue{
+			Id:   assign(fv),
+			Kind: "FreeVar",
+			Repr: fv.Name(),
+			Type: e.typeID(fv.Type()),
+		})
+	}
+	// Pass 1: number every value-producing instruction so operands can
+	// reference values defined later (phi edges).
+	for _, b := range fn.Blocks {
+		for _, ins := range b.Instrs {
+			if v, ok := ins.(ssa.Value); ok {
+				assign(v)
+			}
+		}
+	}
+	// Pass 2: emit; operands not yet numbered (consts, globals,
+	// functions, builtins) become AuxValues at first encounter.
+	operandID := func(v ssa.Value) uint32 {
+		if id, ok := ids[v]; ok {
+			return id
+		}
+		id := assign(v)
+		f.Aux = append(f.Aux, &gvirpb.AuxValue{
+			Id:   id,
+			Kind: auxKind(v),
+			Repr: v.String(),
+			Type: e.typeID(v.Type()),
+		})
+		return id
+	}
+	var rands []*ssa.Value
+	for _, b := range fn.Blocks {
+		bb := &gvirpb.BasicBlock{Index: uint32(b.Index)}
+		for _, s := range b.Succs {
+			bb.Succs = append(bb.Succs, uint32(s.Index))
+		}
+		for _, ins := range b.Instrs {
+			pi := &gvirpb.Instruction{
+				Kind:   strings.TrimPrefix(fmt.Sprintf("%T", ins), "*ssa."),
+				Pos:    e.position(ins.Pos()),
+				Detail: ins.String(),
+			}
+			if v, ok := ins.(ssa.Value); ok {
+				pi.Register = ids[v]
+				pi.Type = e.typeID(v.Type())
+			}
+			rands = ins.Operands(rands[:0])
+			for _, vp := range rands {
+				if vp == nil || *vp == nil {
+					pi.Operands = append(pi.Operands, 0)
+					continue
+				}
+				pi.Operands = append(pi.Operands, operandID(*vp))
+			}
+			bb.Instrs = append(bb.Instrs, pi)
+		}
+		f.Blocks = append(f.Blocks, bb)
+	}
+	return f
+}
+
+func auxKind(v ssa.Value) string {
+	switch v.(type) {
+	case *ssa.Const:
+		return "Const"
+	case *ssa.Global:
+		return "Global"
+	case *ssa.Function:
+		return "Function"
+	case *ssa.Builtin:
+		return "Builtin"
+	case *ssa.FreeVar:
+		return "FreeVar"
+	default:
+		return "Value"
 	}
 }

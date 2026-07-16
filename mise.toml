@@ -52,3 +52,8 @@ run = "protoc --go_out=extractor --go_opt=module=goverify.dev/extractor proto/gv
 [tasks.setup]
 description = "one-time dev setup: git hooks"
 run = "git config core.hooksPath .githooks"
+
+[tasks.fuzz]
+description = "fuzz smoke run (nightly tier; needs rustup nightly)"
+run = "cargo +nightly fuzz run gvir_decode -- -max_total_time=60"
+dir = "{{cwd}}"

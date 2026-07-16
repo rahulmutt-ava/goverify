@@ -1,0 +1,23 @@
+[package]
+name = "goverify-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+prost = "0.13"
+goverify-extract = { path = "../crates/goverify-extract" }
+
+[[bin]]
+name = "gvir_decode"
+path = "fuzz_targets/gvir_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

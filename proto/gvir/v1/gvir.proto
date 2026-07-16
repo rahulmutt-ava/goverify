@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package gvir.v1;
+
+option go_package = "goverify.dev/extractor/gvirpb";
+
+// One .gvir artifact = one Go package, fully canonicalized: every
+// repeated field is sorted as documented below, all IDs are stable
+// functions of source content, and serialization is deterministic.
+// Invariant (spec §3): identical source bytes MUST produce
+// byte-identical .gvir files. No timestamps, no absolute paths.
+
+message Package {
+  string schema_version = 1;     // gvir schema version; loader rejects mismatches
+  string go_version = 2;         // Go toolchain, e.g. "go1.25.5"
+  string extractor_version = 3;  // extractor's own version constant
+  string import_path = 4;
+  repeated File files = 5;             // sorted by path
+  repeated Type types = 6;             // by id; ids are first-encounter order
+  repeated Function functions = 7;     // sorted by id
+  repeated MethodSet method_sets = 8;  // sorted by type id
+  repeated Pragma pragmas = 9;         // sorted by (decl_id, text)
+}
+
+message File {
+  string path = 1;    // module-root-relative or $GOROOT/…-prefixed; never absolute
+  string sha256 = 2;  // hex digest of the source bytes; "" if unreadable
+}
+
+message Type {
+  uint32 id = 1;    // 1-based
+  string repr = 2;  // types.TypeString with full-package-path qualifier
+}
+
+message Position {
+  uint32 file = 1;  // 1-based index into Package.files; 0 = unknown file
+  uint32 line = 2;
+  uint32 col = 3;
+}
+
+// Function value numbering: ids are assigned 1,2,3,… in this order:
+// params (declaration order), free vars, then every value-producing
+// instruction walking blocks by index; any operand not yet numbered
+// (const/global/function/builtin) is assigned the next id as an
+// AuxValue at first encounter. The walk is deterministic, so ids are.
+message Function {
+  string id = 1;    // ssa.Function.String(), e.g. "(*example.com/m.T).Close"
+  string name = 2;
+  uint32 type = 3;  // signature type id
+  repeated Param params = 4;       // declaration order
+  repeated AuxValue aux = 5;       // ascending id
+  repeated BasicBlock blocks = 6;  // by block index; empty for bodyless funcs
+  Position pos = 7;
+}
+
+message Param {
+  uint32 id = 1;
+  string name = 2;
+  uint32 type = 3;
+}
+
+// Non-instruction values an instruction can reference.
+message AuxValue {
+  uint32 id = 1;
+  string kind = 2;  // "Const" | "Global" | "Function" | "Builtin" | "FreeVar" | "Value"
+  string repr = 3;  // the value's canonical ssa String()
+  uint32 type = 4;
+}
+
+message BasicBlock {
+  uint32 index = 1;
+  repeated Instruction instrs = 2;  // program order
+  repeated uint32 succs = 3;        // successor block indexes
+}
+
+message Instruction {
+  string kind = 1;               // ssa type name: "Call", "Store", "Phi", …
+  uint32 register = 2;           // value id this instruction defines; 0 if none
+  uint32 type = 3;               // result type id; 0 if none
+  repeated uint32 operands = 4;  // value ids; 0 for nil operand slots
+  Position pos = 5;
+  string detail = 6;             // the instruction's canonical ssa String()
+}
+
+message MethodSet {
+  uint32 type = 1;              // type id of the named type (interfaces: T itself; otherwise *T)
+  repeated string methods = 2;  // fully-qualified method names, in types.NewMethodSet order
+}
+
+message Pragma {
+  string decl_id = 1;  // types.Func.FullName() or "pkgpath.Name" of the decl
+  string text = 2;     // full comment line including "//goverify:"
+  Position pos = 3;
+}

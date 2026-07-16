@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A built extractor binary, addressed by the content hash of its
-/// sources: the same sources always reuse the same binary, and any
-/// source change forces a rebuild (spec §3: the extractor is itself
-/// content-hashed).
+/// sources folded with the Go toolchain version: the same sources
+/// built by the same toolchain always reuse the same binary, and any
+/// source change or toolchain upgrade forces a rebuild (spec §3: the
+/// extraction cache key is `hash(source files ⊕ Go version ⊕ extractor
+/// version)`).
 pub struct Sidecar {
     bin: PathBuf,
 }
@@ -41,7 +43,8 @@ impl From<io::Error> for SidecarError {
 
 impl Sidecar {
     pub fn build(extractor_src: &Path, build_dir: &Path) -> Result<Sidecar, SidecarError> {
-        let hash = hash_dir(extractor_src)?;
+        let go_version = go_version()?;
+        let hash = cache_key(extractor_src, &go_version)?;
         let bin = build_dir.join(format!("goverify-extractor-{}", &hash[..16]));
         if !bin.exists() {
             fs::create_dir_all(build_dir)?;
@@ -109,13 +112,44 @@ impl Sidecar {
     }
 }
 
-/// Content hash of a source directory: blake3 over (relative path,
-/// length, bytes) of every non-hidden file, in sorted path order.
-fn hash_dir(dir: &Path) -> Result<String, SidecarError> {
+/// Resolves the Go toolchain version via `go env GOVERSION` (output like
+/// `go1.25.1`), trimmed of surrounding whitespace. Called at most once
+/// per `Sidecar::build`. A failure to spawn `go` surfaces as
+/// `SidecarError::Io` via `?`; a non-zero exit or empty output is
+/// reported as `SidecarError::GoBuild`, the same error class used when
+/// `go` is missing or broken elsewhere in this file.
+fn go_version() -> Result<String, SidecarError> {
+    let output = Command::new("go").args(["env", "GOVERSION"]).output()?;
+    if !output.status.success() {
+        return Err(SidecarError::GoBuild(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        return Err(SidecarError::GoBuild(
+            "`go env GOVERSION` printed no output".to_string(),
+        ));
+    }
+    Ok(version)
+}
+
+/// The sidecar binary's cache key: blake3 over the Go toolchain version
+/// (domain-separated from the file entries below by a distinct tag and
+/// its own length prefix, so it can never collide with file content or
+/// path bytes) followed by (relative path, length, bytes) of every
+/// non-hidden file in `dir`, in sorted path order.
+///
+/// Takes `go_version` as a parameter rather than resolving it internally
+/// so the hashing logic stays unit-testable without invoking `go`.
+fn cache_key(dir: &Path, go_version: &str) -> Result<String, SidecarError> {
     let mut files = Vec::new();
     collect_files(dir, dir, &mut files)?;
     files.sort();
     let mut hasher = blake3::Hasher::new();
+    hasher.update(b"goverify-sidecar-cache-key/go-version\0");
+    hasher.update(&(go_version.len() as u64).to_le_bytes());
+    hasher.update(go_version.as_bytes());
     for rel in &files {
         hasher.update(rel.as_bytes());
         let bytes = fs::read(dir.join(rel))?;
@@ -151,31 +185,59 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> io::Result<(
 mod tests {
     use super::*;
 
+    const GO_VERSION: &str = "go1.25.1";
+
     #[test]
-    fn hash_dir_is_stable_and_content_sensitive() {
+    fn cache_key_is_stable_and_content_sensitive() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.go"), "package a\n").unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/b.go"), "package sub\n").unwrap();
 
-        let h1 = hash_dir(dir.path()).unwrap();
-        let h2 = hash_dir(dir.path()).unwrap();
-        assert_eq!(h1, h2, "hash_dir must be deterministic");
+        let h1 = cache_key(dir.path(), GO_VERSION).unwrap();
+        let h2 = cache_key(dir.path(), GO_VERSION).unwrap();
+        assert_eq!(h1, h2, "cache_key must be deterministic");
 
         std::fs::write(dir.path().join("a.go"), "package a // changed\n").unwrap();
         assert_ne!(
             h1,
-            hash_dir(dir.path()).unwrap(),
+            cache_key(dir.path(), GO_VERSION).unwrap(),
             "content change must change the hash"
         );
     }
 
     #[test]
-    fn hash_dir_ignores_hidden_files() {
+    fn cache_key_ignores_hidden_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.go"), "package a\n").unwrap();
-        let h1 = hash_dir(dir.path()).unwrap();
+        let h1 = cache_key(dir.path(), GO_VERSION).unwrap();
         std::fs::write(dir.path().join(".DS_Store"), "junk").unwrap();
-        assert_eq!(h1, hash_dir(dir.path()).unwrap());
+        assert_eq!(h1, cache_key(dir.path(), GO_VERSION).unwrap());
+    }
+
+    #[test]
+    fn cache_key_is_stable_across_calls_with_same_go_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.go"), "package a\n").unwrap();
+
+        let h1 = cache_key(dir.path(), GO_VERSION).unwrap();
+        let h2 = cache_key(dir.path(), GO_VERSION).unwrap();
+        assert_eq!(
+            h1, h2,
+            "same directory and same Go version must produce identical keys"
+        );
+    }
+
+    #[test]
+    fn cache_key_changes_with_go_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.go"), "package a\n").unwrap();
+
+        let h1 = cache_key(dir.path(), "go1.25.1").unwrap();
+        let h2 = cache_key(dir.path(), "go1.26.0").unwrap();
+        assert_ne!(
+            h1, h2,
+            "same directory with a different Go version must produce a different key"
+        );
     }
 }

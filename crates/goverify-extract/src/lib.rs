@@ -7,5 +7,7 @@ pub mod gvir {
 }
 
 mod load;
+mod sidecar;
 
 pub use load::{load_package, LoadError, SCHEMA_VERSION};
+pub use sidecar::{Sidecar, SidecarError};

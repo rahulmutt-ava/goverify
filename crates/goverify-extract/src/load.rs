@@ -9,7 +9,10 @@ pub const SCHEMA_VERSION: &str = "1";
 pub enum LoadError {
     Io(std::io::Error),
     Decode(prost::DecodeError),
-    SchemaVersion { found: String, expected: &'static str },
+    SchemaVersion {
+        found: String,
+        expected: &'static str,
+    },
 }
 
 impl fmt::Display for LoadError {

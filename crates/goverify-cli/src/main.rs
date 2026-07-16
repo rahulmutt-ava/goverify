@@ -10,7 +10,11 @@ use clap::{Parser, Subcommand};
 use goverify_extract::Sidecar;
 
 #[derive(Parser)]
-#[command(name = "goverify", version, about = "SMT-backed static analyzer for Go")]
+#[command(
+    name = "goverify",
+    version,
+    about = "SMT-backed static analyzer for Go"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -50,7 +54,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for f in &files {
                 println!("{}", f.display());
             }
-            eprintln!("goverify: extracted {} package(s) to {}", files.len(), out.display());
+            eprintln!(
+                "goverify: extracted {} package(s) to {}",
+                files.len(),
+                out.display()
+            );
             Ok(())
         }
     }

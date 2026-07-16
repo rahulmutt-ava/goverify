@@ -28,7 +28,10 @@ fn extract_writes_gvir_and_exits_zero() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("example.com%2Fhello.gvir"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("example.com%2Fhello.gvir"),
+        "stdout: {stdout}"
+    );
     assert!(out.path().join("example.com%2Fhello.gvir").exists());
 }
 
@@ -43,7 +46,11 @@ fn extract_outside_a_module_exits_two() {
         .arg(out.path())
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2), "analyzer error must exit 2 (spec §10)");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "analyzer error must exit 2 (spec §10)"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).starts_with("goverify:"),
         "errors go to stderr with the goverify: prefix"

@@ -9,5 +9,5 @@ pub mod gvir {
 mod load;
 mod sidecar;
 
-pub use load::{load_package, LoadError, SCHEMA_VERSION};
+pub use load::{LoadError, SCHEMA_VERSION, load_package};
 pub use sidecar::{Sidecar, SidecarError};

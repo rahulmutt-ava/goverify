@@ -23,7 +23,9 @@ impl fmt::Display for SidecarError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SidecarError::Io(e) => write!(f, "sidecar io: {e}"),
-            SidecarError::GoBuild(stderr) => write!(f, "building extractor (is `go` installed?): {stderr}"),
+            SidecarError::GoBuild(stderr) => {
+                write!(f, "building extractor (is `go` installed?): {stderr}")
+            }
             SidecarError::Extractor(stderr) => write!(f, "extractor failed: {stderr}"),
         }
     }
@@ -149,7 +151,11 @@ mod tests {
         assert_eq!(h1, h2, "hash_dir must be deterministic");
 
         std::fs::write(dir.path().join("a.go"), "package a // changed\n").unwrap();
-        assert_ne!(h1, hash_dir(dir.path()).unwrap(), "content change must change the hash");
+        assert_ne!(
+            h1,
+            hash_dir(dir.path()).unwrap(),
+            "content change must change the hash"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use goverify_extract::{load_package, Sidecar};
+use goverify_extract::{Sidecar, load_package};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -23,14 +23,20 @@ fn sidecar() -> Sidecar {
 fn extracts_and_loads_hello_module() {
     let out = tempfile::tempdir().unwrap();
     let files = sidecar()
-        .extract(&repo_root().join("testdata/corpus/hello"), &["./..."], out.path())
+        .extract(
+            &repo_root().join("testdata/corpus/hello"),
+            &["./..."],
+            out.path(),
+        )
         .expect("Sidecar::extract");
     assert_eq!(files.len(), 1, "hello has no deps: want exactly one .gvir");
 
     let pkg = load_package(&files[0]).expect("load_package");
     assert_eq!(pkg.import_path, "example.com/hello");
     assert!(
-        pkg.functions.iter().any(|f| f.id == "example.com/hello.Add"),
+        pkg.functions
+            .iter()
+            .any(|f| f.id == "example.com/hello.Add"),
         "missing example.com/hello.Add in {:?}",
         pkg.functions.iter().map(|f| &f.id).collect::<Vec<_>>()
     );
@@ -72,23 +78,40 @@ fn extraction_is_byte_identical_across_runs() {
 fn dependency_traversal_extracts_the_import_closure() {
     let out = tempfile::tempdir().unwrap();
     let files = sidecar()
-        .extract(&repo_root().join("testdata/corpus/withdeps"), &["./..."], out.path())
+        .extract(
+            &repo_root().join("testdata/corpus/withdeps"),
+            &["./..."],
+            out.path(),
+        )
         .expect("Sidecar::extract");
 
     let names: Vec<String> = files
         .iter()
         .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    assert!(names.contains(&"example.com%2Fwithdeps.gvir".to_string()), "{names:?}");
-    assert!(names.contains(&"strings.gvir".to_string()), "stdlib dep missing: {names:?}");
-    assert!(files.len() > 2, "expected the transitive closure, got {names:?}");
+    assert!(
+        names.contains(&"example.com%2Fwithdeps.gvir".to_string()),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&"strings.gvir".to_string()),
+        "stdlib dep missing: {names:?}"
+    );
+    assert!(
+        files.len() > 2,
+        "expected the transitive closure, got {names:?}"
+    );
 }
 
 #[test]
 fn gvir_contains_no_absolute_paths() {
     let out = tempfile::tempdir().unwrap();
     let files = sidecar()
-        .extract(&repo_root().join("testdata/corpus/withdeps"), &["./..."], out.path())
+        .extract(
+            &repo_root().join("testdata/corpus/withdeps"),
+            &["./..."],
+            out.path(),
+        )
         .unwrap();
     for f in &files {
         let pkg = load_package(f).unwrap();

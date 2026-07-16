@@ -3,6 +3,7 @@
 //! Phase 1 ships the developer-facing `extract` subcommand; `check`,
 //! `baseline`, and `spec` arrive with the checkers (spec §10, §15).
 
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -77,6 +78,22 @@ fn extractor_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Err("cannot locate extractor sources; set GOVERIFY_EXTRACTOR_DIR".into())
 }
 
+/// Sidecar build cache root: user-scoped (`$XDG_CACHE_HOME/goverify` or
+/// `$HOME/.cache/goverify`, spec §9), created 0700. A predictable,
+/// world-writable-parent path (bare `temp_dir()`) would let another local
+/// user pre-plant a binary for `Sidecar::build` to execute unchecked
+/// (CWE-377); temp_dir() is used only as a last-resort fallback.
 fn sidecar_build_dir() -> PathBuf {
-    std::env::temp_dir().join("goverify-extractor-bin")
+    let cache_root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
+    let Some(cache_root) = cache_root else {
+        return std::env::temp_dir().join("goverify-extractor-bin");
+    };
+    let dir = cache_root.join("goverify");
+    let _ = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir);
+    dir.join("extractor-bin")
 }

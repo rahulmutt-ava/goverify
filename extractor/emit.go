@@ -1,9 +1,11 @@
 package main
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"go/ast"
 	"go/token"
 	"go/types"
 	"os"
@@ -50,7 +52,9 @@ func extractPackage(fset *token.FileSet, p *packages.Package, sp *ssa.Package, f
 	for _, fn := range fns {
 		e.out.Functions = append(e.out.Functions, e.emitFunction(fn))
 	}
-	_ = sp // Task 5: method sets, pragmas, canonicalize
+	e.emitMethodSets(sp)
+	e.emitPragmas()
+	e.canonicalize()
 	return e.out
 }
 
@@ -220,4 +224,95 @@ func auxKind(v ssa.Value) string {
 	default:
 		return "Value"
 	}
+}
+
+// emitMethodSets records, for each named type declared in the package,
+// the full method set of *T (or of T itself for interfaces), as
+// fully-qualified method names sorted by the method-set order (which
+// types.NewMethodSet defines deterministically, by name).
+func (e *emitter) emitMethodSets(sp *ssa.Package) {
+	names := make([]string, 0, len(sp.Members))
+	for name, m := range sp.Members {
+		if _, ok := m.(*ssa.Type); ok {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		T := sp.Members[name].(*ssa.Type).Type()
+		var ms *types.MethodSet
+		if types.IsInterface(T) {
+			ms = types.NewMethodSet(T)
+		} else {
+			ms = types.NewMethodSet(types.NewPointer(T))
+		}
+		if ms.Len() == 0 {
+			continue
+		}
+		pb := &gvirpb.MethodSet{Type: e.typeID(T)}
+		for i := range ms.Len() {
+			pb.Methods = append(pb.Methods, ms.At(i).Obj().(*types.Func).FullName())
+		}
+		e.out.MethodSets = append(e.out.MethodSets, pb)
+	}
+}
+
+// emitPragmas captures //goverify: doc-comment lines verbatim; parsing
+// and validation belong to goverify-spec (phase 6, spec §6).
+func (e *emitter) emitPragmas() {
+	for _, file := range e.pkg.Syntax {
+		ast.Inspect(file, func(n ast.Node) bool {
+			var doc *ast.CommentGroup
+			var declID string
+			switch d := n.(type) {
+			case *ast.FuncDecl:
+				doc = d.Doc
+				if obj, ok := e.pkg.TypesInfo.Defs[d.Name].(*types.Func); ok {
+					declID = obj.FullName()
+				}
+			case *ast.GenDecl:
+				doc = d.Doc
+				if len(d.Specs) == 1 {
+					switch s := d.Specs[0].(type) {
+					case *ast.TypeSpec:
+						declID = e.pkg.PkgPath + "." + s.Name.Name
+					case *ast.ValueSpec:
+						if len(s.Names) > 0 {
+							declID = e.pkg.PkgPath + "." + s.Names[0].Name
+						}
+					}
+				}
+			default:
+				return true
+			}
+			if doc == nil || declID == "" {
+				return true
+			}
+			for _, c := range doc.List {
+				if strings.HasPrefix(c.Text, "//goverify:") {
+					e.out.Pragmas = append(e.out.Pragmas, &gvirpb.Pragma{
+						DeclId: declID,
+						Text:   c.Text,
+						Pos:    e.position(c.Pos()),
+					})
+				}
+			}
+			return true
+		})
+	}
+}
+
+// canonicalize enforces the sort orders documented in gvir.proto.
+// Files, types, and functions are already deterministic by
+// construction; method sets and pragmas are sorted here.
+func (e *emitter) canonicalize() {
+	slices.SortFunc(e.out.MethodSets, func(a, b *gvirpb.MethodSet) int {
+		return cmp.Compare(a.GetType(), b.GetType())
+	})
+	slices.SortFunc(e.out.Pragmas, func(a, b *gvirpb.Pragma) int {
+		if c := strings.Compare(a.GetDeclId(), b.GetDeclId()); c != 0 {
+			return c
+		}
+		return strings.Compare(a.GetText(), b.GetText())
+	})
 }

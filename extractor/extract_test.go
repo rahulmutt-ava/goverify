@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -174,5 +175,58 @@ func TestSpawnHasGoAndSendInstructions(t *testing.T) {
 	}
 	if !kinds(findFunc(t, p, "example.com/hello.Spawn$1"))["Send"] {
 		t.Error("Spawn$1: no Send instruction")
+	}
+}
+
+func TestExtractPragmas(t *testing.T) {
+	pkgs := extractCorpus(t, helloDir, false)
+	p := pkgs["example.com/hello"]
+	if len(p.GetPragmas()) != 1 {
+		t.Fatalf("pragmas = %v, want exactly one", p.GetPragmas())
+	}
+	pr := p.GetPragmas()[0]
+	if pr.GetDeclId() != "example.com/hello.Deref" {
+		t.Errorf("pragma decl_id = %q, want example.com/hello.Deref", pr.GetDeclId())
+	}
+	if pr.GetText() != "//goverify:requires p != nil" {
+		t.Errorf("pragma text = %q", pr.GetText())
+	}
+	if pr.GetPos().GetLine() == 0 {
+		t.Error("pragma has no position")
+	}
+}
+
+func TestExtractMethodSets(t *testing.T) {
+	pkgs := extractCorpus(t, helloDir, false)
+	p := pkgs["example.com/hello"]
+	if len(p.GetMethodSets()) != 1 {
+		t.Fatalf("method_sets = %v, want exactly one (Counter)", p.GetMethodSets())
+	}
+	ms := p.GetMethodSets()[0]
+	want := []string{"(*example.com/hello.Counter).Inc"}
+	if len(ms.GetMethods()) != 1 || ms.GetMethods()[0] != want[0] {
+		t.Errorf("Counter methods = %v, want %v", ms.GetMethods(), want)
+	}
+}
+
+func TestDeterministicBytesAcrossRuns(t *testing.T) {
+	out1, out2 := t.TempDir(), t.TempDir()
+	w1, err := run(helloDir, []string{"./..."}, out1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2, err := run(helloDir, []string{"./..."}, out2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w1) != len(w2) {
+		t.Fatalf("run 1 wrote %d files, run 2 wrote %d", len(w1), len(w2))
+	}
+	for i := range w1 {
+		b1, _ := os.ReadFile(w1[i])
+		b2, _ := os.ReadFile(w2[i])
+		if !bytes.Equal(b1, b2) {
+			t.Errorf("nondeterministic .gvir: %s", w1[i])
+		}
 	}
 }

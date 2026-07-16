@@ -22,7 +22,7 @@ run = [
   "cargo fmt --all --check",
   "cargo clippy --workspace --all-targets -- -D warnings",
   "buf lint",
-  "sh -c 'cd extractor && gofmt -l . && go vet ./...'",
+  "sh -c 'cd extractor && test -z \"$(gofmt -l .)\" && go vet ./...'",
 ]
 
 [tasks.fmt]

@@ -88,6 +88,12 @@ impl Sidecar {
                 String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
         }
+        // Forward the extractor's degrade diagnostics ("goverify: skipping
+        // <pkg>: <err>") to our stderr; otherwise they vanish even though
+        // extraction succeeded (spec §11: degrade, never die — silently).
+        if !output.stderr.is_empty() {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
         let mut files: Vec<PathBuf> = String::from_utf8_lossy(&output.stdout)
             .lines()
             .map(PathBuf::from)

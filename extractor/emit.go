@@ -30,15 +30,17 @@ const (
 type emitter struct {
 	fset    *token.FileSet
 	pkg     *packages.Package
+	goroot  string // resolved via `go env GOROOT` by the caller; "" if unresolved
 	out     *gvirpb.Package
 	typeIDs map[string]uint32
 	fileIDs map[string]uint32
 }
 
-func extractPackage(fset *token.FileSet, p *packages.Package, sp *ssa.Package, fns []*ssa.Function) *gvirpb.Package {
+func extractPackage(fset *token.FileSet, p *packages.Package, sp *ssa.Package, fns []*ssa.Function, goroot string) *gvirpb.Package {
 	e := &emitter{
 		fset:    fset,
 		pkg:     p,
+		goroot:  goroot,
 		typeIDs: map[string]uint32{},
 		fileIDs: map[string]uint32{},
 		out: &gvirpb.Package{
@@ -62,14 +64,22 @@ func extractPackage(fset *token.FileSet, p *packages.Package, sp *ssa.Package, f
 // form: module-root-relative when inside a module (covers the target
 // module and module-cache deps alike), $GOROOT-relative for stdlib,
 // otherwise the base name. Never absolute (spec §3).
+//
+// GOROOT comes from e.goroot (resolved once per run via `go env GOROOT`
+// in extract.go's run()), never from runtime.GOROOT(): in a -trimpath
+// build, runtime.GOROOT() returns "" whenever the GOROOT env var is
+// unset, which would silently degrade every stdlib file to its
+// basename and break byte-identical determinism across machines.
 func (e *emitter) relPath(filename string) string {
 	if m := e.pkg.Module; m != nil && m.Dir != "" {
 		if r, err := filepath.Rel(m.Dir, filename); err == nil && !strings.HasPrefix(r, "..") {
 			return filepath.ToSlash(r)
 		}
 	}
-	if r, err := filepath.Rel(runtime.GOROOT(), filename); err == nil && !strings.HasPrefix(r, "..") {
-		return "$GOROOT/" + filepath.ToSlash(r)
+	if e.goroot != "" {
+		if r, err := filepath.Rel(e.goroot, filename); err == nil && !strings.HasPrefix(r, "..") {
+			return "$GOROOT/" + filepath.ToSlash(r)
+		}
 	}
 	return filepath.Base(filename)
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -67,6 +68,17 @@ func run(dir string, patterns []string, outDir string, deps bool) ([]string, err
 		}
 	}
 
+	// Resolve GOROOT once via `go env GOROOT` rather than runtime.GOROOT():
+	// a -trimpath build (as produced by the sidecar) makes runtime.GOROOT()
+	// return "" whenever the GOROOT env var isn't set, silently degrading
+	// every stdlib file to its basename and breaking byte-identical
+	// determinism across machines (spec §3).
+	gorootOut, err := exec.Command("go", "env", "GOROOT").Output()
+	if err != nil {
+		return nil, fmt.Errorf("resolve GOROOT: %w", err)
+	}
+	goroot := strings.TrimSpace(string(gorootOut))
+
 	targets := roots
 	if deps {
 		targets = nil
@@ -110,7 +122,7 @@ func run(dir string, patterns []string, outDir string, deps bool) ([]string, err
 			fmt.Fprintf(os.Stderr, "goverify: skipping %s: no SSA package\n", p.PkgPath)
 			continue
 		}
-		pb := extractPackage(prog.Fset, p, sp, fnsByPkg[sp])
+		pb := extractPackage(prog.Fset, p, sp, fnsByPkg[sp], goroot)
 		raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(pb)
 		if err != nil {
 			return nil, fmt.Errorf("marshal %s: %w", p.PkgPath, err)

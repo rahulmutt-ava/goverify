@@ -83,8 +83,8 @@ message Instruction {
 }
 
 message MethodSet {
-  uint32 type = 1;              // type id of the named type (interfaces: T itself; otherwise *T)
-  repeated string methods = 2;  // fully-qualified method names, in types.NewMethodSet order
+  uint32 type = 1;              // type id of the named type T
+  repeated string methods = 2;  // fully-qualified method names of *T's method set (T itself if T is an interface), in types.NewMethodSet order
 }
 
 message Pragma {

@@ -665,8 +665,8 @@ func (x *Instruction) GetDetail() string {
 
 type MethodSet struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Type          uint32                 `protobuf:"varint,1,opt,name=type,proto3" json:"type,omitempty"`      // type id of the named type (interfaces: T itself; otherwise *T)
-	Methods       []string               `protobuf:"bytes,2,rep,name=methods,proto3" json:"methods,omitempty"` // fully-qualified method names, in types.NewMethodSet order
+	Type          uint32                 `protobuf:"varint,1,opt,name=type,proto3" json:"type,omitempty"`      // type id of the named type T
+	Methods       []string               `protobuf:"bytes,2,rep,name=methods,proto3" json:"methods,omitempty"` // fully-qualified method names of *T's method set (T itself if T is an interface), in types.NewMethodSet order
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

@@ -17,10 +17,10 @@ Explicit v1 stance from the
   without signing (out of scope for v1).
 - **The sidecar build cache executes what it holds.** It lives at
   `$XDG_CACHE_HOME/goverify/extractor-bin` (or
-  `$HOME/.cache/goverify/extractor-bin`), directory created `0700`;
+  `$HOME/.cache/goverify/extractor-bin`), parent directory created `0700`;
   a bare `temp_dir()/goverify-extractor-bin` path is used only as a
   last-resort fallback when neither env var is set (CWE-377 rationale
-  in `crates/goverify-cli/src/main.rs:81-99`). It holds extractor
+  in `sidecar_build_dir()` in `crates/goverify-cli/src/main.rs`). It holds extractor
   binaries named by content hash (extractor source ⊕ Go toolchain
   version) that goverify **executes without further verification** —
   whoever can write to this directory executes code as the user. The

@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -59,6 +60,32 @@ func TestExtractHelloMetadata(t *testing.T) {
 func TestNoPackagesMatchedIsAnError(t *testing.T) {
 	if _, err := run(t.TempDir(), []string{"./..."}, t.TempDir(), false); err == nil {
 		t.Fatal("run() on an empty dir: want error, got nil")
+	}
+}
+
+// TestBuildExcludedPackageDegrades pins spec §11 ("degrade, never die")
+// against a real, legitimately-matched module whose only file is
+// entirely excluded by a build constraint. go/packages reports this
+// case very differently from an unresolvable pattern (see extract.go's
+// comment in run()), but both can present as "nothing to extract" —
+// this must NOT be treated the same as TestNoPackagesMatchedIsAnError's
+// case: it should succeed with zero output, not fail.
+func TestBuildExcludedPackageDegrades(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/excluded\n\ngo 1.25\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := "//go:build never\n\npackage excluded\n\nfunc Never() {}\n"
+	if err := os.WriteFile(filepath.Join(dir, "excluded.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	written, err := run(dir, []string{"./..."}, t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("run() on a build-excluded-only module: want nil error, got %v", err)
+	}
+	if len(written) != 0 {
+		t.Errorf("run() on a build-excluded-only module: want no files written, got %v", written)
 	}
 }
 

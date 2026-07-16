@@ -33,21 +33,38 @@ func run(dir string, patterns []string, outDir string, deps bool) ([]string, err
 	if err != nil {
 		return nil, err
 	}
-	// go/packages reports an unresolvable pattern (e.g. a dir with no
-	// go.mod) as a single synthetic placeholder package carrying a
-	// ListError and no files, not as zero roots — so len(roots) == 0
-	// alone doesn't catch it. Distinguish that from a real package that
-	// merely has parse/type errors (degraded per spec §11 in the loop
-	// below) by requiring at least one root to have actual source files.
-	anyFiles := false
-	for _, p := range roots {
-		if len(p.GoFiles) > 0 || len(p.CompiledGoFiles) > 0 {
-			anyFiles = true
-			break
+	// go/packages surfaces two very different "nothing here" situations,
+	// and only one of them is fatal:
+	//
+	//  - An unresolvable pattern (e.g. a dir with no go.mod, or a bogus
+	//    import path) yields one or more synthetic placeholder roots:
+	//    Errors is set, but GoFiles/CompiledGoFiles/OtherFiles/
+	//    IgnoredFiles are ALL empty — there was never a real package
+	//    behind it. That's "no packages matched" (fatal).
+	//  - A glob pattern (e.g. "./...") that legitimately expands to zero
+	//    packages (every candidate's files are excluded by build
+	//    constraints, or there are simply no Go files under it) returns
+	//    zero roots at all, with no error — a real, empty result, not a
+	//    failure (spec §11: degrade, never die). len(roots) == 0 alone
+	//    must NOT be treated as fatal.
+	//
+	// A root that legitimately matched a real package but is entirely
+	// excluded by build constraints (e.g. pattern "." on such a package)
+	// also has zero GoFiles/CompiledGoFiles, but non-empty OtherFiles/
+	// IgnoredFiles — that's how it's told apart from a true placeholder.
+	// It still carries an Errors entry, so the per-package degrade loop
+	// below skips it with a diagnostic rather than emitting it.
+	if len(roots) > 0 {
+		anyReal := false
+		for _, p := range roots {
+			if len(p.GoFiles) > 0 || len(p.CompiledGoFiles) > 0 || len(p.OtherFiles) > 0 || len(p.IgnoredFiles) > 0 {
+				anyReal = true
+				break
+			}
 		}
-	}
-	if !anyFiles {
-		return nil, errors.New("no packages matched")
+		if !anyReal {
+			return nil, errors.New("no packages matched")
+		}
 	}
 
 	targets := roots

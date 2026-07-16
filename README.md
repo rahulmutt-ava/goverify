@@ -22,11 +22,19 @@ mise run test
 ```
 
 Extract `.gvir` IR artifacts from a Go module (developer command; the
-`check` command arrives with the first checkers):
+`check` command arrives with the first checkers). Build the binary once
+from this checkout, then run it from *inside* the target Go module — the
+`extract` command resolves patterns in the current directory, and it
+shells out to `go` and the extractor sidecar at runtime, so `go` must be
+on `PATH`:
 
 ```sh
+# from this checkout:
+mise run build   # or: cargo build -p goverify-cli
+
+# from the target Go module:
 cd /path/to/some/go/module
-cargo run -p goverify-cli -- extract -o /tmp/gvir ./...
+/path/to/goverify/target/debug/goverify extract -o /tmp/gvir ./...
 ```
 
 ## Development

@@ -54,7 +54,7 @@ impl Program {
         for pkg in &pkgs {
             let tmap = p.types.import_package(&pkg.types);
             p.import_method_sets(pkg, &tmap);
-            // Task 6 inserts: p.lower_package(pkg, &tmap);
+            p.lower_package(pkg, &tmap);
         }
         p
     }
@@ -141,9 +141,24 @@ impl Program {
         &self.diagnostics
     }
 
-    #[allow(dead_code)]
     pub(crate) fn push_diagnostic(&mut self, d: String) {
         self.diagnostics.push(d);
+    }
+
+    /// The shared Unknown type. Exposed to `lower.rs` (a sibling module)
+    /// without making the `types` field itself `pub(crate)`.
+    pub(crate) fn types_unknown(&mut self) -> crate::types::TypeId {
+        self.types.unknown()
+    }
+
+    /// Install a lowered body for a previously-interned function. Bounds
+    /// checked even though `id` always comes from `intern_func` (and is
+    /// therefore always in range) — cheap insurance against a future
+    /// caller passing a stray id.
+    pub(crate) fn set_func_body(&mut self, id: FuncId, f: Function) {
+        if let Some(slot) = self.funcs.get_mut(id.0 as usize) {
+            *slot = Some(f);
+        }
     }
 }
 

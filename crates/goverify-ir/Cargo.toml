@@ -3,3 +3,9 @@ name = "goverify-ir"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+goverify-extract = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

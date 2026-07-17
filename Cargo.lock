@@ -267,6 +267,10 @@ dependencies = [
 [[package]]
 name = "goverify-ir"
 version = "0.1.0"
+dependencies = [
+ "goverify-extract",
+ "tempfile",
+]
 
 [[package]]
 name = "goverify-solver"

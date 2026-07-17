@@ -60,5 +60,8 @@ run = "git config core.hooksPath .githooks"
 
 [tasks.fuzz]
 description = "fuzz smoke run (nightly tier; needs rustup nightly)"
-run = "cargo +nightly fuzz run gvir_decode -- -max_total_time=60"
+run = [
+  "cargo +nightly fuzz run gvir_decode -- -max_total_time=60",
+  "cargo +nightly fuzz run ir_lower -- -max_total_time=60",
+]
 dir = "{{cwd}}"

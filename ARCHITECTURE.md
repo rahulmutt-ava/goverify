@@ -25,10 +25,10 @@ Rust core: IR load ─▶ call-graph SCC order ─▶ per-function analysis
 |---|---|---|
 | `goverify-cli` | argument parsing, orchestration, rendering | any analysis logic |
 | `goverify-extract` | sidecar driving, `.gvir` schema + loader | interpretation of the IR |
-| `goverify-ir` | analyzer-owned SSA-style IR, call graph | x/tools SSA quirks (isolated at the extractor boundary) |
-| `goverify-analysis` | SCC scheduler, pre-pass, summary instantiation, fixpoint | what to check (checkers plug in) |
+| `goverify-ir` | analyzer-owned SSA-style IR lowered from `.gvir`, the whole-program call graph (static/interface/function-value edges), SCC condensation for scheduling | x/tools SSA quirks (isolated at the extractor boundary) |
+| `goverify-analysis` | the SCC-ordered engine: concurrency effects, the syntactic pre-pass (no SMT), summary instantiation over placeholder clauses — the term language arrives in phase 3, `Solver` stays behind the same API | what to check (checkers plug in) |
 | `goverify-checkers` | nil, bounds, leaks, races | engine machinery, solver details |
-| `goverify-solver` | `Solver` trait, Z3 backend, canonical SMT-LIB2 printer | summary semantics |
+| `goverify-solver` | `Solver` trait + `StubSolver` (phase 2 answers Unknown to everything, so bug-finder semantics report nothing); Z3 and SMT-LIB2-process backends land in phase 3 | summary semantics |
 | `goverify-spec` | summary/annotation format: parse, serialize, validate | inference |
 | `goverify-cache` | content-addressed store, invalidation, locking | what the bytes mean |
 

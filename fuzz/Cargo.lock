@@ -159,8 +159,17 @@ name = "goverify-fuzz"
 version = "0.0.0"
 dependencies = [
  "goverify-extract",
+ "goverify-ir",
  "libfuzzer-sys",
  "prost",
+]
+
+[[package]]
+name = "goverify-ir"
+version = "0.1.0"
+dependencies = [
+ "goverify-extract",
+ "tempfile",
 ]
 
 [[package]]

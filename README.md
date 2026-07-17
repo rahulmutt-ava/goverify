@@ -6,8 +6,10 @@ summaries, constraints discharged with Z3, aggressive content-addressed
 caching. Bug-finder first — high-confidence reports, false positives
 are the enemy.
 
-**Status:** early development. Phase 1 (extraction pipeline) of the
-[design](docs/superpowers/specs/2026-07-16-goverify-design.md) is
+**Status:** early development. Phase 1 (extraction pipeline) and phase 2
+(IR, call graph, and the analysis engine — pre-pass and summaries, no
+real solver backend yet) of the
+[design](docs/superpowers/specs/2026-07-16-goverify-design.md) are
 implemented; checkers land in later phases.
 
 ## Quickstart
@@ -36,6 +38,19 @@ mise run build   # or: cargo build -p goverify-cli
 cd /path/to/some/go/module
 /path/to/goverify/target/debug/goverify extract -o /tmp/gvir ./...
 ```
+
+Inspect the analyzer's view of a module without writing `.gvir` files
+yourself — `debug` extracts to a temp dir on the fly when `--gvir-dir` is
+omitted (same directory/`PATH` requirements as `extract` above):
+
+```sh
+cd /path/to/some/go/module
+/path/to/goverify/target/debug/goverify debug ir ./...
+```
+
+Other `debug` subcommands (`callgraph`, `sccs`, `prepass`, `summary`)
+take the same arguments; `--func` filters by substring match on the
+function's SSA id.
 
 ## Development
 

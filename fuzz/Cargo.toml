@@ -11,10 +11,18 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 prost = "0.13"
 goverify-extract = { path = "../crates/goverify-extract" }
+goverify-ir = { path = "../crates/goverify-ir" }
 
 [[bin]]
 name = "gvir_decode"
 path = "fuzz_targets/gvir_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ir_lower"
+path = "fuzz_targets/ir_lower.rs"
 test = false
 doc = false
 bench = false

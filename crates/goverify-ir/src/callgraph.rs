@@ -53,18 +53,27 @@ impl CallGraph {
                                 .insert(*target);
                         }
                     };
-                    match &ins.op {
-                        Op::MakeClosure { func, dst, .. } => {
-                            address_taken
-                                .entry(f.value(*dst).ty)
-                                .or_default()
-                                .insert(*func);
-                        }
-                        op => {
-                            for v in op_value_operands(op) {
-                                mark(v);
-                            }
-                        }
+                    // Unconditional, every op: covers every plain value
+                    // operand *and* `MakeClosure`'s `bindings` (a captured
+                    // value that is itself a bare `FuncRef` — e.g. `g :=
+                    // someNamedFunc; return func(){ g() }` — must be
+                    // address-taken even when the binding is its only use
+                    // anywhere in the function; review fix, was
+                    // previously skipped because the match below used to
+                    // short-circuit `MakeClosure` before reaching this
+                    // scan).
+                    for v in op_value_operands(&ins.op) {
+                        mark(v);
+                    }
+                    // `func` is a `FuncId` embedded directly in the op, not
+                    // a `ValueId` in the value table, so it can't come
+                    // through `op_value_operands` above — recorded here
+                    // separately, in addition to (not instead of) the scan.
+                    if let Op::MakeClosure { func, dst, .. } = &ins.op {
+                        address_taken
+                            .entry(f.value(*dst).ty)
+                            .or_default()
+                            .insert(*func);
                     }
                 }
             }
@@ -142,12 +151,16 @@ fn resolve_invoke(
 
 /// Every ValueId an op reads (not defines). Add arms for ALL Op variants;
 /// the compiler's exhaustiveness check is the point — a new op can't
-/// silently hide function references. `Callee::Dynamic`'s function-value
-/// operand is included for `Call`/`Go`/`Defer` (via `callee_operands`)
-/// since it is exactly the kind of function-value read this scan exists
-/// to catch; `MakeClosure`'s `func` field is handled separately by the
-/// caller (it's a `FuncId`, not a `ValueId`), but its `bindings` are real
-/// value reads and are included here.
+/// silently hide function references. `build()`'s address-taken scan
+/// calls this unconditionally on *every* instruction, `MakeClosure`
+/// included — its `bindings` are real value reads (a bound value can
+/// itself be a bare `FuncRef`) and must be scanned, same as any other
+/// op's operands; `Callee::Dynamic`'s function-value operand is included
+/// for `Call`/`Go`/`Defer` (via `callee_operands`) for the same reason.
+/// `MakeClosure`'s `func` field is the one exception: it's a `FuncId`
+/// embedded directly in the op, not a `ValueId` in the value table, so it
+/// can't be returned from here — `build()` records it separately, in
+/// addition to (not instead of) calling this function.
 fn op_value_operands(op: &Op) -> Vec<ValueId> {
     match op {
         Op::Assign { src, .. } => vec![*src],
@@ -207,4 +220,101 @@ fn select_arm_operands(arms: &[SelectArm]) -> Vec<ValueId> {
     arms.iter()
         .flat_map(|a| std::iter::once(a.chan).chain(a.send))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use goverify_extract::gvir;
+
+    /// Regression (review fix): a named function captured *only* as a
+    /// `MakeClosure` binding — never appearing as a plain value operand
+    /// anywhere else in the function — must still be recorded
+    /// address-taken under its signature TypeId, so a later
+    /// `Callee::Dynamic` call through that same signature resolves to it.
+    ///
+    /// Before the fix, `build()`'s address-taken scan special-cased
+    /// `MakeClosure` to record only its `func` field and never inspected
+    /// `bindings`, so this edge was silently missing — an
+    /// under-approximation, the one failure mode this module must never
+    /// have (extra edges are fine; missing ones are not).
+    ///
+    /// Models `g := t.NamedFn; return func(){ ...g... }` where `g` is
+    /// never used in `t.Outer` except as the closure binding, plus an
+    /// unrelated dynamic call through a same-signature-typed parameter
+    /// that must resolve to `t.NamedFn` via the address-taken set.
+    #[test]
+    fn makeclosure_binding_only_reference_is_address_taken() {
+        let pkg = gvir::Package {
+            import_path: "t".into(),
+            types: vec![gvir::Type {
+                id: 1,
+                repr: "func()".into(),
+                kind: gvir::TypeKind::Signature as i32,
+                ..Default::default()
+            }],
+            functions: vec![gvir::Function {
+                id: "t.Outer".into(),
+                params: vec![gvir::Param {
+                    id: 1,
+                    name: "p".into(),
+                    r#type: 1, // same signature type as the captured func
+                }],
+                aux: vec![
+                    gvir::AuxValue {
+                        id: 2,
+                        kind: "Function".into(),
+                        repr: "t.NamedFn".into(),
+                        r#type: 1, // captured func's own signature type
+                        ..Default::default()
+                    },
+                    gvir::AuxValue {
+                        id: 3,
+                        kind: "Function".into(),
+                        repr: "t.Outer$1".into(),
+                        ..Default::default()
+                    },
+                ],
+                blocks: vec![gvir::BasicBlock {
+                    index: 0,
+                    instrs: vec![
+                        // g := t.NamedFn bound into the closure; g is
+                        // never referenced anywhere else in t.Outer.
+                        gvir::Instruction {
+                            kind: "MakeClosure".into(),
+                            register: 4,
+                            operands: vec![3, 2], // [fn, bindings...]
+                            ..Default::default()
+                        },
+                        // An unrelated dynamic call through a value that
+                        // merely happens to share t.NamedFn's signature.
+                        gvir::Instruction {
+                            kind: "Call".into(),
+                            operands: vec![1],
+                            sem: Some(gvir::instruction::Sem::Call(gvir::CallSem::default())),
+                            ..Default::default()
+                        },
+                        gvir::Instruction {
+                            kind: "Return".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    succs: vec![],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let p = Program::from_packages(vec![pkg]);
+        let outer = p.lookup_func("t.Outer").unwrap();
+        let named_fn = p.lookup_func("t.NamedFn").unwrap();
+        let g = CallGraph::build(&p);
+        assert!(
+            g.callees(outer).contains(&named_fn),
+            "t.NamedFn is captured only as a MakeClosure binding and must \
+             still be address-taken under its signature type, so the \
+             dynamic call resolves to it; got {:?}",
+            g.callees(outer)
+        );
+    }
 }

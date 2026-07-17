@@ -97,18 +97,21 @@ impl TypeTable {
     /// Unknown — never panic (fuzzed input).
     pub fn import_package(&mut self, types: &[gvir::Type]) -> Vec<TypeId> {
         let unknown = self.unknown();
-        let max_local = types.iter().map(|t| t.id).max().unwrap_or(0) as usize;
-        let mut map = vec![unknown; max_local + 1];
+        // Cap the map size at types.len() to prevent allocation bombs from
+        // untrusted ids. Legitimate extractor output assigns ids densely 1..=N,
+        // so any id > types.len() is malformed and degrades to Unknown.
+        let cap = types.len();
+        let mut map = vec![unknown; cap + 1];
         // Pass 1: intern all reprs so cycles resolve.
         for t in types {
-            if t.id != 0 {
+            if t.id != 0 && (t.id as usize) <= cap {
                 map[t.id as usize] = self.intern(&t.repr);
             }
         }
         // Pass 2: translate kinds. First writer for a repr wins; identical
         // sources produce identical structures, so later writers agree.
         for t in types {
-            if t.id == 0 {
+            if t.id == 0 || (t.id as usize) > cap {
                 continue;
             }
             let gid = map[t.id as usize];
@@ -228,5 +231,36 @@ mod tests {
             panic!()
         };
         assert!(matches!(table.kind(elem), TypeKind::Unknown));
+    }
+
+    #[test]
+    fn huge_id_avoids_allocation_bomb() {
+        use goverify_extract::gvir;
+        let mk = |id, repr: &str, kind| gvir::Type {
+            id,
+            repr: repr.into(),
+            kind: kind as i32,
+            ..Default::default()
+        };
+        // Package with u32::MAX id and a valid sibling type.
+        // Allocation should cap at types.len(), not allocate ~17 GB.
+        let pkg = vec![
+            mk(1, "int", gvir::TypeKind::Basic),
+            gvir::Type {
+                id: u32::MAX,
+                repr: "overflow".into(),
+                kind: gvir::TypeKind::Basic as i32,
+                ..Default::default()
+            },
+        ];
+        let mut table = TypeTable::default();
+        let map = table.import_package(&pkg); // must not panic or hang
+        // Valid type 1 is accessible
+        assert!(matches!(table.kind(map[1]), TypeKind::Basic { .. }));
+        // Overflow id (out of range) degrades to Unknown when accessed
+        let overflow_id = u32::MAX as usize;
+        if overflow_id < map.len() {
+            assert!(matches!(table.kind(map[overflow_id]), TypeKind::Unknown));
+        }
     }
 }

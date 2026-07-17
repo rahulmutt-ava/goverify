@@ -175,4 +175,43 @@ mod tests {
         let ids2: Vec<_> = p2.func_ids().collect();
         assert_eq!(ids1, ids2);
     }
+
+    #[test]
+    fn load_dir_skips_malformed_and_ignores_non_gvir() {
+        use std::fs;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Create a malformed .gvir file (garbage bytes)
+        let malformed_path = dir_path.join("malformed.gvir");
+        let mut f = fs::File::create(&malformed_path).unwrap();
+        f.write_all(&[0xffu8; 64]).unwrap();
+        drop(f);
+
+        // Create a non-.gvir file (should be ignored)
+        let non_gvir_path = dir_path.join("readme.txt");
+        fs::write(&non_gvir_path, "not a gvir file").unwrap();
+
+        // Load the directory
+        let result = Program::load_dir(dir_path);
+        assert!(result.is_ok(), "load_dir must not fail on malformed files");
+
+        let p = result.unwrap();
+        // The Program should exist but be empty (no valid packages loaded)
+        assert_eq!(p.func_ids().count(), 0);
+
+        // Diagnostics should mention the malformed file and appear first
+        let diags = p.diagnostics();
+        assert!(
+            !diags.is_empty(),
+            "should have a diagnostic for the malformed file"
+        );
+        assert!(
+            diags[0].contains("malformed.gvir"),
+            "first diagnostic should mention malformed.gvir, got: {:?}",
+            diags[0]
+        );
+    }
 }

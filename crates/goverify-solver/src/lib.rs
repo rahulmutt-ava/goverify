@@ -3,6 +3,13 @@
 //! opaque SMT-LIB2 fragments for now — phase 3 replaces their innards
 //! with the typed term language behind the same trait.
 
+mod sort;
+mod term;
+
+pub use sort::{CtorDecl, DatatypeDecl, Sort, SortError, ptr_datatype, ptr_sort};
+pub use term::Term as AstTerm;
+pub use term::{BvBinOp, BvCmpOp, ptr_is_nil, ptr_nil};
+
 /// A declaration (sort, const, or function) in canonical SMT-LIB2 text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decl(pub String);

@@ -75,3 +75,43 @@ func TestStructuredTypesRecursive(t *testing.T) {
 		t.Errorf("next field: want pointer, got %v", ptr.Kind)
 	}
 }
+
+// findInstr returns instructions of the given kind across all functions.
+func findInstr(p *gvirpb.Package, kind string) []*gvirpb.Instruction {
+	var out []*gvirpb.Instruction
+	for _, f := range p.Functions {
+		for _, b := range f.Blocks {
+			for _, ins := range b.Instrs {
+				if ins.Kind == kind {
+					out = append(out, ins)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func TestStructuredConstsAndSems(t *testing.T) {
+	pkgs := extractCorpus(t, "../testdata/corpus/hello", false)
+	p := pkgs["example.com/hello"]
+
+	// hello.Add contains a BinOp; its sem must carry the token.
+	binops := findInstr(p, "BinOp")
+	if len(binops) == 0 {
+		t.Fatal("no BinOp in hello corpus")
+	}
+	for _, ins := range binops {
+		if ins.GetBinop().GetOp() == "" {
+			t.Errorf("BinOp without sem.op: %s", ins.Detail)
+		}
+	}
+
+	// Every Const aux value must carry a structured ConstValue.
+	for _, f := range p.Functions {
+		for _, a := range f.Aux {
+			if a.Kind == "Const" && a.Const == nil {
+				t.Errorf("%s: const aux %q lacks ConstValue", f.Id, a.Repr)
+			}
+		}
+	}
+}

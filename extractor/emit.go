@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -239,12 +241,16 @@ func (e *emitter) emitFunction(fn *ssa.Function) *gvirpb.Function {
 			return id
 		}
 		id := assign(v)
-		f.Aux = append(f.Aux, &gvirpb.AuxValue{
+		aux := &gvirpb.AuxValue{
 			Id:   id,
 			Kind: auxKind(v),
 			Repr: v.String(),
 			Type: e.typeID(v.Type()),
-		})
+		}
+		if c, ok := v.(*ssa.Const); ok {
+			aux.Const = constValue(c)
+		}
+		f.Aux = append(f.Aux, aux)
 		return id
 	}
 	var rands []*ssa.Value
@@ -271,11 +277,61 @@ func (e *emitter) emitFunction(fn *ssa.Function) *gvirpb.Function {
 				}
 				pi.Operands = append(pi.Operands, operandID(*vp))
 			}
+			switch ins := ins.(type) {
+			case *ssa.BinOp:
+				pi.Sem = &gvirpb.Instruction_Binop{Binop: &gvirpb.BinOpSem{Op: ins.Op.String()}}
+			case *ssa.UnOp:
+				pi.Sem = &gvirpb.Instruction_Unop{Unop: &gvirpb.UnOpSem{Op: ins.Op.String(), CommaOk: ins.CommaOk}}
+			case *ssa.Field:
+				if st, ok := ins.X.Type().Underlying().(*types.Struct); ok {
+					pi.Sem = &gvirpb.Instruction_Field{Field: &gvirpb.FieldSem{
+						Index: uint32(ins.Field), Name: st.Field(ins.Field).Name()}}
+				}
+			case *ssa.FieldAddr:
+				if pt, ok := ins.X.Type().Underlying().(*types.Pointer); ok {
+					if st, ok := pt.Elem().Underlying().(*types.Struct); ok {
+						pi.Sem = &gvirpb.Instruction_Field{Field: &gvirpb.FieldSem{
+							Index: uint32(ins.Field), Name: st.Field(ins.Field).Name()}}
+					}
+				}
+			case *ssa.TypeAssert:
+				pi.Sem = &gvirpb.Instruction_TypeAssert{TypeAssert: &gvirpb.TypeAssertSem{
+					Asserted: e.typeID(ins.AssertedType), CommaOk: ins.CommaOk}}
+			case *ssa.Extract:
+				pi.Sem = &gvirpb.Instruction_Extract{Extract: &gvirpb.ExtractSem{Index: uint32(ins.Index)}}
+			case *ssa.Lookup:
+				pi.Sem = &gvirpb.Instruction_Lookup{Lookup: &gvirpb.LookupSem{CommaOk: ins.CommaOk}}
+			case *ssa.Alloc:
+				pi.Sem = &gvirpb.Instruction_Alloc{Alloc: &gvirpb.AllocSem{Heap: ins.Heap}}
+			}
 			bb.Instrs = append(bb.Instrs, pi)
 		}
 		f.Blocks = append(f.Blocks, bb)
 	}
 	return f
+}
+
+func constValue(c *ssa.Const) *gvirpb.ConstValue {
+	if c.Value == nil { // nil pointer/interface/map/…, or zero value
+		return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_Nil{Nil: true}}
+	}
+	switch c.Value.Kind() {
+	case constant.Bool:
+		return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_Bool{Bool: constant.BoolVal(c.Value)}}
+	case constant.Int:
+		if i, exact := constant.Int64Val(c.Value); exact {
+			return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_Int{Int: i}}
+		}
+		return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_BigInt{BigInt: c.Value.ExactString()}}
+	case constant.Float:
+		f, _ := constant.Float64Val(c.Value)
+		return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_FloatBits{FloatBits: math.Float64bits(f)}}
+	case constant.String:
+		return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_Str{Str: []byte(constant.StringVal(c.Value))}}
+	case constant.Complex:
+		return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_Complex{Complex: c.Value.ExactString()}}
+	}
+	return nil // Unknown kind: leave unset; Rust treats as opaque
 }
 
 func auxKind(v ssa.Value) string {

@@ -10,8 +10,8 @@ mod program;
 pub mod testutil;
 mod types;
 
-pub use callgraph::CallGraph;
-pub use dump::{dump_callgraph, dump_function};
+pub use callgraph::{CallGraph, Sccs};
+pub use dump::{dump_callgraph, dump_function, dump_sccs};
 pub use func::{Block, ConstVal, Function, Instr, Pos, ValueId, ValueInfo, ValueKind};
 pub use op::{BinOpKind, Callee, LockKind, MakeKind, Op, SelectArm, UnOpKind};
 pub use program::{FuncId, MethodInfo, Program};

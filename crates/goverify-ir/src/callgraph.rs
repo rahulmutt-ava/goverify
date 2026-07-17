@@ -222,6 +222,157 @@ fn select_arm_operands(arms: &[SelectArm]) -> Vec<ValueId> {
         .collect()
 }
 
+/// Strongly-connected-component condensation of a `CallGraph`
+/// (iterative Tarjan; phase-2 spec, Task 10). A mutually-recursive cluster
+/// of functions collapses into one SCC; `schedule()` orders SCCs
+/// callees-first (reverse topological — every SCC appears after all SCCs
+/// it calls into), which is exactly the order an analysis that needs
+/// callee summaries before caller summaries must process functions in.
+///
+/// Determinism: the outer loop seeds roots in ascending `FuncId` order and
+/// visits callees in `CallGraph::callees`'s sorted order, so the schedule
+/// (and thus any analysis driven by it) is byte-stable across runs and
+/// machines — no `HashMap` iteration anywhere in this algorithm. Tarjan is
+/// formulated iteratively with an explicit frame stack rather than
+/// recursively: the call graph can have long chains (deep stdlib call
+/// chains), and a recursive DFS would risk a stack overflow on them.
+pub struct Sccs {
+    schedule: Vec<Vec<FuncId>>,   // callees-first
+    scc_of: Vec<usize>,           // FuncId index -> position in schedule
+    callee_sccs: Vec<Vec<usize>>, // per schedule position, deduped, no self
+}
+
+impl Sccs {
+    pub fn compute(p: &Program, g: &CallGraph) -> Sccs {
+        Self::compute_from_graph(p.func_ids().count(), g)
+    }
+
+    /// Split out so unit tests can hand-build small graphs (`from_edges`)
+    /// without constructing a `Program`.
+    pub fn compute_from_graph(n: usize, g: &CallGraph) -> Sccs {
+        const UNVISITED: u32 = u32::MAX;
+        let mut index = vec![UNVISITED; n];
+        let mut lowlink = vec![0u32; n];
+        let mut on_stack = vec![false; n];
+        let mut stack: Vec<u32> = Vec::new();
+        let mut next_index = 0u32;
+        let mut schedule: Vec<Vec<FuncId>> = Vec::new();
+        let mut scc_of = vec![usize::MAX; n];
+
+        // Iterative Tarjan: frame = (node, next-child-cursor). Seeding the
+        // outer loop in ascending FuncId order (0..n) and consuming each
+        // node's callees in `g.callees`'s sorted order is what makes the
+        // resulting schedule deterministic.
+        for root in 0..n as u32 {
+            if index[root as usize] != UNVISITED {
+                continue;
+            }
+            let mut frames: Vec<(u32, usize)> = vec![(root, 0)];
+            while let Some(&(node, cursor)) = frames.last() {
+                let ni = node as usize;
+                if cursor == 0 {
+                    index[ni] = next_index;
+                    lowlink[ni] = next_index;
+                    next_index += 1;
+                    stack.push(node);
+                    on_stack[ni] = true;
+                }
+                let edges = g.callees(FuncId(node));
+                if cursor < edges.len() {
+                    let child = edges[cursor].0;
+                    frames.last_mut().unwrap().1 += 1;
+                    let ci = child as usize;
+                    if ci >= n {
+                        continue; // defensive: malformed/out-of-range edge
+                    }
+                    if index[ci] == UNVISITED {
+                        frames.push((child, 0));
+                    } else if on_stack[ci] {
+                        lowlink[ni] = lowlink[ni].min(index[ci]);
+                    }
+                } else {
+                    frames.pop();
+                    if let Some(&(parent, _)) = frames.last() {
+                        let pi = parent as usize;
+                        lowlink[pi] = lowlink[pi].min(lowlink[ni]);
+                    }
+                    if lowlink[ni] == index[ni] {
+                        let mut members = Vec::new();
+                        loop {
+                            let w = stack.pop().unwrap();
+                            on_stack[w as usize] = false;
+                            members.push(FuncId(w));
+                            if w == node {
+                                break;
+                            }
+                        }
+                        members.sort_unstable();
+                        for m in &members {
+                            scc_of[m.0 as usize] = schedule.len();
+                        }
+                        schedule.push(members);
+                    }
+                }
+            }
+        }
+        // Callee-SCC deps per schedule slot: which other SCCs does this
+        // one call into (excluding itself — a self-edge from recursion
+        // within the SCC isn't an inter-SCC dependency).
+        let mut callee_sccs: Vec<Vec<usize>> = vec![Vec::new(); schedule.len()];
+        for (si, members) in schedule.iter().enumerate() {
+            let mut deps: Vec<usize> = members
+                .iter()
+                .flat_map(|&m| g.callees(m).iter().map(|&c| scc_of[c.0 as usize]))
+                .filter(|&d| d != si && d != usize::MAX)
+                .collect();
+            deps.sort_unstable();
+            deps.dedup();
+            callee_sccs[si] = deps;
+        }
+        Sccs {
+            schedule,
+            scc_of,
+            callee_sccs,
+        }
+    }
+
+    /// SCCs in callees-first (reverse topological) order; members within
+    /// each SCC sorted ascending by `FuncId`.
+    pub fn schedule(&self) -> &[Vec<FuncId>] {
+        &self.schedule
+    }
+
+    /// Index into `schedule()` of the SCC containing `f`.
+    pub fn scc_of(&self, f: FuncId) -> usize {
+        self.scc_of[f.0 as usize]
+    }
+
+    /// SCCs that schedule-position `i` calls into (deduped, excludes `i`
+    /// itself).
+    pub fn callee_sccs(&self, i: usize) -> &[usize] {
+        &self.callee_sccs[i]
+    }
+}
+
+/// Test-only constructor: builds a `CallGraph` directly from an edge list
+/// (`(caller, callee)` pairs, indexed 0..n), skipping `Program`/lowering so
+/// SCC unit tests can hand-build small graphs. `pub(crate)` (not private)
+/// so it's usable from other in-crate test modules; `#[cfg(test)]` keeps it
+/// out of the release build.
+#[cfg(test)]
+pub(crate) fn from_edges(n: usize, edges: &[(u32, u32)]) -> CallGraph {
+    let mut callees = vec![std::collections::BTreeSet::new(); n];
+    for &(a, b) in edges {
+        callees[a as usize].insert(FuncId(b));
+    }
+    CallGraph {
+        callees: callees
+            .into_iter()
+            .map(|s| s.into_iter().collect())
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +466,45 @@ mod tests {
              still be address-taken under its signature type, so the \
              dynamic call resolves to it; got {:?}",
             g.callees(outer)
+        );
+    }
+
+    #[test]
+    fn schedule_is_callees_first() {
+        // 0 -> 1 -> 2, 0 -> 2
+        let g = from_edges(3, &[(0, 1), (1, 2), (0, 2)]);
+        let sccs = Sccs::compute_from_graph(3, &g);
+        let order: Vec<u32> = sccs.schedule().iter().map(|s| s[0].0).collect();
+        assert_eq!(
+            order,
+            vec![2, 1, 0],
+            "Sccs::schedule() must be callees-first"
+        );
+    }
+
+    #[test]
+    fn mutual_recursion_is_one_scc() {
+        // 0 <-> 1, both call 2
+        let g = from_edges(3, &[(0, 1), (1, 0), (0, 2), (1, 2)]);
+        let sccs = Sccs::compute_from_graph(3, &g);
+        assert_eq!(
+            sccs.schedule().len(),
+            2,
+            "Sccs::schedule() must collapse the mutually-recursive pair into one SCC"
+        );
+        assert_eq!(sccs.schedule()[0], vec![FuncId(2)]);
+        assert_eq!(sccs.schedule()[1], vec![FuncId(0), FuncId(1)]); // sorted members
+    }
+
+    #[test]
+    fn self_recursive_function_is_its_own_scc() {
+        let g = from_edges(2, &[(0, 0), (0, 1)]);
+        let sccs = Sccs::compute_from_graph(2, &g);
+        assert_eq!(sccs.schedule(), &[vec![FuncId(1)], vec![FuncId(0)]]);
+        assert_eq!(
+            sccs.callee_sccs(1),
+            &[0],
+            "Sccs::callee_sccs() must exclude the self-edge"
         );
     }
 }

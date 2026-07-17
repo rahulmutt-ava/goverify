@@ -19,7 +19,7 @@
 
 use std::fmt::Write;
 
-use crate::callgraph::CallGraph;
+use crate::callgraph::{CallGraph, Sccs};
 use crate::func::{Function, ValueId, ValueKind};
 use crate::op::{Callee, Op};
 use crate::program::{FuncId, Program};
@@ -87,6 +87,33 @@ pub fn dump_callgraph(p: &Program, g: &CallGraph) -> String {
         .collect();
     lines.sort_unstable();
     lines.join("\n") + "\n"
+}
+
+/// Render the SCC condensation (Task 10) as canonical text: one line per
+/// SCC in `schedule()`'s callees-first order — `scc <i> [recursive]:
+/// nameA, nameB` — member names sorted; `[recursive]` iff the SCC has more
+/// than one member or its sole member self-calls. `schedule()` and its
+/// members are already sorted (`Sccs::compute`'s invariant), so this needs
+/// no map iteration and is byte-identical across runs, same determinism
+/// surface as `dump_callgraph`.
+///
+/// `Sccs` doesn't retain the `CallGraph` it was computed from (and the
+/// cross-task contract fixes this function's signature to `(Program,
+/// Sccs)`, no graph), so a singleton SCC's self-edge is rechecked here by
+/// rebuilding the graph, rather than re-deriving self-calls from op scans
+/// — `CallGraph::build` already resolves the Static/Invoke/Dynamic cases
+/// correctly and it's the one place that logic should live.
+pub fn dump_sccs(p: &Program, s: &Sccs) -> String {
+    let g = CallGraph::build(p);
+    let mut out = String::new();
+    for (i, members) in s.schedule().iter().enumerate() {
+        let recursive = members.len() > 1 || members.iter().any(|&m| g.callees(m).contains(&m));
+        let mut names: Vec<&str> = members.iter().map(|&f| p.func_name(f)).collect();
+        names.sort_unstable();
+        let tag = if recursive { " [recursive]" } else { "" };
+        let _ = writeln!(out, "scc {i}{tag}: {}", names.join(", "));
+    }
+    out
 }
 
 fn render_callee(p: &Program, c: &Callee) -> String {
@@ -253,5 +280,76 @@ fn render_op(p: &Program, f: &Function, op: &Op) -> String {
             Some(d) => format!("v{} = havoc", d.0),
             None => "havoc".to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::callgraph::Sccs;
+    use goverify_extract::gvir;
+
+    fn call_instr(callee: &str) -> gvir::Instruction {
+        gvir::Instruction {
+            kind: "Call".into(),
+            sem: Some(gvir::instruction::Sem::Call(gvir::CallSem {
+                static_callee: callee.into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// `a.A` self-calls and calls `a.B`; `a.B` calls nothing. Exercises the
+    /// two things `dump_sccs`'s fixed `(Program, Sccs)` signature can't get
+    /// for free: the callees-first line order (B before A) and the
+    /// `[recursive]` tag on a *singleton* SCC via its self-edge (not just
+    /// the `members.len() > 1` case, which `self_recursive_function_is_its_own_scc`
+    /// in `callgraph.rs` already shows Tarjan keeps as a size-1 SCC).
+    #[test]
+    fn dump_sccs_orders_callees_first_and_flags_self_recursion() {
+        let pkg = gvir::Package {
+            import_path: "a".into(),
+            functions: vec![
+                gvir::Function {
+                    id: "a.A".into(),
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![
+                            call_instr("a.A"),
+                            call_instr("a.B"),
+                            gvir::Instruction {
+                                kind: "Return".into(),
+                                ..Default::default()
+                            },
+                        ],
+                        succs: vec![],
+                    }],
+                    ..Default::default()
+                },
+                gvir::Function {
+                    id: "a.B".into(),
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![gvir::Instruction {
+                            kind: "Return".into(),
+                            ..Default::default()
+                        }],
+                        succs: vec![],
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let p = Program::from_packages(vec![pkg]);
+        let g = CallGraph::build(&p);
+        let sccs = Sccs::compute(&p, &g);
+        assert_eq!(
+            dump_sccs(&p, &sccs),
+            "scc 0: a.B\nscc 1 [recursive]: a.A\n",
+            "callee (a.B) must be scheduled before caller (a.A), and a.A's \
+             self-edge must mark its singleton SCC [recursive]"
+        );
     }
 }

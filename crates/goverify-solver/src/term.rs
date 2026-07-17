@@ -444,8 +444,6 @@ impl Term {
 
     /// True if any subterm has Datatype sort or is a Dt* node — tells
     /// `Query::for_asserts` whether the Ptr declaration is needed.
-    // Not yet called: first consumer is Task 3's printer/query layer.
-    #[allow(dead_code)]
     pub(crate) fn uses_datatype(&self) -> bool {
         if matches!(self.sort, Sort::Datatype(_))
             || matches!(

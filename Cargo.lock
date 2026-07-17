@@ -310,6 +310,10 @@ dependencies = [
 [[package]]
 name = "goverify-cache"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "tempfile",
+]
 
 [[package]]
 name = "goverify-checkers"

@@ -14,6 +14,7 @@ prost-build = "0.13"
 clap = { version = "4", features = ["derive"] }
 blake3 = "1"
 tempfile = "3"
+rayon = "1"
 goverify-extract = { path = "crates/goverify-extract" }
 goverify-ir = { path = "crates/goverify-ir" }
 goverify-solver = { path = "crates/goverify-solver" }

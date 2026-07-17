@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 goverify-ir = { workspace = true }
 goverify-solver = { workspace = true }
+rayon = { workspace = true }
 
 # `src/testpkg.rs` is a `#[cfg(test)]` module (shared by this crate's and
 # Task 14's hand-written-package tests), not a file under `tests/`, so a

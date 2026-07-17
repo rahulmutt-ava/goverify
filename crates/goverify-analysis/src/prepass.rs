@@ -9,12 +9,34 @@ use std::collections::HashSet;
 
 use goverify_ir::{BinOpKind, FuncId, Op, Program, TypeKind, ValueId};
 
-fn int_width(name: &str) -> Option<u32> {
+/// Numeric family (final-review I1): `int_width` used to map int64,
+/// uint64, and float64 all to width 64 and compare widths alone, so
+/// int64->uint64 (sign reinterpretation) and float64->int64 (lossy
+/// truncation) both satisfied `dw < sw` being false and were classified
+/// clean — unsound for a phase-4+ value obligation. `SignedInt` and
+/// `UnsignedInt` are distinct variants (not one `Int` variant plus a
+/// separate signedness bool) precisely so a same-width, cross-signedness
+/// conversion can never accidentally compare equal to a same-family one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumFamily {
+    SignedInt,
+    UnsignedInt,
+    Float,
+}
+
+fn num_info(name: &str) -> Option<(NumFamily, u32)> {
+    use NumFamily::{Float, SignedInt, UnsignedInt};
     Some(match name {
-        "int8" | "uint8" | "byte" => 8,
-        "int16" | "uint16" => 16,
-        "int32" | "uint32" | "rune" | "float32" => 32,
-        "int" | "uint" | "int64" | "uint64" | "uintptr" | "float64" => 64,
+        "int8" => (SignedInt, 8),
+        "int16" => (SignedInt, 16),
+        "int32" | "rune" => (SignedInt, 32),
+        "int" | "int64" => (SignedInt, 64),
+        "uint8" | "byte" => (UnsignedInt, 8),
+        "uint16" => (UnsignedInt, 16),
+        "uint32" => (UnsignedInt, 32),
+        "uint" | "uint64" | "uintptr" => (UnsignedInt, 64),
+        "float32" => (Float, 32),
+        "float64" => (Float, 64),
         _ => return None,
     })
 }
@@ -52,9 +74,14 @@ pub fn value_clean(p: &Program, id: FuncId) -> bool {
                     );
                     match (dt, st) {
                         (TypeKind::Basic { name: d }, TypeKind::Basic { name: s }) => {
-                            match (int_width(d), int_width(s)) {
-                                (Some(dw), Some(sw)) => dw < sw, // narrowing
-                                _ => true,                       // unknown basics: not clean
+                            match (num_info(d), num_info(s)) {
+                                // Clean only same-family (int vs uint vs
+                                // float, signedness included) AND
+                                // non-narrowing; anything cross-family
+                                // (int64->uint64, float64->int64) or
+                                // narrowing (int64->int32) is dirty.
+                                (Some((df, dw)), Some((sf, sw))) => df != sf || dw < sw,
+                                _ => true, // unknown basics: not clean
                             }
                         }
                         _ => true,
@@ -184,6 +211,81 @@ mod tests {
             vec![
                 ty(1, "int64", gvir::TypeKind::Basic, "int64"),
                 ty(2, "int8", gvir::TypeKind::Basic, "int8"),
+            ],
+            vec![param(1, 1)],
+            vec![conv, instr("Return")],
+        );
+        assert!(!clean(&p));
+    }
+
+    /// Regression (final-review I1): int64 -> uint64 is a same-width sign
+    /// reinterpretation, not a narrowing conversion; `int_width` used to
+    /// map both to width 64 and classify this clean.
+    #[test]
+    fn cross_signedness_same_width_convert_is_not_clean() {
+        let mut conv = instr("Convert");
+        conv.register = 2;
+        conv.r#type = 2; // uint64 result
+        conv.operands = vec![1];
+        let p = build(
+            vec![
+                ty(1, "int64", gvir::TypeKind::Basic, "int64"),
+                ty(2, "uint64", gvir::TypeKind::Basic, "uint64"),
+            ],
+            vec![param(1, 1)],
+            vec![conv, instr("Return")],
+        );
+        assert!(!clean(&p));
+    }
+
+    /// Regression (final-review I1): float64 -> int64 is a lossy
+    /// truncation despite matching width; must not be clean.
+    #[test]
+    fn float_to_int_same_width_convert_is_not_clean() {
+        let mut conv = instr("Convert");
+        conv.register = 2;
+        conv.r#type = 2; // int64 result
+        conv.operands = vec![1];
+        let p = build(
+            vec![
+                ty(1, "float64", gvir::TypeKind::Basic, "float64"),
+                ty(2, "int64", gvir::TypeKind::Basic, "int64"),
+            ],
+            vec![param(1, 1)],
+            vec![conv, instr("Return")],
+        );
+        assert!(!clean(&p));
+    }
+
+    /// int32 -> int64: same family (signed int), widening — clean.
+    #[test]
+    fn widening_same_family_convert_is_clean() {
+        let mut conv = instr("Convert");
+        conv.register = 2;
+        conv.r#type = 2; // int64 result
+        conv.operands = vec![1];
+        let p = build(
+            vec![
+                ty(1, "int32", gvir::TypeKind::Basic, "int32"),
+                ty(2, "int64", gvir::TypeKind::Basic, "int64"),
+            ],
+            vec![param(1, 1)],
+            vec![conv, instr("Return")],
+        );
+        assert!(clean(&p));
+    }
+
+    /// int64 -> int32: same family (signed int), narrowing — not clean.
+    #[test]
+    fn narrowing_same_family_convert_is_not_clean() {
+        let mut conv = instr("Convert");
+        conv.register = 2;
+        conv.r#type = 2; // int32 result
+        conv.operands = vec![1];
+        let p = build(
+            vec![
+                ty(1, "int64", gvir::TypeKind::Basic, "int64"),
+                ty(2, "int32", gvir::TypeKind::Basic, "int32"),
             ],
             vec![param(1, 1)],
             vec![conv, instr("Return")],

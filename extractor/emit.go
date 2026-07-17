@@ -303,6 +303,32 @@ func (e *emitter) emitFunction(fn *ssa.Function) *gvirpb.Function {
 				pi.Sem = &gvirpb.Instruction_Lookup{Lookup: &gvirpb.LookupSem{CommaOk: ins.CommaOk}}
 			case *ssa.Alloc:
 				pi.Sem = &gvirpb.Instruction_Alloc{Alloc: &gvirpb.AllocSem{Heap: ins.Heap}}
+			case *ssa.Select:
+				sem := &gvirpb.SelectSem{Blocking: ins.Blocking}
+				for _, st := range ins.States {
+					s := &gvirpb.SelectState{Dir: uint32(st.Dir), ChanOperand: operandID(st.Chan)}
+					if st.Send != nil {
+						s.SendOperand = operandID(st.Send)
+					}
+					sem.States = append(sem.States, s)
+				}
+				pi.Sem = &gvirpb.Instruction_Select{Select: sem}
+			case ssa.CallInstruction: // *ssa.Call, *ssa.Defer, *ssa.Go
+				cc := ins.Common()
+				sem := &gvirpb.CallSem{}
+				if cc.IsInvoke() {
+					sem.Invoke = true
+					sem.Method = cc.Method.Name()
+					sem.IfaceType = e.typeID(cc.Value.Type())
+					sem.MethodSig = e.typeID(cc.Method.Type())
+				} else {
+					if f := cc.StaticCallee(); f != nil {
+						sem.StaticCallee = f.String()
+					} else if b, ok := cc.Value.(*ssa.Builtin); ok {
+						sem.Builtin = b.Name()
+					}
+				}
+				pi.Sem = &gvirpb.Instruction_Call{Call: sem}
 			}
 			bb.Instrs = append(bb.Instrs, pi)
 		}
@@ -376,11 +402,15 @@ func (e *emitter) emitMethodSets(sp *ssa.Package) {
 		}
 		pb := &gvirpb.MethodSet{Type: e.typeID(T)}
 		for i := range ms.Len() {
-			obj := ms.At(i).Obj().(*types.Func)
-			pb.Methods = append(pb.Methods, &gvirpb.Method{
-				Name: obj.Name(),
-				Sig:  e.typeID(ms.At(i).Type()),
-			})
+			sel := ms.At(i)
+			obj := sel.Obj().(*types.Func)
+			m := &gvirpb.Method{Name: obj.Name(), Sig: e.typeID(sel.Type())}
+			if !types.IsInterface(T) {
+				if fn := sp.Prog.MethodValue(sel); fn != nil {
+					m.FuncId = fn.String()
+				}
+			}
+			pb.Methods = append(pb.Methods, m)
 		}
 		e.out.MethodSets = append(e.out.MethodSets, pb)
 	}

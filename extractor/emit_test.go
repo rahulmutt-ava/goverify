@@ -115,3 +115,51 @@ func TestStructuredConstsAndSems(t *testing.T) {
 		}
 	}
 }
+
+func TestCallAndSelectSems(t *testing.T) {
+	pkgs := extractCorpus(t, "../testdata/corpus/conc", false)
+	p := pkgs["example.com/conc"]
+
+	var invokes, statics, builtins int
+	for _, kind := range []string{"Call", "Defer", "Go"} {
+		for _, ins := range findInstr(p, kind) {
+			c := ins.GetCall()
+			if c == nil {
+				t.Fatalf("%s without CallSem: %s", kind, ins.Detail)
+			}
+			switch {
+			case c.Invoke:
+				invokes++
+				if c.Method == "" || c.IfaceType == 0 || c.MethodSig == 0 {
+					t.Errorf("invoke sem incomplete: %+v", c)
+				}
+			case c.Builtin != "":
+				builtins++
+			case c.StaticCallee != "":
+				statics++
+			}
+		}
+	}
+	if invokes == 0 || statics == 0 || builtins == 0 {
+		t.Errorf("want ≥1 of each call mode, got invoke=%d static=%d builtin=%d",
+			invokes, statics, builtins)
+	}
+
+	sel := findInstr(p, "Select")
+	if len(sel) != 1 || len(sel[0].GetSelect().States) != 3 || !sel[0].GetSelect().Blocking {
+		t.Fatalf("want one blocking 3-state Select, got %+v", sel)
+	}
+
+	// Concrete method-set entries must carry ssa func ids.
+	found := false
+	for _, ms := range p.MethodSets {
+		for _, m := range ms.Methods {
+			if m.Name == "Close" && m.FuncId != "" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("no concrete Close method with func_id in method sets")
+	}
+}

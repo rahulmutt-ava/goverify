@@ -22,3 +22,8 @@ fn dump_module(module: &str, import_path: &str) -> String {
 fn hello_ir_matches_golden() {
     testutil::check_golden("hello.ir.txt", &dump_module("hello", "example.com/hello"));
 }
+
+#[test]
+fn ops_ir_matches_golden() {
+    testutil::check_golden("ops.ir.txt", &dump_module("ops", "example.com/ops"));
+}

@@ -58,6 +58,25 @@ fn debug_ir_prints_lowered_function() {
 }
 
 #[test]
+fn debug_dumps_are_byte_identical_across_extract_and_analyze_runs() {
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    extract_conc(d1.path());
+    extract_conc(d2.path());
+    for what in ["ir", "callgraph", "sccs", "prepass", "summary"] {
+        let o1 = goverify(
+            &["debug", what, "--gvir-dir", d1.path().to_str().unwrap()],
+            &repo_root(),
+        );
+        let o2 = goverify(
+            &["debug", what, "--gvir-dir", d2.path().to_str().unwrap()],
+            &repo_root(),
+        );
+        assert!(o1.status.success() && o2.status.success());
+        assert_eq!(o1.stdout, o2.stdout, "debug {what} is nondeterministic");
+    }
+}
+
+#[test]
 fn debug_prepass_and_summary_render() {
     let dir = tempfile::tempdir().unwrap();
     extract_conc(dir.path());

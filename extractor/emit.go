@@ -114,8 +114,67 @@ func (e *emitter) typeID(t types.Type) uint32 {
 	}
 	id := uint32(len(e.typeIDs) + 1)
 	e.typeIDs[repr] = id
-	e.out.Types = append(e.out.Types, &gvirpb.Type{Id: id, Repr: repr})
+	pb := &gvirpb.Type{Id: id, Repr: repr}
+	e.out.Types = append(e.out.Types, pb) // append BEFORE fill: recursion sees the id
+	e.fillType(pb, t)
 	return id
+}
+
+func (e *emitter) fillType(pb *gvirpb.Type, t types.Type) {
+	switch t := t.(type) {
+	case *types.Basic:
+		pb.Kind, pb.Name = gvirpb.TypeKind_TYPE_KIND_BASIC, t.Name()
+	case *types.Named:
+		pb.Kind = gvirpb.TypeKind_TYPE_KIND_NAMED
+		if t.Obj().Pkg() != nil {
+			pb.Name = t.Obj().Pkg().Path() + "." + t.Obj().Name()
+		} else {
+			pb.Name = t.Obj().Name() // universe scope: "error"
+		}
+		pb.Elem = e.typeID(t.Underlying())
+	case *types.Alias:
+		e.fillType(pb, types.Unalias(t)) // aliases are transparent
+	case *types.Pointer:
+		pb.Kind, pb.Elem = gvirpb.TypeKind_TYPE_KIND_POINTER, e.typeID(t.Elem())
+	case *types.Slice:
+		pb.Kind, pb.Elem = gvirpb.TypeKind_TYPE_KIND_SLICE, e.typeID(t.Elem())
+	case *types.Array:
+		pb.Kind, pb.Elem = gvirpb.TypeKind_TYPE_KIND_ARRAY, e.typeID(t.Elem())
+		pb.ArrayLen = uint64(t.Len())
+	case *types.Map:
+		pb.Kind = gvirpb.TypeKind_TYPE_KIND_MAP
+		pb.Key, pb.Elem = e.typeID(t.Key()), e.typeID(t.Elem())
+	case *types.Chan:
+		pb.Kind, pb.Elem = gvirpb.TypeKind_TYPE_KIND_CHAN, e.typeID(t.Elem())
+		pb.ChanDir = uint32(t.Dir())
+	case *types.Struct:
+		pb.Kind = gvirpb.TypeKind_TYPE_KIND_STRUCT
+		for i := range t.NumFields() {
+			f := t.Field(i)
+			pb.Fields = append(pb.Fields, &gvirpb.Field{
+				Name: f.Name(), Type: e.typeID(f.Type()), Embedded: f.Embedded(),
+			})
+		}
+	case *types.Interface:
+		pb.Kind = gvirpb.TypeKind_TYPE_KIND_INTERFACE
+	case *types.Signature:
+		pb.Kind, pb.Variadic = gvirpb.TypeKind_TYPE_KIND_SIGNATURE, t.Variadic()
+		for i := range t.Params().Len() {
+			pb.Params = append(pb.Params, e.typeID(t.Params().At(i).Type()))
+		}
+		for i := range t.Results().Len() {
+			pb.Results = append(pb.Results, e.typeID(t.Results().At(i).Type()))
+		}
+	case *types.Tuple:
+		pb.Kind = gvirpb.TypeKind_TYPE_KIND_TUPLE
+		for i := range t.Len() {
+			pb.Params = append(pb.Params, e.typeID(t.At(i).Type()))
+		}
+	case *types.TypeParam:
+		pb.Kind = gvirpb.TypeKind_TYPE_KIND_TYPE_PARAM
+	}
+	// anything else stays TYPE_KIND_UNSPECIFIED — the Rust side treats
+	// unspecified as opaque/unknown (degrade, never die)
 }
 
 func (e *emitter) position(pos token.Pos) *gvirpb.Position {

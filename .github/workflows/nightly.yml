@@ -12,7 +12,8 @@ jobs:
   # Nightly tier (spec §12): fuzz campaign; new-CVE sweep on old code.
   fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Two 900s fuzz runs alone are 30 min; headroom for setup + harness builds.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2

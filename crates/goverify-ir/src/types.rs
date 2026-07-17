@@ -205,11 +205,16 @@ pub enum StructuralKey {
     Tuple(Vec<StructuralKey>),
     TypeParam,
     Unknown,
-    /// A cycle was detected on the current recursion path (never a
-    /// legitimate Go type, but this reads types built from possibly
-    /// malformed/fuzzed `.gvir` input, so it must degrade rather than
-    /// recurse forever). Distinct types that both hit a cycle collapse to
-    /// this same key — an over-merge, the safe direction.
+    /// A cycle was detected on the current recursion path. Legitimate
+    /// recursive Go types reach this too (`type node struct{ next *node }`
+    /// routes Named→Struct→Pointer→Named), not just malformed/fuzzed
+    /// `.gvir` — either way the walk must degrade rather than recurse
+    /// forever. The enclosing `Named` key's name still anchors identity,
+    /// so distinct recursive types keep distinct keys; types that collapse
+    /// to the same key over-merge — the safe direction. Cached keys inside
+    /// a cycle are entry-point-dependent and deterministic only because
+    /// `CallGraph::build`'s traversal order is fixed; do not "optimize"
+    /// the on-path check away on the premise that cycles are illegitimate.
     Cyclic,
 }
 

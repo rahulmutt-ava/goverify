@@ -3,3 +3,7 @@
 fuzz/target
 fuzz/corpus
 fuzz/artifacts
+
+# Re-include specs/plans (globally ignored in ~/.config/git/ignore, but committed in this repo)
+!/docs/superpowers/
+!/docs/superpowers/**

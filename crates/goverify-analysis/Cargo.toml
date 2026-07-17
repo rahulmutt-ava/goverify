@@ -3,3 +3,7 @@ name = "goverify-analysis"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+goverify-ir = { workspace = true }
+goverify-solver = { workspace = true }

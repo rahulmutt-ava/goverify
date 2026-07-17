@@ -236,6 +236,10 @@ dependencies = [
 [[package]]
 name = "goverify-analysis"
 version = "0.1.0"
+dependencies = [
+ "goverify-ir",
+ "goverify-solver",
+]
 
 [[package]]
 name = "goverify-cache"

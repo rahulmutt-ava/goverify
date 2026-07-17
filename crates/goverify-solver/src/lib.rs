@@ -7,12 +7,14 @@ mod printer;
 mod reader;
 mod sort;
 mod term;
+mod z3native;
 
 pub use printer::{Logic, Query};
 pub use reader::{ReadError, SExpr, parse_query, parse_response, parse_sexpr};
 pub use sort::{CtorDecl, DatatypeDecl, Sort, SortError, ptr_datatype, ptr_sort};
 pub use term::Term as AstTerm;
 pub use term::{BvBinOp, BvCmpOp, ptr_is_nil, ptr_nil};
+pub use z3native::Z3Native;
 
 /// A declaration (sort, const, or function) in canonical SMT-LIB2 text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +44,37 @@ pub trait Solver {
     fn model(&self) -> Option<Model>;
     fn push(&mut self);
     fn pop(&mut self);
+}
+
+/// Per-query resource caps (parent spec §8: default 100 ms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SolverLimits {
+    pub timeout_ms: u32,
+    pub mem_mb: u32,
+}
+
+impl Default for SolverLimits {
+    fn default() -> Self {
+        SolverLimits {
+            timeout_ms: 100,
+            mem_mb: 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryOutcome {
+    pub result: SatResult,
+    /// Model text, Sat only. Display-only — never parsed for decisions.
+    pub model: Option<String>,
+}
+
+/// A backend that consumes canonical SMT-LIB2 bytes (single-lowering
+/// rule, phase-3 spec §4). `identity()` feeds the query-cache key.
+pub trait TextSolver: Send {
+    fn identity(&self) -> String;
+    fn limits(&self) -> SolverLimits;
+    fn solve_text(&mut self, canonical: &str) -> QueryOutcome;
 }
 
 /// Answers Unknown to everything: with bug-finder semantics this means

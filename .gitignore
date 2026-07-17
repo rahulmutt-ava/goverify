@@ -4,6 +4,11 @@ fuzz/target
 fuzz/corpus
 fuzz/artifacts
 
+# Z3 (vendored, via z3-sys) writes a trace log to the process cwd whenever
+# a debug-profile build hits a TRACE() macro internally; harmless, not
+# determinism-relevant output, just needs to not get committed by accident.
+.z3-trace
+
 # Re-include specs/plans (globally ignored in ~/.config/git/ignore, but committed in this repo)
 !/docs/superpowers/
 !/docs/superpowers/**

@@ -16,6 +16,7 @@ blake3 = "1"
 tempfile = "3"
 rayon = "1"
 proptest = "1"
+z3-sys = { version = "0.11", features = ["vendored"] }
 goverify-extract = { path = "crates/goverify-extract" }
 goverify-ir = { path = "crates/goverify-ir" }
 goverify-analysis = { path = "crates/goverify-analysis" }

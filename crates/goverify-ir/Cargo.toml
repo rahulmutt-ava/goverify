@@ -14,3 +14,6 @@ goverify-extract = { workspace = true }
 # only" constraint — `tempfile` was already a workspace dependency used by
 # goverify-extract's own tests.
 tempfile = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

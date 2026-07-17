@@ -7,6 +7,9 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 #[derive(Debug)]
 pub struct Store {
     root: PathBuf,
@@ -17,9 +20,16 @@ fn hex(key: &[u8; 32]) -> String {
 }
 
 impl Store {
-    /// Never fails: directory creation is deferred to `put` (a read-only
-    /// consumer of a nonexistent cache just misses).
+    /// Creates the root directory with 0700 permissions (best-effort; any
+    /// failure is ignored). Never fails — read-only consumers of a
+    /// nonexistent cache just miss.
     pub fn open(root: PathBuf) -> Store {
+        // Best-effort: create root and set 0o700 permissions on Unix.
+        let _ = fs::create_dir_all(&root);
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
+        }
         Store { root }
     }
 
@@ -42,9 +52,17 @@ impl Store {
         let lock = fs::File::create(&lock_path)?;
         lock.lock()?;
         let tmp = layer_dir.join(format!("tmp-{}-{}", &hex(key)[..8], std::process::id()));
-        fs::write(&tmp, value)?;
+        // Clean up tmp file on failure (best-effort).
+        if let Err(e) = fs::write(&tmp, value) {
+            let _ = fs::remove_file(&tmp);
+            let _ = lock.unlock();
+            return Err(e);
+        }
         let renamed = fs::rename(&tmp, &dest);
         let _ = lock.unlock();
+        if renamed.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
         renamed
     }
 }
@@ -91,5 +109,16 @@ mod tests {
             }
         });
         assert_eq!(s.get("query", &[9u8; 32]), Some(b"same-bytes".to_vec()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn root_created_with_0700_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        let _s = Store::open(root_path.clone());
+        let metadata = fs::metadata(&root_path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "root directory should have 0o700 permissions");
     }
 }

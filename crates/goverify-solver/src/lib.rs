@@ -4,10 +4,12 @@
 //! with the typed term language behind the same trait.
 
 mod printer;
+mod reader;
 mod sort;
 mod term;
 
 pub use printer::{Logic, Query};
+pub use reader::{ReadError, SExpr, parse_query, parse_response, parse_sexpr};
 pub use sort::{CtorDecl, DatatypeDecl, Sort, SortError, ptr_datatype, ptr_sort};
 pub use term::Term as AstTerm;
 pub use term::{BvBinOp, BvCmpOp, ptr_is_nil, ptr_nil};

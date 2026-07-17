@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 prost = "0.13"
 goverify-extract = { path = "../crates/goverify-extract" }
 goverify-ir = { path = "../crates/goverify-ir" }
+goverify-solver = { path = "../crates/goverify-solver" }
 
 [[bin]]
 name = "gvir_decode"
@@ -23,6 +24,13 @@ bench = false
 [[bin]]
 name = "ir_lower"
 path = "fuzz_targets/ir_lower.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "smt_reader"
+path = "fuzz_targets/smt_reader.rs"
 test = false
 doc = false
 bench = false

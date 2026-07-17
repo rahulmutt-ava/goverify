@@ -3,3 +3,6 @@ name = "goverify-solver"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

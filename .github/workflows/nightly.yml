@@ -18,6 +18,7 @@ jobs:
       - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
       - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
       - run: cargo +nightly fuzz run gvir_decode -- -max_total_time=900
+      - run: cargo +nightly fuzz run ir_lower -- -max_total_time=900
   audit:
     runs-on: ubuntu-latest
     # Headroom for cold mise tool caches (cargo-audit builds from source).

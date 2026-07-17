@@ -1,14 +1,15 @@
 //! gvir → IR lowering (spec §3). Lowering is TOTAL: unmodeled instruction
 //! kinds and any out-of-range id from the wire degrade to `Op::Havoc` plus
 //! a diagnostic, never a panic — this reads fuzzed input. Calls, defers,
-//! goroutines, selects, and closures are routed to `Op::Havoc` for now;
-//! Task 7 gives them real ops.
+//! goroutines, selects, and closures get real ops here; the
+//! `sync.Mutex`/`sync.RWMutex` lock methods and the `close` builtin are
+//! rewritten to `Op::Lock`/`Op::CloseChan` intrinsics.
 
 use goverify_extract::gvir;
 use goverify_extract::gvir::instruction::Sem;
 
 use crate::func::{Block, ConstVal, Function, Instr, Pos, ValueId, ValueInfo, ValueKind};
-use crate::op::{BinOpKind, MakeKind, Op, UnOpKind};
+use crate::op::{BinOpKind, Callee, LockKind, MakeKind, Op, SelectArm, UnOpKind};
 use crate::program::Program;
 use crate::types::TypeId;
 
@@ -105,7 +106,7 @@ impl Program {
                 instrs: b
                     .instrs
                     .iter()
-                    .filter_map(|ins| self.lower_instr(pkg, gf, ins, tmap))
+                    .filter_map(|ins| self.lower_instr(pkg, gf, ins, tmap, &values))
                     .collect(),
             })
             .collect();
@@ -133,6 +134,7 @@ impl Program {
         gf: &gvir::Function,
         ins: &gvir::Instruction,
         tmap: &[TypeId],
+        values: &[ValueInfo],
     ) -> Option<Instr> {
         let v = |i: usize| ValueId(ins.operands.get(i).copied().unwrap_or(0));
         let vopt = |i: usize| {
@@ -380,13 +382,107 @@ impl Program {
             // Dropped: no analyzer-visible semantics (defers are recorded
             // at the `defer` op itself).
             "DebugRef" | "RunDefers" => return None,
-            // Calls/concurrency/closures: Task 7 replaces these.
-            "Call" | "Defer" | "Go" | "Select" | "MakeClosure" => {
-                return Some(self.havoc(gf, ins, dst, pos));
+            "Call" | "Defer" | "Go" => {
+                let Some(Sem::Call(c)) = &ins.sem else {
+                    return Some(self.havoc(gf, ins, dst, pos));
+                };
+                let unknown = self.types_unknown();
+                // SSA operand layout: non-invoke: [callee, args…]; invoke:
+                // [recv, args…] (the receiver is passed through as the
+                // invoke call's first argument, mirroring x/tools SSA).
+                let (callee, args): (Callee, Vec<ValueId>) = if c.invoke {
+                    (
+                        Callee::Invoke {
+                            iface: resolve_ty(tmap, unknown, c.iface_type),
+                            method: c.method.clone(),
+                            sig: resolve_ty(tmap, unknown, c.method_sig),
+                        },
+                        ins.operands.iter().map(|&o| ValueId(o)).collect(),
+                    )
+                } else if !c.builtin.is_empty() {
+                    (
+                        Callee::Builtin(c.builtin.clone()),
+                        ins.operands.iter().skip(1).map(|&o| ValueId(o)).collect(),
+                    )
+                } else if !c.static_callee.is_empty() {
+                    (
+                        Callee::Static(self.intern_func(&c.static_callee)),
+                        ins.operands.iter().skip(1).map(|&o| ValueId(o)).collect(),
+                    )
+                } else {
+                    (
+                        Callee::Dynamic { value: v(0) },
+                        ins.operands.iter().skip(1).map(|&o| ValueId(o)).collect(),
+                    )
+                };
+                match ins.kind.as_str() {
+                    "Go" => Op::Go { callee, args },
+                    "Defer" => Op::Defer { callee, args },
+                    _ => self.lower_plain_call(dst, callee, args),
+                }
+            }
+            "MakeClosure" => {
+                let Some(d) = dst else {
+                    return Some(self.havoc(gf, ins, dst, pos));
+                };
+                // operands: [fn, bindings…]; fn is a Function aux value.
+                let ValueKind::FuncRef(func) = value_kind_of(values, ins, 0) else {
+                    return Some(self.havoc(gf, ins, dst, pos));
+                };
+                Op::MakeClosure {
+                    dst: d,
+                    func,
+                    bindings: ins.operands.iter().skip(1).map(|&o| ValueId(o)).collect(),
+                }
+            }
+            "Select" => {
+                let Some(Sem::Select(s)) = &ins.sem else {
+                    return Some(self.havoc(gf, ins, dst, pos));
+                };
+                let Some(d) = dst else {
+                    return Some(self.havoc(gf, ins, dst, pos));
+                };
+                Op::Select {
+                    dst: d,
+                    blocking: s.blocking,
+                    arms: s
+                        .states
+                        .iter()
+                        .map(|st| SelectArm {
+                            dir: st.dir,
+                            chan: ValueId(st.chan_operand),
+                            send: (st.send_operand != 0).then_some(ValueId(st.send_operand)),
+                        })
+                        .collect(),
+                }
             }
             _ => return Some(self.havoc(gf, ins, dst, pos)),
         };
         Some(Instr { op, pos })
+    }
+
+    /// Rewrite a plain (non-Go, non-Defer) call to its intrinsic op when
+    /// the callee is one of the modeled `sync` lock methods or the `close`
+    /// builtin; otherwise a plain `Op::Call`. `args` still includes the
+    /// receiver for a lock method (operand layout: [callee, receiver,
+    /// …]), which is exactly the value `Op::Lock` wants as `mu`.
+    fn lower_plain_call(&self, dst: Option<ValueId>, callee: Callee, args: Vec<ValueId>) -> Op {
+        if let Callee::Static(f) = &callee
+            && let Some(kind) = lock_kind(self.func_name(*f))
+        {
+            return Op::Lock {
+                kind,
+                mu: args.first().copied().unwrap_or(ValueId(0)),
+            };
+        }
+        if let Callee::Builtin(name) = &callee
+            && name == "close"
+        {
+            return Op::CloseChan {
+                chan: args.first().copied().unwrap_or(ValueId(0)),
+            };
+        }
+        Op::Call { dst, callee, args }
     }
 
     /// Shared fallback for both "instruction kind not modeled at all" and
@@ -427,6 +523,29 @@ fn value_id_ceiling(gf: &gvir::Function) -> usize {
 
 fn resolve_ty(tmap: &[TypeId], unknown: TypeId, local: u32) -> TypeId {
     tmap.get(local as usize).copied().unwrap_or(unknown)
+}
+
+/// Maps the static callee of a `sync.Mutex`/`sync.RWMutex` lock method to
+/// its `Op::Lock` intrinsic kind; `None` for every other function name.
+fn lock_kind(name: &str) -> Option<LockKind> {
+    match name {
+        "(*sync.Mutex).Lock" | "(*sync.RWMutex).Lock" => Some(LockKind::Lock),
+        "(*sync.Mutex).Unlock" | "(*sync.RWMutex).Unlock" => Some(LockKind::Unlock),
+        "(*sync.RWMutex).RLock" => Some(LockKind::RLock),
+        "(*sync.RWMutex).RUnlock" => Some(LockKind::RUnlock),
+        _ => None,
+    }
+}
+
+/// Look up the `ValueKind` of the value id at `ins.operands[idx]` in the
+/// already-built per-function value table. Bounds-checked and total: a
+/// missing operand or an out-of-range id degrades to `ValueKind::Opaque`
+/// rather than panicking (fuzzed input).
+fn value_kind_of(values: &[ValueInfo], ins: &gvir::Instruction, idx: usize) -> ValueKind {
+    let id = ins.operands.get(idx).copied().unwrap_or(0) as usize;
+    values
+        .get(id)
+        .map_or(ValueKind::Opaque, |vi| vi.kind.clone())
 }
 
 fn lower_const(a: &gvir::AuxValue) -> ConstVal {
@@ -595,6 +714,129 @@ mod tests {
         assert!(f.values.len() < 1_000, "{}", f.values.len());
         assert!(matches!(f.blocks[0].instrs[0].op, Op::Alloc { .. }));
         assert_eq!(f.value(ValueId(u32::MAX)).kind, ValueKind::Opaque);
+    }
+
+    #[test]
+    fn lowers_static_call_and_lock_intrinsics() {
+        // aux id 3 = Function "(*sync.Mutex).Lock"; call it with operand
+        // order [callee, receiver]; also a plain static call to t.G.
+        let pkg = gvir::Package {
+            import_path: "t".into(),
+            types: vec![gvir::Type {
+                id: 1,
+                repr: "*sync.Mutex".into(),
+                kind: gvir::TypeKind::Pointer as i32,
+                ..Default::default()
+            }],
+            functions: vec![gvir::Function {
+                id: "t.F".into(),
+                params: vec![gvir::Param {
+                    id: 1,
+                    name: "mu".into(),
+                    r#type: 1,
+                }],
+                blocks: vec![gvir::BasicBlock {
+                    index: 0,
+                    instrs: vec![
+                        gvir::Instruction {
+                            kind: "Call".into(),
+                            operands: vec![0, 1],
+                            sem: Some(gvir::instruction::Sem::Call(gvir::CallSem {
+                                static_callee: "(*sync.Mutex).Lock".into(),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                        gvir::Instruction {
+                            kind: "Call".into(),
+                            operands: vec![0],
+                            sem: Some(gvir::instruction::Sem::Call(gvir::CallSem {
+                                static_callee: "t.G".into(),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                        gvir::Instruction {
+                            kind: "Return".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    succs: vec![],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let p = Program::from_packages(vec![pkg]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let ops: Vec<&Op> = f.blocks[0].instrs.iter().map(|i| &i.op).collect();
+        assert!(
+            matches!(
+                ops[0],
+                Op::Lock {
+                    kind: LockKind::Lock,
+                    ..
+                }
+            ),
+            "{ops:?}"
+        );
+        assert!(
+            matches!(
+                ops[1],
+                Op::Call {
+                    callee: Callee::Static(_),
+                    ..
+                }
+            ),
+            "{ops:?}"
+        );
+    }
+
+    #[test]
+    fn lowers_builtin_close_to_closechan() {
+        // Call with sem.builtin = "close", operands [callee, ch] → Op::CloseChan { chan }.
+        let pkg = gvir::Package {
+            import_path: "t".into(),
+            types: vec![gvir::Type {
+                id: 1,
+                repr: "chan struct{}".into(),
+                kind: gvir::TypeKind::Chan as i32,
+                ..Default::default()
+            }],
+            functions: vec![gvir::Function {
+                id: "t.F".into(),
+                params: vec![gvir::Param {
+                    id: 1,
+                    name: "ch".into(),
+                    r#type: 1,
+                }],
+                blocks: vec![gvir::BasicBlock {
+                    index: 0,
+                    instrs: vec![
+                        gvir::Instruction {
+                            kind: "Call".into(),
+                            operands: vec![0, 1],
+                            sem: Some(gvir::instruction::Sem::Call(gvir::CallSem {
+                                builtin: "close".into(),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                        gvir::Instruction {
+                            kind: "Return".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    succs: vec![],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let p = Program::from_packages(vec![pkg]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let op = &f.blocks[0].instrs[0].op;
+        assert!(matches!(op, Op::CloseChan { chan: ValueId(1) }), "{op:?}");
     }
 
     #[test]

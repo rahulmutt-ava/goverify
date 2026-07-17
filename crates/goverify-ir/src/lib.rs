@@ -4,6 +4,8 @@ mod func;
 mod lower;
 mod op;
 mod program;
+#[doc(hidden)]
+pub mod testutil;
 mod types;
 
 pub use func::{Block, ConstVal, Function, Instr, Pos, ValueId, ValueInfo, ValueKind};

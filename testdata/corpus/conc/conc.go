@@ -4,9 +4,14 @@ import "sync"
 
 type Closer interface{ Close() error }
 
-type file struct{ mu sync.Mutex }
+// File is exported so `go/ssa/ssautil.AllFunctions` treats its methods as
+// roots (it only does so for methods of exported, non-parameterized
+// types); otherwise `(*File).Close`, reached only through CloseAll's
+// invoke-mode dispatch and never via a direct SSA value, would never be
+// materialized with a body in the extracted .gvir at all.
+type File struct{ mu sync.Mutex }
 
-func (f *file) Close() error {
+func (f *File) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return nil

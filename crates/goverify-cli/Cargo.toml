@@ -11,6 +11,6 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 goverify-extract.workspace = true
-
-[dev-dependencies]
+goverify-ir.workspace = true
+goverify-analysis.workspace = true
 tempfile.workspace = true

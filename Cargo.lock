@@ -281,7 +281,9 @@ name = "goverify-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "goverify-analysis",
  "goverify-extract",
+ "goverify-ir",
  "tempfile",
 ]
 

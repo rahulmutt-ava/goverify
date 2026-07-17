@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,7 +23,7 @@ import (
 )
 
 const (
-	schemaVersion    = "1"
+	schemaVersion    = "2"
 	extractorVersion = "0.1.0"
 )
 
@@ -114,8 +116,67 @@ func (e *emitter) typeID(t types.Type) uint32 {
 	}
 	id := uint32(len(e.typeIDs) + 1)
 	e.typeIDs[repr] = id
-	e.out.Types = append(e.out.Types, &gvirpb.Type{Id: id, Repr: repr})
+	pb := &gvirpb.Type{Id: id, Repr: repr}
+	e.out.Types = append(e.out.Types, pb) // append BEFORE fill: recursion sees the id
+	e.fillType(pb, t)
 	return id
+}
+
+func (e *emitter) fillType(pb *gvirpb.Type, t types.Type) {
+	switch t := t.(type) {
+	case *types.Basic:
+		pb.Kind, pb.Name = gvirpb.TypeKind_TYPE_KIND_BASIC, t.Name()
+	case *types.Named:
+		pb.Kind = gvirpb.TypeKind_TYPE_KIND_NAMED
+		if t.Obj().Pkg() != nil {
+			pb.Name = t.Obj().Pkg().Path() + "." + t.Obj().Name()
+		} else {
+			pb.Name = t.Obj().Name() // universe scope: "error"
+		}
+		pb.Elem = e.typeID(t.Underlying())
+	case *types.Alias:
+		e.fillType(pb, types.Unalias(t)) // aliases are transparent
+	case *types.Pointer:
+		pb.Kind, pb.Elem = gvirpb.TypeKind_TYPE_KIND_POINTER, e.typeID(t.Elem())
+	case *types.Slice:
+		pb.Kind, pb.Elem = gvirpb.TypeKind_TYPE_KIND_SLICE, e.typeID(t.Elem())
+	case *types.Array:
+		pb.Kind, pb.Elem = gvirpb.TypeKind_TYPE_KIND_ARRAY, e.typeID(t.Elem())
+		pb.ArrayLen = uint64(t.Len())
+	case *types.Map:
+		pb.Kind = gvirpb.TypeKind_TYPE_KIND_MAP
+		pb.Key, pb.Elem = e.typeID(t.Key()), e.typeID(t.Elem())
+	case *types.Chan:
+		pb.Kind, pb.Elem = gvirpb.TypeKind_TYPE_KIND_CHAN, e.typeID(t.Elem())
+		pb.ChanDir = uint32(t.Dir())
+	case *types.Struct:
+		pb.Kind = gvirpb.TypeKind_TYPE_KIND_STRUCT
+		for i := range t.NumFields() {
+			f := t.Field(i)
+			pb.Fields = append(pb.Fields, &gvirpb.Field{
+				Name: f.Name(), Type: e.typeID(f.Type()), Embedded: f.Embedded(),
+			})
+		}
+	case *types.Interface:
+		pb.Kind = gvirpb.TypeKind_TYPE_KIND_INTERFACE
+	case *types.Signature:
+		pb.Kind, pb.Variadic = gvirpb.TypeKind_TYPE_KIND_SIGNATURE, t.Variadic()
+		for i := range t.Params().Len() {
+			pb.Params = append(pb.Params, e.typeID(t.Params().At(i).Type()))
+		}
+		for i := range t.Results().Len() {
+			pb.Results = append(pb.Results, e.typeID(t.Results().At(i).Type()))
+		}
+	case *types.Tuple:
+		pb.Kind = gvirpb.TypeKind_TYPE_KIND_TUPLE
+		for i := range t.Len() {
+			pb.Params = append(pb.Params, e.typeID(t.At(i).Type()))
+		}
+	case *types.TypeParam:
+		pb.Kind = gvirpb.TypeKind_TYPE_KIND_TYPE_PARAM
+	}
+	// anything else stays TYPE_KIND_UNSPECIFIED — the Rust side treats
+	// unspecified as opaque/unknown (degrade, never die)
 }
 
 func (e *emitter) position(pos token.Pos) *gvirpb.Position {
@@ -180,12 +241,16 @@ func (e *emitter) emitFunction(fn *ssa.Function) *gvirpb.Function {
 			return id
 		}
 		id := assign(v)
-		f.Aux = append(f.Aux, &gvirpb.AuxValue{
+		aux := &gvirpb.AuxValue{
 			Id:   id,
 			Kind: auxKind(v),
 			Repr: v.String(),
 			Type: e.typeID(v.Type()),
-		})
+		}
+		if c, ok := v.(*ssa.Const); ok {
+			aux.Const = constValue(c)
+		}
+		f.Aux = append(f.Aux, aux)
 		return id
 	}
 	var rands []*ssa.Value
@@ -212,11 +277,87 @@ func (e *emitter) emitFunction(fn *ssa.Function) *gvirpb.Function {
 				}
 				pi.Operands = append(pi.Operands, operandID(*vp))
 			}
+			switch ins := ins.(type) {
+			case *ssa.BinOp:
+				pi.Sem = &gvirpb.Instruction_Binop{Binop: &gvirpb.BinOpSem{Op: ins.Op.String()}}
+			case *ssa.UnOp:
+				pi.Sem = &gvirpb.Instruction_Unop{Unop: &gvirpb.UnOpSem{Op: ins.Op.String(), CommaOk: ins.CommaOk}}
+			case *ssa.Field:
+				if st, ok := ins.X.Type().Underlying().(*types.Struct); ok {
+					pi.Sem = &gvirpb.Instruction_Field{Field: &gvirpb.FieldSem{
+						Index: uint32(ins.Field), Name: st.Field(ins.Field).Name()}}
+				}
+			case *ssa.FieldAddr:
+				if pt, ok := ins.X.Type().Underlying().(*types.Pointer); ok {
+					if st, ok := pt.Elem().Underlying().(*types.Struct); ok {
+						pi.Sem = &gvirpb.Instruction_Field{Field: &gvirpb.FieldSem{
+							Index: uint32(ins.Field), Name: st.Field(ins.Field).Name()}}
+					}
+				}
+			case *ssa.TypeAssert:
+				pi.Sem = &gvirpb.Instruction_TypeAssert{TypeAssert: &gvirpb.TypeAssertSem{
+					Asserted: e.typeID(ins.AssertedType), CommaOk: ins.CommaOk}}
+			case *ssa.Extract:
+				pi.Sem = &gvirpb.Instruction_Extract{Extract: &gvirpb.ExtractSem{Index: uint32(ins.Index)}}
+			case *ssa.Lookup:
+				pi.Sem = &gvirpb.Instruction_Lookup{Lookup: &gvirpb.LookupSem{CommaOk: ins.CommaOk}}
+			case *ssa.Alloc:
+				pi.Sem = &gvirpb.Instruction_Alloc{Alloc: &gvirpb.AllocSem{Heap: ins.Heap}}
+			case *ssa.Select:
+				sem := &gvirpb.SelectSem{Blocking: ins.Blocking}
+				for _, st := range ins.States {
+					s := &gvirpb.SelectState{Dir: uint32(st.Dir), ChanOperand: operandID(st.Chan)}
+					if st.Send != nil {
+						s.SendOperand = operandID(st.Send)
+					}
+					sem.States = append(sem.States, s)
+				}
+				pi.Sem = &gvirpb.Instruction_Select{Select: sem}
+			case ssa.CallInstruction: // *ssa.Call, *ssa.Defer, *ssa.Go
+				cc := ins.Common()
+				sem := &gvirpb.CallSem{}
+				if cc.IsInvoke() {
+					sem.Invoke = true
+					sem.Method = cc.Method.Name()
+					sem.IfaceType = e.typeID(cc.Value.Type())
+					sem.MethodSig = e.typeID(cc.Method.Type())
+				} else {
+					if f := cc.StaticCallee(); f != nil {
+						sem.StaticCallee = f.String()
+					} else if b, ok := cc.Value.(*ssa.Builtin); ok {
+						sem.Builtin = b.Name()
+					}
+				}
+				pi.Sem = &gvirpb.Instruction_Call{Call: sem}
+			}
 			bb.Instrs = append(bb.Instrs, pi)
 		}
 		f.Blocks = append(f.Blocks, bb)
 	}
 	return f
+}
+
+func constValue(c *ssa.Const) *gvirpb.ConstValue {
+	if c.Value == nil { // nil pointer/interface/map/…, or zero value
+		return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_Nil{Nil: true}}
+	}
+	switch c.Value.Kind() {
+	case constant.Bool:
+		return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_Bool{Bool: constant.BoolVal(c.Value)}}
+	case constant.Int:
+		if i, exact := constant.Int64Val(c.Value); exact {
+			return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_Int{Int: i}}
+		}
+		return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_BigInt{BigInt: c.Value.ExactString()}}
+	case constant.Float:
+		f, _ := constant.Float64Val(c.Value)
+		return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_FloatBits{FloatBits: math.Float64bits(f)}}
+	case constant.String:
+		return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_Str{Str: []byte(constant.StringVal(c.Value))}}
+	case constant.Complex:
+		return &gvirpb.ConstValue{Value: &gvirpb.ConstValue_Complex{Complex: c.Value.ExactString()}}
+	}
+	return nil // Unknown kind: leave unset; Rust treats as opaque
 }
 
 func auxKind(v ssa.Value) string {
@@ -238,8 +379,8 @@ func auxKind(v ssa.Value) string {
 
 // emitMethodSets records, for each named type declared in the package,
 // the full method set of *T (or of T itself for interfaces), as
-// fully-qualified method names sorted by the method-set order (which
-// types.NewMethodSet defines deterministically, by name).
+// Method entries (plain name + signature type id) in the method-set
+// order (which types.NewMethodSet defines deterministically, by name).
 func (e *emitter) emitMethodSets(sp *ssa.Package) {
 	names := make([]string, 0, len(sp.Members))
 	for name, m := range sp.Members {
@@ -261,7 +402,15 @@ func (e *emitter) emitMethodSets(sp *ssa.Package) {
 		}
 		pb := &gvirpb.MethodSet{Type: e.typeID(T)}
 		for i := range ms.Len() {
-			pb.Methods = append(pb.Methods, ms.At(i).Obj().(*types.Func).FullName())
+			sel := ms.At(i)
+			obj := sel.Obj().(*types.Func)
+			m := &gvirpb.Method{Name: obj.Name(), Sig: e.typeID(sel.Type())}
+			if !types.IsInterface(T) {
+				if fn := sp.Prog.MethodValue(sel); fn != nil {
+					m.FuncId = fn.String()
+				}
+			}
+			pb.Methods = append(pb.Methods, m)
 		}
 		e.out.MethodSets = append(e.out.MethodSets, pb)
 	}

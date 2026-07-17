@@ -21,6 +21,85 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type TypeKind int32
+
+const (
+	TypeKind_TYPE_KIND_UNSPECIFIED TypeKind = 0
+	TypeKind_TYPE_KIND_BASIC       TypeKind = 1 // name = "int", "string", …
+	TypeKind_TYPE_KIND_NAMED       TypeKind = 2 // name = fully-qualified; elem = underlying type id
+	TypeKind_TYPE_KIND_POINTER     TypeKind = 3 // elem
+	TypeKind_TYPE_KIND_SLICE       TypeKind = 4 // elem
+	TypeKind_TYPE_KIND_ARRAY       TypeKind = 5 // elem, array_len
+	TypeKind_TYPE_KIND_MAP         TypeKind = 6 // key, elem
+	TypeKind_TYPE_KIND_CHAN        TypeKind = 7 // elem, chan_dir
+	TypeKind_TYPE_KIND_STRUCT      TypeKind = 8 // fields
+	TypeKind_TYPE_KIND_INTERFACE   TypeKind = 9
+	TypeKind_TYPE_KIND_SIGNATURE   TypeKind = 10 // params, results, variadic
+	TypeKind_TYPE_KIND_TUPLE       TypeKind = 11 // params
+	TypeKind_TYPE_KIND_TYPE_PARAM  TypeKind = 12
+)
+
+// Enum value maps for TypeKind.
+var (
+	TypeKind_name = map[int32]string{
+		0:  "TYPE_KIND_UNSPECIFIED",
+		1:  "TYPE_KIND_BASIC",
+		2:  "TYPE_KIND_NAMED",
+		3:  "TYPE_KIND_POINTER",
+		4:  "TYPE_KIND_SLICE",
+		5:  "TYPE_KIND_ARRAY",
+		6:  "TYPE_KIND_MAP",
+		7:  "TYPE_KIND_CHAN",
+		8:  "TYPE_KIND_STRUCT",
+		9:  "TYPE_KIND_INTERFACE",
+		10: "TYPE_KIND_SIGNATURE",
+		11: "TYPE_KIND_TUPLE",
+		12: "TYPE_KIND_TYPE_PARAM",
+	}
+	TypeKind_value = map[string]int32{
+		"TYPE_KIND_UNSPECIFIED": 0,
+		"TYPE_KIND_BASIC":       1,
+		"TYPE_KIND_NAMED":       2,
+		"TYPE_KIND_POINTER":     3,
+		"TYPE_KIND_SLICE":       4,
+		"TYPE_KIND_ARRAY":       5,
+		"TYPE_KIND_MAP":         6,
+		"TYPE_KIND_CHAN":        7,
+		"TYPE_KIND_STRUCT":      8,
+		"TYPE_KIND_INTERFACE":   9,
+		"TYPE_KIND_SIGNATURE":   10,
+		"TYPE_KIND_TUPLE":       11,
+		"TYPE_KIND_TYPE_PARAM":  12,
+	}
+)
+
+func (x TypeKind) Enum() *TypeKind {
+	p := new(TypeKind)
+	*p = x
+	return p
+}
+
+func (x TypeKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (TypeKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_gvir_v1_gvir_proto_enumTypes[0].Descriptor()
+}
+
+func (TypeKind) Type() protoreflect.EnumType {
+	return &file_proto_gvir_v1_gvir_proto_enumTypes[0]
+}
+
+func (x TypeKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use TypeKind.Descriptor instead.
+func (TypeKind) EnumDescriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{0}
+}
+
 type Package struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	SchemaVersion    string                 `protobuf:"bytes,1,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`          // gvir schema version; loader rejects mismatches
@@ -181,10 +260,22 @@ func (x *File) GetSha256() string {
 	return ""
 }
 
+// Structured form alongside the display repr (phase-2 spec §2.2). All
+// component references are type ids in this package's table; 0 = absent.
 type Type struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            uint32                 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`    // 1-based
-	Repr          string                 `protobuf:"bytes,2,opt,name=repr,proto3" json:"repr,omitempty"` // types.TypeString with full-package-path qualifier
+	Repr          string                 `protobuf:"bytes,2,opt,name=repr,proto3" json:"repr,omitempty"` // types.TypeString, display only — loader never parses it
+	Kind          TypeKind               `protobuf:"varint,3,opt,name=kind,proto3,enum=gvir.v1.TypeKind" json:"kind,omitempty"`
+	Elem          uint32                 `protobuf:"varint,4,opt,name=elem,proto3" json:"elem,omitempty"` // pointer/slice/array/chan elem; map value; named underlying
+	Key           uint32                 `protobuf:"varint,5,opt,name=key,proto3" json:"key,omitempty"`   // map key
+	ArrayLen      uint64                 `protobuf:"varint,6,opt,name=array_len,json=arrayLen,proto3" json:"array_len,omitempty"`
+	ChanDir       uint32                 `protobuf:"varint,7,opt,name=chan_dir,json=chanDir,proto3" json:"chan_dir,omitempty"` // types.ChanDir: 0 SendRecv, 1 SendOnly, 2 RecvOnly
+	Fields        []*Field               `protobuf:"bytes,8,rep,name=fields,proto3" json:"fields,omitempty"`                   // struct fields, declaration order
+	Params        []uint32               `protobuf:"varint,9,rep,packed,name=params,proto3" json:"params,omitempty"`           // signature params / tuple members, in order
+	Results       []uint32               `protobuf:"varint,10,rep,packed,name=results,proto3" json:"results,omitempty"`        // signature results, in order
+	Variadic      bool                   `protobuf:"varint,11,opt,name=variadic,proto3" json:"variadic,omitempty"`
+	Name          string                 `protobuf:"bytes,12,opt,name=name,proto3" json:"name,omitempty"` // basic: type name; named: fully-qualified name
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -233,6 +324,299 @@ func (x *Type) GetRepr() string {
 	return ""
 }
 
+func (x *Type) GetKind() TypeKind {
+	if x != nil {
+		return x.Kind
+	}
+	return TypeKind_TYPE_KIND_UNSPECIFIED
+}
+
+func (x *Type) GetElem() uint32 {
+	if x != nil {
+		return x.Elem
+	}
+	return 0
+}
+
+func (x *Type) GetKey() uint32 {
+	if x != nil {
+		return x.Key
+	}
+	return 0
+}
+
+func (x *Type) GetArrayLen() uint64 {
+	if x != nil {
+		return x.ArrayLen
+	}
+	return 0
+}
+
+func (x *Type) GetChanDir() uint32 {
+	if x != nil {
+		return x.ChanDir
+	}
+	return 0
+}
+
+func (x *Type) GetFields() []*Field {
+	if x != nil {
+		return x.Fields
+	}
+	return nil
+}
+
+func (x *Type) GetParams() []uint32 {
+	if x != nil {
+		return x.Params
+	}
+	return nil
+}
+
+func (x *Type) GetResults() []uint32 {
+	if x != nil {
+		return x.Results
+	}
+	return nil
+}
+
+func (x *Type) GetVariadic() bool {
+	if x != nil {
+		return x.Variadic
+	}
+	return false
+}
+
+func (x *Type) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+type Field struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Type          uint32                 `protobuf:"varint,2,opt,name=type,proto3" json:"type,omitempty"`
+	Embedded      bool                   `protobuf:"varint,3,opt,name=embedded,proto3" json:"embedded,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Field) Reset() {
+	*x = Field{}
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Field) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Field) ProtoMessage() {}
+
+func (x *Field) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Field.ProtoReflect.Descriptor instead.
+func (*Field) Descriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *Field) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *Field) GetType() uint32 {
+	if x != nil {
+		return x.Type
+	}
+	return 0
+}
+
+func (x *Field) GetEmbedded() bool {
+	if x != nil {
+		return x.Embedded
+	}
+	return false
+}
+
+// Structured constant (phase-2 spec §2.3).
+type ConstValue struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Value:
+	//
+	//	*ConstValue_Bool
+	//	*ConstValue_Int
+	//	*ConstValue_BigInt
+	//	*ConstValue_FloatBits
+	//	*ConstValue_Str
+	//	*ConstValue_Nil
+	//	*ConstValue_Complex
+	Value         isConstValue_Value `protobuf_oneof:"value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConstValue) Reset() {
+	*x = ConstValue{}
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConstValue) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConstValue) ProtoMessage() {}
+
+func (x *ConstValue) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConstValue.ProtoReflect.Descriptor instead.
+func (*ConstValue) Descriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *ConstValue) GetValue() isConstValue_Value {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+func (x *ConstValue) GetBool() bool {
+	if x != nil {
+		if x, ok := x.Value.(*ConstValue_Bool); ok {
+			return x.Bool
+		}
+	}
+	return false
+}
+
+func (x *ConstValue) GetInt() int64 {
+	if x != nil {
+		if x, ok := x.Value.(*ConstValue_Int); ok {
+			return x.Int
+		}
+	}
+	return 0
+}
+
+func (x *ConstValue) GetBigInt() string {
+	if x != nil {
+		if x, ok := x.Value.(*ConstValue_BigInt); ok {
+			return x.BigInt
+		}
+	}
+	return ""
+}
+
+func (x *ConstValue) GetFloatBits() uint64 {
+	if x != nil {
+		if x, ok := x.Value.(*ConstValue_FloatBits); ok {
+			return x.FloatBits
+		}
+	}
+	return 0
+}
+
+func (x *ConstValue) GetStr() []byte {
+	if x != nil {
+		if x, ok := x.Value.(*ConstValue_Str); ok {
+			return x.Str
+		}
+	}
+	return nil
+}
+
+func (x *ConstValue) GetNil() bool {
+	if x != nil {
+		if x, ok := x.Value.(*ConstValue_Nil); ok {
+			return x.Nil
+		}
+	}
+	return false
+}
+
+func (x *ConstValue) GetComplex() string {
+	if x != nil {
+		if x, ok := x.Value.(*ConstValue_Complex); ok {
+			return x.Complex
+		}
+	}
+	return ""
+}
+
+type isConstValue_Value interface {
+	isConstValue_Value()
+}
+
+type ConstValue_Bool struct {
+	Bool bool `protobuf:"varint,1,opt,name=bool,proto3,oneof"`
+}
+
+type ConstValue_Int struct {
+	Int int64 `protobuf:"varint,2,opt,name=int,proto3,oneof"` // ints representable in i64 (signed or unsigned ≤ MaxInt64)
+}
+
+type ConstValue_BigInt struct {
+	BigInt string `protobuf:"bytes,3,opt,name=big_int,json=bigInt,proto3,oneof"` // decimal string when outside i64
+}
+
+type ConstValue_FloatBits struct {
+	FloatBits uint64 `protobuf:"varint,4,opt,name=float_bits,json=floatBits,proto3,oneof"` // IEEE-754 f64 bits
+}
+
+type ConstValue_Str struct {
+	Str []byte `protobuf:"bytes,5,opt,name=str,proto3,oneof"`
+}
+
+type ConstValue_Nil struct {
+	Nil bool `protobuf:"varint,6,opt,name=nil,proto3,oneof"` // always true: the nil / zero-value constant
+}
+
+type ConstValue_Complex struct {
+	Complex string `protobuf:"bytes,7,opt,name=complex,proto3,oneof"` // constant.ExactString rendering
+}
+
+func (*ConstValue_Bool) isConstValue_Value() {}
+
+func (*ConstValue_Int) isConstValue_Value() {}
+
+func (*ConstValue_BigInt) isConstValue_Value() {}
+
+func (*ConstValue_FloatBits) isConstValue_Value() {}
+
+func (*ConstValue_Str) isConstValue_Value() {}
+
+func (*ConstValue_Nil) isConstValue_Value() {}
+
+func (*ConstValue_Complex) isConstValue_Value() {}
+
 type Position struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	File          uint32                 `protobuf:"varint,1,opt,name=file,proto3" json:"file,omitempty"` // 1-based index into Package.files; 0 = unknown file
@@ -244,7 +628,7 @@ type Position struct {
 
 func (x *Position) Reset() {
 	*x = Position{}
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[3]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -256,7 +640,7 @@ func (x *Position) String() string {
 func (*Position) ProtoMessage() {}
 
 func (x *Position) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[3]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -269,7 +653,7 @@ func (x *Position) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Position.ProtoReflect.Descriptor instead.
 func (*Position) Descriptor() ([]byte, []int) {
-	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{3}
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *Position) GetFile() uint32 {
@@ -313,7 +697,7 @@ type Function struct {
 
 func (x *Function) Reset() {
 	*x = Function{}
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[4]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -325,7 +709,7 @@ func (x *Function) String() string {
 func (*Function) ProtoMessage() {}
 
 func (x *Function) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[4]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -338,7 +722,7 @@ func (x *Function) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Function.ProtoReflect.Descriptor instead.
 func (*Function) Descriptor() ([]byte, []int) {
-	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{4}
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Function) GetId() string {
@@ -401,7 +785,7 @@ type Param struct {
 
 func (x *Param) Reset() {
 	*x = Param{}
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[5]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -413,7 +797,7 @@ func (x *Param) String() string {
 func (*Param) ProtoMessage() {}
 
 func (x *Param) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[5]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -426,7 +810,7 @@ func (x *Param) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Param.ProtoReflect.Descriptor instead.
 func (*Param) Descriptor() ([]byte, []int) {
-	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{5}
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *Param) GetId() uint32 {
@@ -457,13 +841,14 @@ type AuxValue struct {
 	Kind          string                 `protobuf:"bytes,2,opt,name=kind,proto3" json:"kind,omitempty"` // "Const" | "Global" | "Function" | "Builtin" | "FreeVar" | "Value"
 	Repr          string                 `protobuf:"bytes,3,opt,name=repr,proto3" json:"repr,omitempty"` // the value's canonical ssa String()
 	Type          uint32                 `protobuf:"varint,4,opt,name=type,proto3" json:"type,omitempty"`
+	Const         *ConstValue            `protobuf:"bytes,5,opt,name=const,proto3" json:"const,omitempty"` // set iff kind == "Const"
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AuxValue) Reset() {
 	*x = AuxValue{}
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[6]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -475,7 +860,7 @@ func (x *AuxValue) String() string {
 func (*AuxValue) ProtoMessage() {}
 
 func (x *AuxValue) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[6]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -488,7 +873,7 @@ func (x *AuxValue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AuxValue.ProtoReflect.Descriptor instead.
 func (*AuxValue) Descriptor() ([]byte, []int) {
-	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{6}
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *AuxValue) GetId() uint32 {
@@ -519,6 +904,13 @@ func (x *AuxValue) GetType() uint32 {
 	return 0
 }
 
+func (x *AuxValue) GetConst() *ConstValue {
+	if x != nil {
+		return x.Const
+	}
+	return nil
+}
+
 type BasicBlock struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Index         uint32                 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
@@ -530,7 +922,7 @@ type BasicBlock struct {
 
 func (x *BasicBlock) Reset() {
 	*x = BasicBlock{}
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[7]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -542,7 +934,7 @@ func (x *BasicBlock) String() string {
 func (*BasicBlock) ProtoMessage() {}
 
 func (x *BasicBlock) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[7]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -555,7 +947,7 @@ func (x *BasicBlock) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BasicBlock.ProtoReflect.Descriptor instead.
 func (*BasicBlock) Descriptor() ([]byte, []int) {
-	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{7}
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *BasicBlock) GetIndex() uint32 {
@@ -579,21 +971,35 @@ func (x *BasicBlock) GetSuccs() []uint32 {
 	return nil
 }
 
+// Structured payloads for kinds where operands + type are insufficient
+// (phase-2 spec §2.1). kind/detail strings remain for debugging only.
 type Instruction struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Kind          string                 `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"`                 // ssa type name: "Call", "Store", "Phi", …
-	Register      uint32                 `protobuf:"varint,2,opt,name=register,proto3" json:"register,omitempty"`        // value id this instruction defines; 0 if none
-	Type          uint32                 `protobuf:"varint,3,opt,name=type,proto3" json:"type,omitempty"`                // result type id; 0 if none
-	Operands      []uint32               `protobuf:"varint,4,rep,packed,name=operands,proto3" json:"operands,omitempty"` // value ids; 0 for nil operand slots
-	Pos           *Position              `protobuf:"bytes,5,opt,name=pos,proto3" json:"pos,omitempty"`
-	Detail        string                 `protobuf:"bytes,6,opt,name=detail,proto3" json:"detail,omitempty"` // the instruction's canonical ssa String()
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Kind     string                 `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"`
+	Register uint32                 `protobuf:"varint,2,opt,name=register,proto3" json:"register,omitempty"`
+	Type     uint32                 `protobuf:"varint,3,opt,name=type,proto3" json:"type,omitempty"`
+	Operands []uint32               `protobuf:"varint,4,rep,packed,name=operands,proto3" json:"operands,omitempty"`
+	Pos      *Position              `protobuf:"bytes,5,opt,name=pos,proto3" json:"pos,omitempty"`
+	Detail   string                 `protobuf:"bytes,6,opt,name=detail,proto3" json:"detail,omitempty"`
+	// Types that are valid to be assigned to Sem:
+	//
+	//	*Instruction_Binop
+	//	*Instruction_Unop
+	//	*Instruction_Call
+	//	*Instruction_Field
+	//	*Instruction_TypeAssert
+	//	*Instruction_Extract
+	//	*Instruction_Lookup
+	//	*Instruction_Alloc
+	//	*Instruction_Select
+	Sem           isInstruction_Sem `protobuf_oneof:"sem"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Instruction) Reset() {
 	*x = Instruction{}
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[8]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -605,7 +1011,7 @@ func (x *Instruction) String() string {
 func (*Instruction) ProtoMessage() {}
 
 func (x *Instruction) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[8]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -618,7 +1024,7 @@ func (x *Instruction) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Instruction.ProtoReflect.Descriptor instead.
 func (*Instruction) Descriptor() ([]byte, []int) {
-	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{8}
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *Instruction) GetKind() string {
@@ -663,17 +1069,754 @@ func (x *Instruction) GetDetail() string {
 	return ""
 }
 
+func (x *Instruction) GetSem() isInstruction_Sem {
+	if x != nil {
+		return x.Sem
+	}
+	return nil
+}
+
+func (x *Instruction) GetBinop() *BinOpSem {
+	if x != nil {
+		if x, ok := x.Sem.(*Instruction_Binop); ok {
+			return x.Binop
+		}
+	}
+	return nil
+}
+
+func (x *Instruction) GetUnop() *UnOpSem {
+	if x != nil {
+		if x, ok := x.Sem.(*Instruction_Unop); ok {
+			return x.Unop
+		}
+	}
+	return nil
+}
+
+func (x *Instruction) GetCall() *CallSem {
+	if x != nil {
+		if x, ok := x.Sem.(*Instruction_Call); ok {
+			return x.Call
+		}
+	}
+	return nil
+}
+
+func (x *Instruction) GetField() *FieldSem {
+	if x != nil {
+		if x, ok := x.Sem.(*Instruction_Field); ok {
+			return x.Field
+		}
+	}
+	return nil
+}
+
+func (x *Instruction) GetTypeAssert() *TypeAssertSem {
+	if x != nil {
+		if x, ok := x.Sem.(*Instruction_TypeAssert); ok {
+			return x.TypeAssert
+		}
+	}
+	return nil
+}
+
+func (x *Instruction) GetExtract() *ExtractSem {
+	if x != nil {
+		if x, ok := x.Sem.(*Instruction_Extract); ok {
+			return x.Extract
+		}
+	}
+	return nil
+}
+
+func (x *Instruction) GetLookup() *LookupSem {
+	if x != nil {
+		if x, ok := x.Sem.(*Instruction_Lookup); ok {
+			return x.Lookup
+		}
+	}
+	return nil
+}
+
+func (x *Instruction) GetAlloc() *AllocSem {
+	if x != nil {
+		if x, ok := x.Sem.(*Instruction_Alloc); ok {
+			return x.Alloc
+		}
+	}
+	return nil
+}
+
+func (x *Instruction) GetSelect() *SelectSem {
+	if x != nil {
+		if x, ok := x.Sem.(*Instruction_Select); ok {
+			return x.Select
+		}
+	}
+	return nil
+}
+
+type isInstruction_Sem interface {
+	isInstruction_Sem()
+}
+
+type Instruction_Binop struct {
+	Binop *BinOpSem `protobuf:"bytes,7,opt,name=binop,proto3,oneof"`
+}
+
+type Instruction_Unop struct {
+	Unop *UnOpSem `protobuf:"bytes,8,opt,name=unop,proto3,oneof"`
+}
+
+type Instruction_Call struct {
+	Call *CallSem `protobuf:"bytes,9,opt,name=call,proto3,oneof"` // Call, Defer, Go
+}
+
+type Instruction_Field struct {
+	Field *FieldSem `protobuf:"bytes,10,opt,name=field,proto3,oneof"` // Field, FieldAddr
+}
+
+type Instruction_TypeAssert struct {
+	TypeAssert *TypeAssertSem `protobuf:"bytes,11,opt,name=type_assert,json=typeAssert,proto3,oneof"`
+}
+
+type Instruction_Extract struct {
+	Extract *ExtractSem `protobuf:"bytes,12,opt,name=extract,proto3,oneof"`
+}
+
+type Instruction_Lookup struct {
+	Lookup *LookupSem `protobuf:"bytes,13,opt,name=lookup,proto3,oneof"`
+}
+
+type Instruction_Alloc struct {
+	Alloc *AllocSem `protobuf:"bytes,14,opt,name=alloc,proto3,oneof"`
+}
+
+type Instruction_Select struct {
+	Select *SelectSem `protobuf:"bytes,15,opt,name=select,proto3,oneof"`
+}
+
+func (*Instruction_Binop) isInstruction_Sem() {}
+
+func (*Instruction_Unop) isInstruction_Sem() {}
+
+func (*Instruction_Call) isInstruction_Sem() {}
+
+func (*Instruction_Field) isInstruction_Sem() {}
+
+func (*Instruction_TypeAssert) isInstruction_Sem() {}
+
+func (*Instruction_Extract) isInstruction_Sem() {}
+
+func (*Instruction_Lookup) isInstruction_Sem() {}
+
+func (*Instruction_Alloc) isInstruction_Sem() {}
+
+func (*Instruction_Select) isInstruction_Sem() {}
+
+type BinOpSem struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Op            string                 `protobuf:"bytes,1,opt,name=op,proto3" json:"op,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BinOpSem) Reset() {
+	*x = BinOpSem{}
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BinOpSem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BinOpSem) ProtoMessage() {}
+
+func (x *BinOpSem) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BinOpSem.ProtoReflect.Descriptor instead.
+func (*BinOpSem) Descriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *BinOpSem) GetOp() string {
+	if x != nil {
+		return x.Op
+	}
+	return ""
+}
+
+type UnOpSem struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Op            string                 `protobuf:"bytes,1,opt,name=op,proto3" json:"op,omitempty"`
+	CommaOk       bool                   `protobuf:"varint,2,opt,name=comma_ok,json=commaOk,proto3" json:"comma_ok,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UnOpSem) Reset() {
+	*x = UnOpSem{}
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UnOpSem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UnOpSem) ProtoMessage() {}
+
+func (x *UnOpSem) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UnOpSem.ProtoReflect.Descriptor instead.
+func (*UnOpSem) Descriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *UnOpSem) GetOp() string {
+	if x != nil {
+		return x.Op
+	}
+	return ""
+}
+
+func (x *UnOpSem) GetCommaOk() bool {
+	if x != nil {
+		return x.CommaOk
+	}
+	return false
+}
+
+type CallSem struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	StaticCallee  string                 `protobuf:"bytes,1,opt,name=static_callee,json=staticCallee,proto3" json:"static_callee,omitempty"` // ssa function id; "" when dynamic or invoke
+	Method        string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`                                 // invoke mode: plain method name
+	IfaceType     uint32                 `protobuf:"varint,3,opt,name=iface_type,json=ifaceType,proto3" json:"iface_type,omitempty"`         // invoke mode: interface type id
+	Invoke        bool                   `protobuf:"varint,4,opt,name=invoke,proto3" json:"invoke,omitempty"`
+	Builtin       string                 `protobuf:"bytes,5,opt,name=builtin,proto3" json:"builtin,omitempty"`                       // builtin name when callee is *ssa.Builtin
+	MethodSig     uint32                 `protobuf:"varint,6,opt,name=method_sig,json=methodSig,proto3" json:"method_sig,omitempty"` // invoke mode: signature type id of the method
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CallSem) Reset() {
+	*x = CallSem{}
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CallSem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CallSem) ProtoMessage() {}
+
+func (x *CallSem) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CallSem.ProtoReflect.Descriptor instead.
+func (*CallSem) Descriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *CallSem) GetStaticCallee() string {
+	if x != nil {
+		return x.StaticCallee
+	}
+	return ""
+}
+
+func (x *CallSem) GetMethod() string {
+	if x != nil {
+		return x.Method
+	}
+	return ""
+}
+
+func (x *CallSem) GetIfaceType() uint32 {
+	if x != nil {
+		return x.IfaceType
+	}
+	return 0
+}
+
+func (x *CallSem) GetInvoke() bool {
+	if x != nil {
+		return x.Invoke
+	}
+	return false
+}
+
+func (x *CallSem) GetBuiltin() string {
+	if x != nil {
+		return x.Builtin
+	}
+	return ""
+}
+
+func (x *CallSem) GetMethodSig() uint32 {
+	if x != nil {
+		return x.MethodSig
+	}
+	return 0
+}
+
+type FieldSem struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Index         uint32                 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
+	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FieldSem) Reset() {
+	*x = FieldSem{}
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FieldSem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FieldSem) ProtoMessage() {}
+
+func (x *FieldSem) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FieldSem.ProtoReflect.Descriptor instead.
+func (*FieldSem) Descriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *FieldSem) GetIndex() uint32 {
+	if x != nil {
+		return x.Index
+	}
+	return 0
+}
+
+func (x *FieldSem) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+type TypeAssertSem struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Asserted      uint32                 `protobuf:"varint,1,opt,name=asserted,proto3" json:"asserted,omitempty"`
+	CommaOk       bool                   `protobuf:"varint,2,opt,name=comma_ok,json=commaOk,proto3" json:"comma_ok,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TypeAssertSem) Reset() {
+	*x = TypeAssertSem{}
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TypeAssertSem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TypeAssertSem) ProtoMessage() {}
+
+func (x *TypeAssertSem) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TypeAssertSem.ProtoReflect.Descriptor instead.
+func (*TypeAssertSem) Descriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *TypeAssertSem) GetAsserted() uint32 {
+	if x != nil {
+		return x.Asserted
+	}
+	return 0
+}
+
+func (x *TypeAssertSem) GetCommaOk() bool {
+	if x != nil {
+		return x.CommaOk
+	}
+	return false
+}
+
+type ExtractSem struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Index         uint32                 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExtractSem) Reset() {
+	*x = ExtractSem{}
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExtractSem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExtractSem) ProtoMessage() {}
+
+func (x *ExtractSem) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExtractSem.ProtoReflect.Descriptor instead.
+func (*ExtractSem) Descriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *ExtractSem) GetIndex() uint32 {
+	if x != nil {
+		return x.Index
+	}
+	return 0
+}
+
+type LookupSem struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	CommaOk       bool                   `protobuf:"varint,1,opt,name=comma_ok,json=commaOk,proto3" json:"comma_ok,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LookupSem) Reset() {
+	*x = LookupSem{}
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LookupSem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LookupSem) ProtoMessage() {}
+
+func (x *LookupSem) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LookupSem.ProtoReflect.Descriptor instead.
+func (*LookupSem) Descriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *LookupSem) GetCommaOk() bool {
+	if x != nil {
+		return x.CommaOk
+	}
+	return false
+}
+
+type AllocSem struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Heap          bool                   `protobuf:"varint,1,opt,name=heap,proto3" json:"heap,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AllocSem) Reset() {
+	*x = AllocSem{}
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AllocSem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AllocSem) ProtoMessage() {}
+
+func (x *AllocSem) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AllocSem.ProtoReflect.Descriptor instead.
+func (*AllocSem) Descriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *AllocSem) GetHeap() bool {
+	if x != nil {
+		return x.Heap
+	}
+	return false
+}
+
+type SelectSem struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	States        []*SelectState         `protobuf:"bytes,1,rep,name=states,proto3" json:"states,omitempty"`
+	Blocking      bool                   `protobuf:"varint,2,opt,name=blocking,proto3" json:"blocking,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SelectSem) Reset() {
+	*x = SelectSem{}
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SelectSem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SelectSem) ProtoMessage() {}
+
+func (x *SelectSem) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SelectSem.ProtoReflect.Descriptor instead.
+func (*SelectSem) Descriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *SelectSem) GetStates() []*SelectState {
+	if x != nil {
+		return x.States
+	}
+	return nil
+}
+
+func (x *SelectSem) GetBlocking() bool {
+	if x != nil {
+		return x.Blocking
+	}
+	return false
+}
+
+type SelectState struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Dir           uint32                 `protobuf:"varint,1,opt,name=dir,proto3" json:"dir,omitempty"`
+	ChanOperand   uint32                 `protobuf:"varint,2,opt,name=chan_operand,json=chanOperand,proto3" json:"chan_operand,omitempty"`
+	SendOperand   uint32                 `protobuf:"varint,3,opt,name=send_operand,json=sendOperand,proto3" json:"send_operand,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SelectState) Reset() {
+	*x = SelectState{}
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SelectState) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SelectState) ProtoMessage() {}
+
+func (x *SelectState) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SelectState.ProtoReflect.Descriptor instead.
+func (*SelectState) Descriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *SelectState) GetDir() uint32 {
+	if x != nil {
+		return x.Dir
+	}
+	return 0
+}
+
+func (x *SelectState) GetChanOperand() uint32 {
+	if x != nil {
+		return x.ChanOperand
+	}
+	return 0
+}
+
+func (x *SelectState) GetSendOperand() uint32 {
+	if x != nil {
+		return x.SendOperand
+	}
+	return 0
+}
+
+// Method-set entry. func_id is the concrete ssa function implementing the
+// method ("" for interface (abstract) methods). sig excludes the receiver,
+// so interface and implementer entries intern to the same signature id.
+type Method struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`                   // plain method name, e.g. "Close"
+	Sig           uint32                 `protobuf:"varint,2,opt,name=sig,proto3" json:"sig,omitempty"`                    // signature type id
+	FuncId        string                 `protobuf:"bytes,3,opt,name=func_id,json=funcId,proto3" json:"func_id,omitempty"` // ssa function id of the concrete method; "" if abstract
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Method) Reset() {
+	*x = Method{}
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Method) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Method) ProtoMessage() {}
+
+func (x *Method) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Method.ProtoReflect.Descriptor instead.
+func (*Method) Descriptor() ([]byte, []int) {
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *Method) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *Method) GetSig() uint32 {
+	if x != nil {
+		return x.Sig
+	}
+	return 0
+}
+
+func (x *Method) GetFuncId() string {
+	if x != nil {
+		return x.FuncId
+	}
+	return ""
+}
+
 type MethodSet struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Type          uint32                 `protobuf:"varint,1,opt,name=type,proto3" json:"type,omitempty"`      // type id of the named type T
-	Methods       []string               `protobuf:"bytes,2,rep,name=methods,proto3" json:"methods,omitempty"` // fully-qualified method names of *T's method set (T itself if T is an interface), in types.NewMethodSet order
+	Methods       []*Method              `protobuf:"bytes,2,rep,name=methods,proto3" json:"methods,omitempty"` // types.NewMethodSet order (by name)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *MethodSet) Reset() {
 	*x = MethodSet{}
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[9]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -685,7 +1828,7 @@ func (x *MethodSet) String() string {
 func (*MethodSet) ProtoMessage() {}
 
 func (x *MethodSet) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[9]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -698,7 +1841,7 @@ func (x *MethodSet) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MethodSet.ProtoReflect.Descriptor instead.
 func (*MethodSet) Descriptor() ([]byte, []int) {
-	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{9}
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *MethodSet) GetType() uint32 {
@@ -708,7 +1851,7 @@ func (x *MethodSet) GetType() uint32 {
 	return 0
 }
 
-func (x *MethodSet) GetMethods() []string {
+func (x *MethodSet) GetMethods() []*Method {
 	if x != nil {
 		return x.Methods
 	}
@@ -726,7 +1869,7 @@ type Pragma struct {
 
 func (x *Pragma) Reset() {
 	*x = Pragma{}
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[10]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -738,7 +1881,7 @@ func (x *Pragma) String() string {
 func (*Pragma) ProtoMessage() {}
 
 func (x *Pragma) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[10]
+	mi := &file_proto_gvir_v1_gvir_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -751,7 +1894,7 @@ func (x *Pragma) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Pragma.ProtoReflect.Descriptor instead.
 func (*Pragma) Descriptor() ([]byte, []int) {
-	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{10}
+	return file_proto_gvir_v1_gvir_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *Pragma) GetDeclId() string {
@@ -795,10 +1938,36 @@ const file_proto_gvir_v1_gvir_proto_rawDesc = "" +
 	"\apragmas\x18\t \x03(\v2\x0f.gvir.v1.PragmaR\apragmas\"2\n" +
 	"\x04File\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x16\n" +
-	"\x06sha256\x18\x02 \x01(\tR\x06sha256\"*\n" +
+	"\x06sha256\x18\x02 \x01(\tR\x06sha256\"\xb9\x02\n" +
 	"\x04Type\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\rR\x02id\x12\x12\n" +
-	"\x04repr\x18\x02 \x01(\tR\x04repr\"D\n" +
+	"\x04repr\x18\x02 \x01(\tR\x04repr\x12%\n" +
+	"\x04kind\x18\x03 \x01(\x0e2\x11.gvir.v1.TypeKindR\x04kind\x12\x12\n" +
+	"\x04elem\x18\x04 \x01(\rR\x04elem\x12\x10\n" +
+	"\x03key\x18\x05 \x01(\rR\x03key\x12\x1b\n" +
+	"\tarray_len\x18\x06 \x01(\x04R\barrayLen\x12\x19\n" +
+	"\bchan_dir\x18\a \x01(\rR\achanDir\x12&\n" +
+	"\x06fields\x18\b \x03(\v2\x0e.gvir.v1.FieldR\x06fields\x12\x16\n" +
+	"\x06params\x18\t \x03(\rR\x06params\x12\x18\n" +
+	"\aresults\x18\n" +
+	" \x03(\rR\aresults\x12\x1a\n" +
+	"\bvariadic\x18\v \x01(\bR\bvariadic\x12\x12\n" +
+	"\x04name\x18\f \x01(\tR\x04name\"K\n" +
+	"\x05Field\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
+	"\x04type\x18\x02 \x01(\rR\x04type\x12\x1a\n" +
+	"\bembedded\x18\x03 \x01(\bR\bembedded\"\xbf\x01\n" +
+	"\n" +
+	"ConstValue\x12\x14\n" +
+	"\x04bool\x18\x01 \x01(\bH\x00R\x04bool\x12\x12\n" +
+	"\x03int\x18\x02 \x01(\x03H\x00R\x03int\x12\x19\n" +
+	"\abig_int\x18\x03 \x01(\tH\x00R\x06bigInt\x12\x1f\n" +
+	"\n" +
+	"float_bits\x18\x04 \x01(\x04H\x00R\tfloatBits\x12\x12\n" +
+	"\x03str\x18\x05 \x01(\fH\x00R\x03str\x12\x12\n" +
+	"\x03nil\x18\x06 \x01(\bH\x00R\x03nil\x12\x1a\n" +
+	"\acomplex\x18\a \x01(\tH\x00R\acomplexB\a\n" +
+	"\x05value\"D\n" +
 	"\bPosition\x12\x12\n" +
 	"\x04file\x18\x01 \x01(\rR\x04file\x12\x12\n" +
 	"\x04line\x18\x02 \x01(\rR\x04line\x12\x10\n" +
@@ -814,31 +1983,97 @@ const file_proto_gvir_v1_gvir_proto_rawDesc = "" +
 	"\x05Param\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\rR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +
-	"\x04type\x18\x03 \x01(\rR\x04type\"V\n" +
+	"\x04type\x18\x03 \x01(\rR\x04type\"\x81\x01\n" +
 	"\bAuxValue\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\rR\x02id\x12\x12\n" +
 	"\x04kind\x18\x02 \x01(\tR\x04kind\x12\x12\n" +
 	"\x04repr\x18\x03 \x01(\tR\x04repr\x12\x12\n" +
-	"\x04type\x18\x04 \x01(\rR\x04type\"f\n" +
+	"\x04type\x18\x04 \x01(\rR\x04type\x12)\n" +
+	"\x05const\x18\x05 \x01(\v2\x13.gvir.v1.ConstValueR\x05const\"f\n" +
 	"\n" +
 	"BasicBlock\x12\x14\n" +
 	"\x05index\x18\x01 \x01(\rR\x05index\x12,\n" +
 	"\x06instrs\x18\x02 \x03(\v2\x14.gvir.v1.InstructionR\x06instrs\x12\x14\n" +
-	"\x05succs\x18\x03 \x03(\rR\x05succs\"\xaa\x01\n" +
+	"\x05succs\x18\x03 \x03(\rR\x05succs\"\xca\x04\n" +
 	"\vInstruction\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x1a\n" +
 	"\bregister\x18\x02 \x01(\rR\bregister\x12\x12\n" +
 	"\x04type\x18\x03 \x01(\rR\x04type\x12\x1a\n" +
 	"\boperands\x18\x04 \x03(\rR\boperands\x12#\n" +
 	"\x03pos\x18\x05 \x01(\v2\x11.gvir.v1.PositionR\x03pos\x12\x16\n" +
-	"\x06detail\x18\x06 \x01(\tR\x06detail\"9\n" +
+	"\x06detail\x18\x06 \x01(\tR\x06detail\x12)\n" +
+	"\x05binop\x18\a \x01(\v2\x11.gvir.v1.BinOpSemH\x00R\x05binop\x12&\n" +
+	"\x04unop\x18\b \x01(\v2\x10.gvir.v1.UnOpSemH\x00R\x04unop\x12&\n" +
+	"\x04call\x18\t \x01(\v2\x10.gvir.v1.CallSemH\x00R\x04call\x12)\n" +
+	"\x05field\x18\n" +
+	" \x01(\v2\x11.gvir.v1.FieldSemH\x00R\x05field\x129\n" +
+	"\vtype_assert\x18\v \x01(\v2\x16.gvir.v1.TypeAssertSemH\x00R\n" +
+	"typeAssert\x12/\n" +
+	"\aextract\x18\f \x01(\v2\x13.gvir.v1.ExtractSemH\x00R\aextract\x12,\n" +
+	"\x06lookup\x18\r \x01(\v2\x12.gvir.v1.LookupSemH\x00R\x06lookup\x12)\n" +
+	"\x05alloc\x18\x0e \x01(\v2\x11.gvir.v1.AllocSemH\x00R\x05alloc\x12,\n" +
+	"\x06select\x18\x0f \x01(\v2\x12.gvir.v1.SelectSemH\x00R\x06selectB\x05\n" +
+	"\x03sem\"\x1a\n" +
+	"\bBinOpSem\x12\x0e\n" +
+	"\x02op\x18\x01 \x01(\tR\x02op\"4\n" +
+	"\aUnOpSem\x12\x0e\n" +
+	"\x02op\x18\x01 \x01(\tR\x02op\x12\x19\n" +
+	"\bcomma_ok\x18\x02 \x01(\bR\acommaOk\"\xb6\x01\n" +
+	"\aCallSem\x12#\n" +
+	"\rstatic_callee\x18\x01 \x01(\tR\fstaticCallee\x12\x16\n" +
+	"\x06method\x18\x02 \x01(\tR\x06method\x12\x1d\n" +
+	"\n" +
+	"iface_type\x18\x03 \x01(\rR\tifaceType\x12\x16\n" +
+	"\x06invoke\x18\x04 \x01(\bR\x06invoke\x12\x18\n" +
+	"\abuiltin\x18\x05 \x01(\tR\abuiltin\x12\x1d\n" +
+	"\n" +
+	"method_sig\x18\x06 \x01(\rR\tmethodSig\"4\n" +
+	"\bFieldSem\x12\x14\n" +
+	"\x05index\x18\x01 \x01(\rR\x05index\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\"F\n" +
+	"\rTypeAssertSem\x12\x1a\n" +
+	"\basserted\x18\x01 \x01(\rR\basserted\x12\x19\n" +
+	"\bcomma_ok\x18\x02 \x01(\bR\acommaOk\"\"\n" +
+	"\n" +
+	"ExtractSem\x12\x14\n" +
+	"\x05index\x18\x01 \x01(\rR\x05index\"&\n" +
+	"\tLookupSem\x12\x19\n" +
+	"\bcomma_ok\x18\x01 \x01(\bR\acommaOk\"\x1e\n" +
+	"\bAllocSem\x12\x12\n" +
+	"\x04heap\x18\x01 \x01(\bR\x04heap\"U\n" +
+	"\tSelectSem\x12,\n" +
+	"\x06states\x18\x01 \x03(\v2\x14.gvir.v1.SelectStateR\x06states\x12\x1a\n" +
+	"\bblocking\x18\x02 \x01(\bR\bblocking\"e\n" +
+	"\vSelectState\x12\x10\n" +
+	"\x03dir\x18\x01 \x01(\rR\x03dir\x12!\n" +
+	"\fchan_operand\x18\x02 \x01(\rR\vchanOperand\x12!\n" +
+	"\fsend_operand\x18\x03 \x01(\rR\vsendOperand\"G\n" +
+	"\x06Method\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
+	"\x03sig\x18\x02 \x01(\rR\x03sig\x12\x17\n" +
+	"\afunc_id\x18\x03 \x01(\tR\x06funcId\"J\n" +
 	"\tMethodSet\x12\x12\n" +
-	"\x04type\x18\x01 \x01(\rR\x04type\x12\x18\n" +
-	"\amethods\x18\x02 \x03(\tR\amethods\"Z\n" +
+	"\x04type\x18\x01 \x01(\rR\x04type\x12)\n" +
+	"\amethods\x18\x02 \x03(\v2\x0f.gvir.v1.MethodR\amethods\"Z\n" +
 	"\x06Pragma\x12\x17\n" +
 	"\adecl_id\x18\x01 \x01(\tR\x06declId\x12\x12\n" +
 	"\x04text\x18\x02 \x01(\tR\x04text\x12#\n" +
-	"\x03pos\x18\x03 \x01(\v2\x11.gvir.v1.PositionR\x03posB\x1fZ\x1dgoverify.dev/extractor/gvirpbb\x06proto3"
+	"\x03pos\x18\x03 \x01(\v2\x11.gvir.v1.PositionR\x03pos*\xae\x02\n" +
+	"\bTypeKind\x12\x19\n" +
+	"\x15TYPE_KIND_UNSPECIFIED\x10\x00\x12\x13\n" +
+	"\x0fTYPE_KIND_BASIC\x10\x01\x12\x13\n" +
+	"\x0fTYPE_KIND_NAMED\x10\x02\x12\x15\n" +
+	"\x11TYPE_KIND_POINTER\x10\x03\x12\x13\n" +
+	"\x0fTYPE_KIND_SLICE\x10\x04\x12\x13\n" +
+	"\x0fTYPE_KIND_ARRAY\x10\x05\x12\x11\n" +
+	"\rTYPE_KIND_MAP\x10\x06\x12\x12\n" +
+	"\x0eTYPE_KIND_CHAN\x10\a\x12\x14\n" +
+	"\x10TYPE_KIND_STRUCT\x10\b\x12\x17\n" +
+	"\x13TYPE_KIND_INTERFACE\x10\t\x12\x17\n" +
+	"\x13TYPE_KIND_SIGNATURE\x10\n" +
+	"\x12\x13\n" +
+	"\x0fTYPE_KIND_TUPLE\x10\v\x12\x18\n" +
+	"\x14TYPE_KIND_TYPE_PARAM\x10\fB\x1fZ\x1dgoverify.dev/extractor/gvirpbb\x06proto3"
 
 var (
 	file_proto_gvir_v1_gvir_proto_rawDescOnce sync.Once
@@ -852,38 +2087,67 @@ func file_proto_gvir_v1_gvir_proto_rawDescGZIP() []byte {
 	return file_proto_gvir_v1_gvir_proto_rawDescData
 }
 
-var file_proto_gvir_v1_gvir_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_proto_gvir_v1_gvir_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_proto_gvir_v1_gvir_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_proto_gvir_v1_gvir_proto_goTypes = []any{
-	(*Package)(nil),     // 0: gvir.v1.Package
-	(*File)(nil),        // 1: gvir.v1.File
-	(*Type)(nil),        // 2: gvir.v1.Type
-	(*Position)(nil),    // 3: gvir.v1.Position
-	(*Function)(nil),    // 4: gvir.v1.Function
-	(*Param)(nil),       // 5: gvir.v1.Param
-	(*AuxValue)(nil),    // 6: gvir.v1.AuxValue
-	(*BasicBlock)(nil),  // 7: gvir.v1.BasicBlock
-	(*Instruction)(nil), // 8: gvir.v1.Instruction
-	(*MethodSet)(nil),   // 9: gvir.v1.MethodSet
-	(*Pragma)(nil),      // 10: gvir.v1.Pragma
+	(TypeKind)(0),         // 0: gvir.v1.TypeKind
+	(*Package)(nil),       // 1: gvir.v1.Package
+	(*File)(nil),          // 2: gvir.v1.File
+	(*Type)(nil),          // 3: gvir.v1.Type
+	(*Field)(nil),         // 4: gvir.v1.Field
+	(*ConstValue)(nil),    // 5: gvir.v1.ConstValue
+	(*Position)(nil),      // 6: gvir.v1.Position
+	(*Function)(nil),      // 7: gvir.v1.Function
+	(*Param)(nil),         // 8: gvir.v1.Param
+	(*AuxValue)(nil),      // 9: gvir.v1.AuxValue
+	(*BasicBlock)(nil),    // 10: gvir.v1.BasicBlock
+	(*Instruction)(nil),   // 11: gvir.v1.Instruction
+	(*BinOpSem)(nil),      // 12: gvir.v1.BinOpSem
+	(*UnOpSem)(nil),       // 13: gvir.v1.UnOpSem
+	(*CallSem)(nil),       // 14: gvir.v1.CallSem
+	(*FieldSem)(nil),      // 15: gvir.v1.FieldSem
+	(*TypeAssertSem)(nil), // 16: gvir.v1.TypeAssertSem
+	(*ExtractSem)(nil),    // 17: gvir.v1.ExtractSem
+	(*LookupSem)(nil),     // 18: gvir.v1.LookupSem
+	(*AllocSem)(nil),      // 19: gvir.v1.AllocSem
+	(*SelectSem)(nil),     // 20: gvir.v1.SelectSem
+	(*SelectState)(nil),   // 21: gvir.v1.SelectState
+	(*Method)(nil),        // 22: gvir.v1.Method
+	(*MethodSet)(nil),     // 23: gvir.v1.MethodSet
+	(*Pragma)(nil),        // 24: gvir.v1.Pragma
 }
 var file_proto_gvir_v1_gvir_proto_depIdxs = []int32{
-	1,  // 0: gvir.v1.Package.files:type_name -> gvir.v1.File
-	2,  // 1: gvir.v1.Package.types:type_name -> gvir.v1.Type
-	4,  // 2: gvir.v1.Package.functions:type_name -> gvir.v1.Function
-	9,  // 3: gvir.v1.Package.method_sets:type_name -> gvir.v1.MethodSet
-	10, // 4: gvir.v1.Package.pragmas:type_name -> gvir.v1.Pragma
-	5,  // 5: gvir.v1.Function.params:type_name -> gvir.v1.Param
-	6,  // 6: gvir.v1.Function.aux:type_name -> gvir.v1.AuxValue
-	7,  // 7: gvir.v1.Function.blocks:type_name -> gvir.v1.BasicBlock
-	3,  // 8: gvir.v1.Function.pos:type_name -> gvir.v1.Position
-	8,  // 9: gvir.v1.BasicBlock.instrs:type_name -> gvir.v1.Instruction
-	3,  // 10: gvir.v1.Instruction.pos:type_name -> gvir.v1.Position
-	3,  // 11: gvir.v1.Pragma.pos:type_name -> gvir.v1.Position
-	12, // [12:12] is the sub-list for method output_type
-	12, // [12:12] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	2,  // 0: gvir.v1.Package.files:type_name -> gvir.v1.File
+	3,  // 1: gvir.v1.Package.types:type_name -> gvir.v1.Type
+	7,  // 2: gvir.v1.Package.functions:type_name -> gvir.v1.Function
+	23, // 3: gvir.v1.Package.method_sets:type_name -> gvir.v1.MethodSet
+	24, // 4: gvir.v1.Package.pragmas:type_name -> gvir.v1.Pragma
+	0,  // 5: gvir.v1.Type.kind:type_name -> gvir.v1.TypeKind
+	4,  // 6: gvir.v1.Type.fields:type_name -> gvir.v1.Field
+	8,  // 7: gvir.v1.Function.params:type_name -> gvir.v1.Param
+	9,  // 8: gvir.v1.Function.aux:type_name -> gvir.v1.AuxValue
+	10, // 9: gvir.v1.Function.blocks:type_name -> gvir.v1.BasicBlock
+	6,  // 10: gvir.v1.Function.pos:type_name -> gvir.v1.Position
+	5,  // 11: gvir.v1.AuxValue.const:type_name -> gvir.v1.ConstValue
+	11, // 12: gvir.v1.BasicBlock.instrs:type_name -> gvir.v1.Instruction
+	6,  // 13: gvir.v1.Instruction.pos:type_name -> gvir.v1.Position
+	12, // 14: gvir.v1.Instruction.binop:type_name -> gvir.v1.BinOpSem
+	13, // 15: gvir.v1.Instruction.unop:type_name -> gvir.v1.UnOpSem
+	14, // 16: gvir.v1.Instruction.call:type_name -> gvir.v1.CallSem
+	15, // 17: gvir.v1.Instruction.field:type_name -> gvir.v1.FieldSem
+	16, // 18: gvir.v1.Instruction.type_assert:type_name -> gvir.v1.TypeAssertSem
+	17, // 19: gvir.v1.Instruction.extract:type_name -> gvir.v1.ExtractSem
+	18, // 20: gvir.v1.Instruction.lookup:type_name -> gvir.v1.LookupSem
+	19, // 21: gvir.v1.Instruction.alloc:type_name -> gvir.v1.AllocSem
+	20, // 22: gvir.v1.Instruction.select:type_name -> gvir.v1.SelectSem
+	21, // 23: gvir.v1.SelectSem.states:type_name -> gvir.v1.SelectState
+	22, // 24: gvir.v1.MethodSet.methods:type_name -> gvir.v1.Method
+	6,  // 25: gvir.v1.Pragma.pos:type_name -> gvir.v1.Position
+	26, // [26:26] is the sub-list for method output_type
+	26, // [26:26] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_proto_gvir_v1_gvir_proto_init() }
@@ -891,18 +2155,39 @@ func file_proto_gvir_v1_gvir_proto_init() {
 	if File_proto_gvir_v1_gvir_proto != nil {
 		return
 	}
+	file_proto_gvir_v1_gvir_proto_msgTypes[4].OneofWrappers = []any{
+		(*ConstValue_Bool)(nil),
+		(*ConstValue_Int)(nil),
+		(*ConstValue_BigInt)(nil),
+		(*ConstValue_FloatBits)(nil),
+		(*ConstValue_Str)(nil),
+		(*ConstValue_Nil)(nil),
+		(*ConstValue_Complex)(nil),
+	}
+	file_proto_gvir_v1_gvir_proto_msgTypes[10].OneofWrappers = []any{
+		(*Instruction_Binop)(nil),
+		(*Instruction_Unop)(nil),
+		(*Instruction_Call)(nil),
+		(*Instruction_Field)(nil),
+		(*Instruction_TypeAssert)(nil),
+		(*Instruction_Extract)(nil),
+		(*Instruction_Lookup)(nil),
+		(*Instruction_Alloc)(nil),
+		(*Instruction_Select)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_gvir_v1_gvir_proto_rawDesc), len(file_proto_gvir_v1_gvir_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   11,
+			NumEnums:      1,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_proto_gvir_v1_gvir_proto_goTypes,
 		DependencyIndexes: file_proto_gvir_v1_gvir_proto_depIdxs,
+		EnumInfos:         file_proto_gvir_v1_gvir_proto_enumTypes,
 		MessageInfos:      file_proto_gvir_v1_gvir_proto_msgTypes,
 	}.Build()
 	File_proto_gvir_v1_gvir_proto = out.File

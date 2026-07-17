@@ -27,9 +27,56 @@ message File {
   string sha256 = 2;  // hex digest of the source bytes; "" if unreadable
 }
 
+enum TypeKind {
+  TYPE_KIND_UNSPECIFIED = 0;
+  TYPE_KIND_BASIC = 1;       // name = "int", "string", …
+  TYPE_KIND_NAMED = 2;       // name = fully-qualified; elem = underlying type id
+  TYPE_KIND_POINTER = 3;     // elem
+  TYPE_KIND_SLICE = 4;       // elem
+  TYPE_KIND_ARRAY = 5;       // elem, array_len
+  TYPE_KIND_MAP = 6;         // key, elem
+  TYPE_KIND_CHAN = 7;        // elem, chan_dir
+  TYPE_KIND_STRUCT = 8;      // fields
+  TYPE_KIND_INTERFACE = 9;
+  TYPE_KIND_SIGNATURE = 10;  // params, results, variadic
+  TYPE_KIND_TUPLE = 11;      // params
+  TYPE_KIND_TYPE_PARAM = 12;
+}
+
+// Structured form alongside the display repr (phase-2 spec §2.2). All
+// component references are type ids in this package's table; 0 = absent.
 message Type {
-  uint32 id = 1;    // 1-based
-  string repr = 2;  // types.TypeString with full-package-path qualifier
+  uint32 id = 1;         // 1-based
+  string repr = 2;       // types.TypeString, display only — loader never parses it
+  TypeKind kind = 3;
+  uint32 elem = 4;       // pointer/slice/array/chan elem; map value; named underlying
+  uint32 key = 5;        // map key
+  uint64 array_len = 6;
+  uint32 chan_dir = 7;   // types.ChanDir: 0 SendRecv, 1 SendOnly, 2 RecvOnly
+  repeated Field fields = 8;    // struct fields, declaration order
+  repeated uint32 params = 9;   // signature params / tuple members, in order
+  repeated uint32 results = 10; // signature results, in order
+  bool variadic = 11;
+  string name = 12;      // basic: type name; named: fully-qualified name
+}
+
+message Field {
+  string name = 1;
+  uint32 type = 2;
+  bool embedded = 3;
+}
+
+// Structured constant (phase-2 spec §2.3).
+message ConstValue {
+  oneof value {
+    bool bool = 1;
+    int64 int = 2;         // ints representable in i64 (signed or unsigned ≤ MaxInt64)
+    string big_int = 3;    // decimal string when outside i64
+    uint64 float_bits = 4; // IEEE-754 f64 bits
+    bytes str = 5;
+    bool nil = 6;          // always true: the nil / zero-value constant
+    string complex = 7;    // constant.ExactString rendering
+  }
 }
 
 message Position {
@@ -65,6 +112,7 @@ message AuxValue {
   string kind = 2;  // "Const" | "Global" | "Function" | "Builtin" | "FreeVar" | "Value"
   string repr = 3;  // the value's canonical ssa String()
   uint32 type = 4;
+  ConstValue const = 5;  // set iff kind == "Const"
 }
 
 message BasicBlock {
@@ -73,18 +121,58 @@ message BasicBlock {
   repeated uint32 succs = 3;        // successor block indexes
 }
 
+// Structured payloads for kinds where operands + type are insufficient
+// (phase-2 spec §2.1). kind/detail strings remain for debugging only.
 message Instruction {
-  string kind = 1;               // ssa type name: "Call", "Store", "Phi", …
-  uint32 register = 2;           // value id this instruction defines; 0 if none
-  uint32 type = 3;               // result type id; 0 if none
-  repeated uint32 operands = 4;  // value ids; 0 for nil operand slots
+  string kind = 1;
+  uint32 register = 2;
+  uint32 type = 3;
+  repeated uint32 operands = 4;
   Position pos = 5;
-  string detail = 6;             // the instruction's canonical ssa String()
+  string detail = 6;
+  oneof sem {
+    BinOpSem binop = 7;
+    UnOpSem unop = 8;
+    CallSem call = 9;          // Call, Defer, Go
+    FieldSem field = 10;       // Field, FieldAddr
+    TypeAssertSem type_assert = 11;
+    ExtractSem extract = 12;
+    LookupSem lookup = 13;
+    AllocSem alloc = 14;
+    SelectSem select = 15;
+  }
+}
+
+message BinOpSem { string op = 1; }                  // token string: "+", "<", "&^", …
+message UnOpSem  { string op = 1; bool comma_ok = 2; }
+message CallSem {
+  string static_callee = 1;  // ssa function id; "" when dynamic or invoke
+  string method = 2;         // invoke mode: plain method name
+  uint32 iface_type = 3;     // invoke mode: interface type id
+  bool invoke = 4;
+  string builtin = 5;        // builtin name when callee is *ssa.Builtin
+  uint32 method_sig = 6;     // invoke mode: signature type id of the method
+}
+message FieldSem      { uint32 index = 1; string name = 2; }
+message TypeAssertSem { uint32 asserted = 1; bool comma_ok = 2; }
+message ExtractSem    { uint32 index = 1; }
+message LookupSem     { bool comma_ok = 1; }
+message AllocSem      { bool heap = 1; }
+message SelectSem     { repeated SelectState states = 1; bool blocking = 2; }
+message SelectState   { uint32 dir = 1; uint32 chan_operand = 2; uint32 send_operand = 3; }
+
+// Method-set entry. func_id is the concrete ssa function implementing the
+// method ("" for interface (abstract) methods). sig excludes the receiver,
+// so interface and implementer entries intern to the same signature id.
+message Method {
+  string name = 1;     // plain method name, e.g. "Close"
+  uint32 sig = 2;      // signature type id
+  string func_id = 3;  // ssa function id of the concrete method; "" if abstract
 }
 
 message MethodSet {
-  uint32 type = 1;              // type id of the named type T
-  repeated string methods = 2;  // fully-qualified method names of *T's method set (T itself if T is an interface), in types.NewMethodSet order
+  uint32 type = 1;                // type id of the named type T
+  repeated Method methods = 2;    // types.NewMethodSet order (by name)
 }
 
 message Pragma {

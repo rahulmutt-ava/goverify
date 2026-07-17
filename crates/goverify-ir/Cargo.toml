@@ -3,3 +3,17 @@ name = "goverify-ir"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+goverify-extract = { workspace = true }
+# Regular (not dev) dependency: `testutil` below is test-only code, but it
+# lives in `src` (not `tests/`) so Tasks 8, 9, 14, and 16's integration
+# tests can share it via `goverify_ir::testutil`, which requires it to
+# compile as part of the library, not just `cfg(test)`. Accepted cost for
+# phase 2 (see Task 7 brief) despite the plan's "new runtime dep: rayon
+# only" constraint — `tempfile` was already a workspace dependency used by
+# goverify-extract's own tests.
+tempfile = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

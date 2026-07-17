@@ -31,7 +31,12 @@ run = ["cargo fmt --all", "sh -c 'cd extractor && gofmt -w .'"]
 
 [tasks.corpus]
 description = "corpus + determinism suite (full extractor pipeline)"
-run = "cargo test -p goverify-extract --test extract_integration"
+run = [
+  "cargo test -p goverify-extract --test extract_integration",
+  "cargo test -p goverify-ir --test lower_golden --test lower_corpus --test callgraph_corpus",
+  "cargo test -p goverify-analysis --test engine_corpus",
+  "cargo test -p goverify-cli --test debug_integration",
+]
 
 [tasks.bench]
 description = "benchmark suite (populated in phase 5)"
@@ -55,5 +60,8 @@ run = "git config core.hooksPath .githooks"
 
 [tasks.fuzz]
 description = "fuzz smoke run (nightly tier; needs rustup nightly)"
-run = "cargo +nightly fuzz run gvir_decode -- -max_total_time=60"
+run = [
+  "cargo +nightly fuzz run gvir_decode -- -max_total_time=60",
+  "cargo +nightly fuzz run ir_lower -- -max_total_time=60",
+]
 dir = "{{cwd}}"

@@ -130,6 +130,8 @@ fn arb_instruction() -> impl Strategy<Value = gvir::Instruction> {
         "Panic",
         "Send",
         "MakeInterface",
+        "Extract",
+        "TypeAssert",
         "TotallyUnknownKind",
     ]);
     (

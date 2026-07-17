@@ -116,6 +116,26 @@ func TestStructuredConstsAndSems(t *testing.T) {
 	}
 }
 
+// TestUniverseScopeNamed pins emit.go's universe-scope Named branch:
+// `error` has no package, so its emitted name must come from
+// t.Obj().Name() directly and its kind must be NAMED.
+func TestUniverseScopeNamed(t *testing.T) {
+	pkgs := extractCorpus(t, "../testdata/corpus/conc", false)
+	p := pkgs["example.com/conc"]
+	var errT *gvirpb.Type
+	for _, ty := range p.Types {
+		if ty.Repr == "error" {
+			errT = ty
+		}
+	}
+	if errT == nil {
+		t.Fatal("no `error` type interned (conc uses `Close() error`)")
+	}
+	if errT.Kind != gvirpb.TypeKind_TYPE_KIND_NAMED || errT.Name != "error" {
+		t.Errorf("error type: kind=%v name=%q, want NAMED/\"error\"", errT.Kind, errT.Name)
+	}
+}
+
 func TestCallAndSelectSems(t *testing.T) {
 	pkgs := extractCorpus(t, "../testdata/corpus/conc", false)
 	p := pkgs["example.com/conc"]

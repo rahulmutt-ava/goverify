@@ -67,6 +67,13 @@ impl Program {
             let kind = match a.kind.as_str() {
                 "Const" => ValueKind::Const(lower_const(a)),
                 "Global" => ValueKind::Global(a.repr.clone()),
+                // NB: interning here assigns FuncIds in aux-traversal
+                // order for functions first seen via a Function-kind aux
+                // value (e.g. closures referenced before their bodies are
+                // lowered). That order is deterministic (aux tables are
+                // sorted in the .gvir) but is NOT the alphabetical order
+                // pass 1 gives bodies — consumers must not assume FuncId
+                // order == name order.
                 "Function" => ValueKind::FuncRef(self.intern_func(&a.repr)),
                 "Builtin" => ValueKind::Builtin(a.repr.clone()),
                 "FreeVar" => ValueKind::FreeVar,

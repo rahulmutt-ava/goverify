@@ -77,6 +77,30 @@ fn debug_dumps_are_byte_identical_across_extract_and_analyze_runs() {
 }
 
 #[test]
+fn func_flag_on_callgraph_warns() {
+    // Reuse the same extracted gvir dir the other tests use.
+    let dir = tempfile::tempdir().unwrap();
+    extract_conc(dir.path());
+    let out = goverify(
+        &[
+            "debug",
+            "callgraph",
+            "--gvir-dir",
+            dir.path().to_str().unwrap(),
+            "--func",
+            "anything",
+        ],
+        &repo_root(),
+    );
+    assert!(out.status.success(), "debug callgraph must still succeed");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--func has no effect"),
+        "expected ignore-warning on stderr, got: {stderr}"
+    );
+}
+
+#[test]
 fn debug_prepass_and_summary_render() {
     let dir = tempfile::tempdir().unwrap();
     extract_conc(dir.path());

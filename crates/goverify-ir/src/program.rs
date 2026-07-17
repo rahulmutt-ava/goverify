@@ -219,9 +219,11 @@ mod tests {
 
         // Diagnostics should mention the malformed file and appear first
         let diags = p.diagnostics();
-        assert!(
-            !diags.is_empty(),
-            "should have a diagnostic for the malformed file"
+        assert_eq!(
+            diags.len(),
+            1,
+            "exactly one diagnostic (malformed.gvir); readme.txt must be \
+             extension-filtered, not diagnosed: {diags:?}"
         );
         assert!(
             diags[0].contains("malformed.gvir"),

@@ -97,6 +97,11 @@ func example.com/ops.Ptr ()
     v1 = alloc heap=true
     return v1
 
+func example.com/ops.RecvPlain (v1 chan int)
+  b0 -> []
+    v2 = recv v1 ok=false
+    return v2
+
 func example.com/ops.Sl (v1 []int)
   aux v3 = const Int(1)
   aux v4 = const Int(3)

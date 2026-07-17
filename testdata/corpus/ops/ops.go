@@ -29,3 +29,4 @@ func Loop(xs []int) int { // phi, branch, jump
 }
 func Panics(v any)           { panic(v) }       // panic
 func Variadic(xs ...int) int { return len(xs) } // builtin len
+func RecvPlain(ch chan int) int { return <-ch } // unop recv (plain, no comma-ok)

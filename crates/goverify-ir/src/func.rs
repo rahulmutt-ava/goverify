@@ -59,6 +59,10 @@ pub struct Instr {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub instrs: Vec<Instr>,
+    /// Successor block indices as raw wire values — NOT validated against
+    /// `Function::blocks.len()`. Any consumer that indexes `blocks` with
+    /// these must bounds-check (fuzzed input can carry arbitrary ids); see
+    /// `effects::cyclic_blocks` for the filtering pattern.
     pub succs: Vec<u32>,
 }
 

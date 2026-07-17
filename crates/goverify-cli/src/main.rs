@@ -108,6 +108,12 @@ fn run_debug(what: DebugWhat) -> Result<(), Box<dyn std::error::Error>> {
         DebugWhat::Prepass(a) => ("prepass", a),
         DebugWhat::Summary(a) => ("summary", a),
     };
+    // --func filters per-function output; callgraph/sccs dumps are
+    // whole-program (final-review deferred T15) — warn instead of
+    // silently ignoring the flag.
+    if args.func.is_some() && matches!(kind, "callgraph" | "sccs") {
+        eprintln!("goverify: --func has no effect on `debug {kind}`; ignoring");
+    }
     let mut _tmp: Option<tempfile::TempDir> = None; // keep tempdir alive
     let gvir_dir = match args.gvir_dir {
         Some(d) => d,

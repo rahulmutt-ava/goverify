@@ -1,5 +1,6 @@
 //! Analyzer-owned SSA-style IR + call graph (phase 2).
 
+mod callgraph;
 mod dump;
 mod func;
 mod lower;
@@ -9,7 +10,8 @@ mod program;
 pub mod testutil;
 mod types;
 
-pub use dump::dump_function;
+pub use callgraph::CallGraph;
+pub use dump::{dump_callgraph, dump_function};
 pub use func::{Block, ConstVal, Function, Instr, Pos, ValueId, ValueInfo, ValueKind};
 pub use op::{BinOpKind, Callee, LockKind, MakeKind, Op, SelectArm, UnOpKind};
 pub use program::{FuncId, MethodInfo, Program};

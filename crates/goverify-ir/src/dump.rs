@@ -19,6 +19,7 @@
 
 use std::fmt::Write;
 
+use crate::callgraph::CallGraph;
 use crate::func::{Function, ValueId, ValueKind};
 use crate::op::{Callee, Op};
 use crate::program::{FuncId, Program};
@@ -65,6 +66,27 @@ pub fn dump_function(p: &Program, id: FuncId) -> String {
         }
     }
     s
+}
+
+/// Render the call graph (Task 9) as canonical text: one line per function
+/// with any outgoing edges, sorted by caller name, callees sorted by name.
+/// Functions with no edges are omitted entirely (a sparse graph shouldn't
+/// pad output with empty lines). Iterates only vectors already sorted
+/// (`CallGraph::callees`) or explicitly sorted here — no map iteration —
+/// so this is byte-identical across runs, same determinism surface as
+/// `dump_function`.
+pub fn dump_callgraph(p: &Program, g: &CallGraph) -> String {
+    let mut lines: Vec<String> = p
+        .func_ids()
+        .filter(|&f| !g.callees(f).is_empty())
+        .map(|f| {
+            let mut names: Vec<&str> = g.callees(f).iter().map(|&c| p.func_name(c)).collect();
+            names.sort_unstable();
+            format!("{} -> {}", p.func_name(f), names.join(", "))
+        })
+        .collect();
+    lines.sort_unstable();
+    lines.join("\n") + "\n"
 }
 
 fn render_callee(p: &Program, c: &Callee) -> String {

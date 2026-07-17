@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	schemaVersion    = "1"
+	schemaVersion    = "2"
 	extractorVersion = "0.1.0"
 )
 
@@ -238,8 +238,8 @@ func auxKind(v ssa.Value) string {
 
 // emitMethodSets records, for each named type declared in the package,
 // the full method set of *T (or of T itself for interfaces), as
-// fully-qualified method names sorted by the method-set order (which
-// types.NewMethodSet defines deterministically, by name).
+// Method entries (plain name + signature type id) in the method-set
+// order (which types.NewMethodSet defines deterministically, by name).
 func (e *emitter) emitMethodSets(sp *ssa.Package) {
 	names := make([]string, 0, len(sp.Members))
 	for name, m := range sp.Members {
@@ -261,7 +261,11 @@ func (e *emitter) emitMethodSets(sp *ssa.Package) {
 		}
 		pb := &gvirpb.MethodSet{Type: e.typeID(T)}
 		for i := range ms.Len() {
-			pb.Methods = append(pb.Methods, ms.At(i).Obj().(*types.Func).FullName())
+			obj := ms.At(i).Obj().(*types.Func)
+			pb.Methods = append(pb.Methods, &gvirpb.Method{
+				Name: obj.Name(),
+				Sig:  e.typeID(ms.At(i).Type()),
+			})
 		}
 		e.out.MethodSets = append(e.out.MethodSets, pb)
 	}

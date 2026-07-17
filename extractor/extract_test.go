@@ -44,8 +44,8 @@ func TestExtractHelloMetadata(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing package example.com/hello; got %v", keys(pkgs))
 	}
-	if p.GetSchemaVersion() != "1" {
-		t.Errorf("schema_version = %q, want \"1\"", p.GetSchemaVersion())
+	if p.GetSchemaVersion() != "2" {
+		t.Errorf("schema_version = %q, want \"2\"", p.GetSchemaVersion())
 	}
 	if !strings.HasPrefix(p.GetGoVersion(), "go") {
 		t.Errorf("go_version = %q, want go1.x", p.GetGoVersion())
@@ -203,9 +203,11 @@ func TestExtractMethodSets(t *testing.T) {
 		t.Fatalf("method_sets = %v, want exactly one (Counter)", p.GetMethodSets())
 	}
 	ms := p.GetMethodSets()[0]
-	want := []string{"(*example.com/hello.Counter).Inc"}
-	if len(ms.GetMethods()) != 1 || ms.GetMethods()[0] != want[0] {
-		t.Errorf("Counter methods = %v, want %v", ms.GetMethods(), want)
+	if len(ms.GetMethods()) != 1 || ms.GetMethods()[0].GetName() != "Inc" {
+		t.Errorf("Counter methods = %v, want [Inc]", ms.GetMethods())
+	}
+	if ms.GetMethods()[0].GetSig() == 0 {
+		t.Error("Counter.Inc method has no signature type id")
 	}
 }
 

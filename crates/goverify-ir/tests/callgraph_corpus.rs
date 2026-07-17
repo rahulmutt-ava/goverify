@@ -19,6 +19,55 @@ fn invoke_call_resolves_to_concrete_impl() {
     );
 }
 
+/// Regression (final-review C1): `Renamer.Rename` is declared with named
+/// params/results (`Rename(newName string) (ok bool, err error)`); its
+/// only implementer, `Thing.Rename`, uses a differently-named param and
+/// unnamed results (`Rename(n string) (bool, error)`). Before the
+/// structural-signature-key fix, `emit.go`'s per-repr TypeId interning
+/// gave these two declarations different sig TypeIds despite being
+/// structurally identical, so the exact-TypeId match in
+/// `resolve_invoke`/method-set-inclusion silently dropped the edge.
+#[test]
+fn invoke_call_resolves_despite_differently_named_params() {
+    let p = testutil::load_corpus("conc");
+    let g = CallGraph::build(&p);
+    let rename_all = p.lookup_func("example.com/conc.RenameAll").unwrap();
+    let rename = p.lookup_func("(*example.com/conc.Thing).Rename").unwrap();
+    assert!(
+        g.callees(rename_all).contains(&rename),
+        "RenameAll must edge to (*Thing).Rename despite differently-named \
+         interface vs implementation params; got {:?}",
+        g.callees(rename_all)
+            .iter()
+            .map(|&f| p.func_name(f))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Regression (final-review C1): `InvokeCB`'s dynamic call `cb("hi")` is
+/// through a parameter declared `func(x string) int`, but the function
+/// value passed to it (`NamedParamImpl`) is declared `func(m string)
+/// int` — same underlying structure, different parameter name. Before
+/// the fix, the address-taken map (keyed by raw sig TypeId) never
+/// matched the call site's dynamic-lookup key, so the edge to
+/// `NamedParamImpl` was silently dropped.
+#[test]
+fn dynamic_call_resolves_despite_differently_named_params() {
+    let p = testutil::load_corpus("conc");
+    let g = CallGraph::build(&p);
+    let invoke_cb = p.lookup_func("example.com/conc.InvokeCB").unwrap();
+    let named_param_impl = p.lookup_func("example.com/conc.NamedParamImpl").unwrap();
+    assert!(
+        g.callees(invoke_cb).contains(&named_param_impl),
+        "InvokeCB must edge to NamedParamImpl despite differently-named \
+         func-type params; got {:?}",
+        g.callees(invoke_cb)
+            .iter()
+            .map(|&f| p.func_name(f))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn go_closure_edges_to_the_closure_body() {
     let p = testutil::load_corpus("conc");

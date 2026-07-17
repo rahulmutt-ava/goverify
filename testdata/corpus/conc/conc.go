@@ -35,3 +35,45 @@ func Fan(a, b chan int) int {
 		return 0
 	}
 }
+
+// Renamer/Thing/RenameAll regression (final-review C1): the interface
+// declares NAMED params/results; Thing's own implementation uses a
+// DIFFERENTLY-named param and unnamed results — the norm for real Go
+// (io.Writer's `Write(p []byte) (n int, err error)` vs almost every
+// concrete Write method). `emit.go` interns a signature's TypeId by its
+// full repr string (parameter names included), so the interface's
+// declared signature and Thing's own declared signature land on
+// different TypeIds despite being structurally identical; a
+// signature-matcher keyed on the raw TypeId must not let that drop the
+// invoke edge.
+type Renamer interface {
+	Rename(newName string) (ok bool, err error)
+}
+
+// Thing is exported for the same reason File is (see above): so
+// ssautil.AllFunctions roots (*Thing).Rename, which is otherwise reached
+// only through RenameAll's invoke-mode dispatch.
+type Thing struct{}
+
+func (Thing) Rename(n string) (bool, error) { return true, nil }
+
+func RenameAll(rs []Renamer) {
+	for _, r := range rs {
+		_, _ = r.Rename("x") // invoke-mode call
+	}
+}
+
+// InvokeCB/NamedParamImpl/UseNamedParamImpl regression (final-review
+// C1): a dynamic call through a function-typed parameter whose declared
+// signature names its parameter differently than the function value
+// passed to it — same root cause as above, exercised through
+// address-taken/Callee::Dynamic resolution instead of invoke-mode.
+func InvokeCB(cb func(x string) int) int {
+	return cb("hi")
+}
+
+func NamedParamImpl(m string) int { return len(m) }
+
+func UseNamedParamImpl() int {
+	return InvokeCB(NamedParamImpl)
+}

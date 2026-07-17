@@ -8,15 +8,22 @@ use std::collections::{BTreeSet, HashMap};
 use crate::func::{ValueId, ValueKind};
 use crate::op::{Callee, Op, SelectArm};
 use crate::program::{FuncId, MethodInfo, Program};
-use crate::types::TypeId;
+use crate::types::{StructuralKey, StructuralKeyCache, TypeId};
 
 pub struct CallGraph {
     callees: Vec<Vec<FuncId>>, // indexed by FuncId
 }
 
-/// `(method name, sig) → [(owner type's method set, concrete FuncId)]`,
-/// the index `resolve_invoke` filters by method-set inclusion.
-type MethodIndex<'a> = HashMap<(&'a str, TypeId), Vec<(&'a Vec<MethodInfo>, FuncId)>>;
+/// `(method name, structural sig key) → [(owner type's method set,
+/// concrete FuncId)]`, the index `resolve_invoke` filters by method-set
+/// inclusion. Keyed by `StructuralKey` rather than the raw sig `TypeId`
+/// (final-review C1): `emit.go` interns a signature's `TypeId` by its
+/// *full* repr string, which includes parameter/result names, so an
+/// interface method and its implementer's differently-named-but-
+/// structurally-identical signature (the norm — `io.Writer`'s `Write(p
+/// []byte) (n int, err error)` vs almost every concrete `Write` method)
+/// would otherwise never match here.
+type MethodIndex<'a> = HashMap<(&'a str, StructuralKey), Vec<(&'a Vec<MethodInfo>, FuncId)>>;
 
 impl CallGraph {
     pub fn callees(&self, f: FuncId) -> &[FuncId] {
@@ -24,8 +31,11 @@ impl CallGraph {
     }
 
     pub fn build(p: &Program) -> CallGraph {
-        // Index 1: (method name, sig) → [(owner type methods, concrete FuncId)]
-        // Index 2: address-taken functions grouped by signature TypeId.
+        let mut keys = StructuralKeyCache::new();
+        // Index 1: (method name, structural sig key) → [(owner type
+        // methods, concrete FuncId)].
+        // Index 2: address-taken functions grouped by structural
+        // signature key.
         let mut by_name_sig: MethodIndex = HashMap::new();
         for methods in p.method_sets.values() {
             if methods.iter().any(|m| m.func.is_none()) {
@@ -33,26 +43,19 @@ impl CallGraph {
             }
             for m in methods {
                 if let Some(f) = m.func {
+                    let key = keys.key(p.types(), m.sig);
                     by_name_sig
-                        .entry((m.name.as_str(), m.sig))
+                        .entry((m.name.as_str(), key))
                         .or_default()
                         .push((methods, f));
                 }
             }
         }
-        let mut address_taken: HashMap<TypeId, BTreeSet<FuncId>> = HashMap::new();
+        let mut address_taken: HashMap<StructuralKey, BTreeSet<FuncId>> = HashMap::new();
         for id in p.func_ids() {
             let Some(f) = p.func(id) else { continue };
             for b in &f.blocks {
                 for ins in &b.instrs {
-                    let mut mark = |v: ValueId| {
-                        if let ValueKind::FuncRef(target) = &f.value(v).kind {
-                            address_taken
-                                .entry(f.value(v).ty)
-                                .or_default()
-                                .insert(*target);
-                        }
-                    };
                     // Unconditional, every op: covers every plain value
                     // operand *and* `MakeClosure`'s `bindings` (a captured
                     // value that is itself a bare `FuncRef` — e.g. `g :=
@@ -63,17 +66,18 @@ impl CallGraph {
                     // short-circuit `MakeClosure` before reaching this
                     // scan).
                     for v in op_value_operands(&ins.op) {
-                        mark(v);
+                        if let ValueKind::FuncRef(target) = &f.value(v).kind {
+                            let key = keys.key(p.types(), f.value(v).ty);
+                            address_taken.entry(key).or_default().insert(*target);
+                        }
                     }
                     // `func` is a `FuncId` embedded directly in the op, not
                     // a `ValueId` in the value table, so it can't come
                     // through `op_value_operands` above — recorded here
                     // separately, in addition to (not instead of) the scan.
                     if let Op::MakeClosure { func, dst, .. } = &ins.op {
-                        address_taken
-                            .entry(f.value(*dst).ty)
-                            .or_default()
-                            .insert(*func);
+                        let key = keys.key(p.types(), f.value(*dst).ty);
+                        address_taken.entry(key).or_default().insert(*func);
                     }
                 }
             }
@@ -97,10 +101,12 @@ impl CallGraph {
                         }
                         Callee::Builtin(_) => {}
                         Callee::Invoke { iface, method, sig } => {
-                            resolve_invoke(p, &by_name_sig, *iface, method, *sig, out);
+                            let key = keys.key(p.types(), *sig);
+                            resolve_invoke(p, &mut keys, &by_name_sig, *iface, method, key, out);
                         }
                         Callee::Dynamic { value } => {
-                            if let Some(set) = address_taken.get(&f.value(*value).ty) {
+                            let key = keys.key(p.types(), f.value(*value).ty);
+                            if let Some(set) = address_taken.get(&key) {
                                 out.extend(set.iter().copied());
                             }
                         }
@@ -119,17 +125,23 @@ impl CallGraph {
 
 fn resolve_invoke(
     p: &Program,
+    keys: &mut StructuralKeyCache,
     by_name_sig: &MethodIndex,
     iface: TypeId,
     method: &str,
-    sig: TypeId,
+    sig: StructuralKey,
     out: &mut BTreeSet<FuncId>,
 ) {
     let Some(candidates) = by_name_sig.get(&(method, sig)) else {
         return;
     };
     // Interface's own method set, when known, filters candidates to true
-    // implementers (method-set inclusion).
+    // implementers (method-set inclusion). Compared by structural key,
+    // not raw `sig` `TypeId` — same C1 rationale as the `by_name_sig`
+    // lookup above: the interface's declared method signature and the
+    // implementer's own declared signature are two separately-interned
+    // `TypeId`s whenever their parameter/result names differ, even when
+    // structurally identical.
     let iface_ms: Option<&Vec<MethodInfo>> = p
         .method_sets
         .get(&iface)
@@ -137,9 +149,10 @@ fn resolve_invoke(
     for (impl_ms, f) in candidates {
         let implements = match iface_ms {
             Some(req) => req.iter().all(|rm| {
+                let rm_key = keys.key(p.types(), rm.sig);
                 impl_ms
                     .iter()
-                    .any(|im| im.name == rm.name && im.sig == rm.sig)
+                    .any(|im| im.name == rm.name && keys.key(p.types(), im.sig) == rm_key)
             }),
             None => true, // anonymous iface: name+sig fallback
         };

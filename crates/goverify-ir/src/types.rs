@@ -2,7 +2,7 @@
 //! canonical repr string. Per-package .gvir type ids are local; importing
 //! a package returns the local→global mapping.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use goverify_extract::gvir;
 
@@ -171,6 +171,151 @@ impl TypeTable {
     }
 }
 
+/// Name-free structural key for a `TypeId` (final-review C1): two
+/// `TypeId`s that are textually distinct only because of parameter/result
+/// *names* on a `Signature` (or on any type nested inside one) — e.g. the
+/// interface method `Write(p []byte) (n int, err error)` vs the
+/// implementer's `Write(b []byte) (int, error)` — must still compare
+/// equal here, because Go signature identity never includes parameter or
+/// result names. `emit.go`'s `typeID` interns by the *full* canonical
+/// repr string (`types.TypeString`), which does include those names, so
+/// two structurally-identical signatures land on different `TypeId`s;
+/// this key recovers the structural equivalence by walking each type's
+/// `TypeKind` components (which are already name-free `TypeId`s, or in
+/// the one case that legitimately carries semantic names — `Named`'s own
+/// name, and `Struct`'s field names, both part of real Go type identity —
+/// preserved verbatim) instead of ever re-reading a `repr` string.
+///
+/// Over-merging structurally-identical-but-distinct types is the safe
+/// direction (it can only widen a call-graph edge set, never narrow it);
+/// under-matching is not, so this must never fall back to per-repr
+/// comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StructuralKey {
+    Basic(String),
+    Named(String, Box<StructuralKey>),
+    Pointer(Box<StructuralKey>),
+    Slice(Box<StructuralKey>),
+    Array(Box<StructuralKey>, u64),
+    Map(Box<StructuralKey>, Box<StructuralKey>),
+    Chan(Box<StructuralKey>, u32),
+    Struct(Vec<(String, StructuralKey, bool)>),
+    Interface,
+    Signature(Vec<StructuralKey>, Vec<StructuralKey>, bool),
+    Tuple(Vec<StructuralKey>),
+    TypeParam,
+    Unknown,
+    /// A cycle was detected on the current recursion path (never a
+    /// legitimate Go type, but this reads types built from possibly
+    /// malformed/fuzzed `.gvir` input, so it must degrade rather than
+    /// recurse forever). Distinct types that both hit a cycle collapse to
+    /// this same key — an over-merge, the safe direction.
+    Cyclic,
+}
+
+/// Memoizing computer for `StructuralKey`s, shared across the many lookups
+/// a single `CallGraph::build` performs (one whole-program computation, not
+/// re-derived from scratch per call site).
+#[derive(Debug, Default)]
+pub struct StructuralKeyCache {
+    cache: HashMap<TypeId, StructuralKey>,
+}
+
+impl StructuralKeyCache {
+    pub fn new() -> StructuralKeyCache {
+        StructuralKeyCache::default()
+    }
+
+    pub fn key(&mut self, types: &TypeTable, id: TypeId) -> StructuralKey {
+        let mut on_path: HashSet<TypeId> = HashSet::new();
+        Self::compute(types, id, &mut self.cache, &mut on_path)
+    }
+
+    /// `on_path` tracks `TypeId`s currently being expanded on *this*
+    /// recursion path (not "ever visited") — a proper cycle detector, as
+    /// opposed to a depth cap, that never mistakes a DAG's legitimate
+    /// diamond-shaped sharing (the same component type reached twice via
+    /// different branches, which is common and must key identically) for
+    /// a cycle. `cache` is keyed by plain `TypeId` and shared across the
+    /// whole `StructuralKeyCache`, so repeated sub-structure is computed
+    /// once regardless of how many times it's reached.
+    fn compute(
+        types: &TypeTable,
+        id: TypeId,
+        cache: &mut HashMap<TypeId, StructuralKey>,
+        on_path: &mut HashSet<TypeId>,
+    ) -> StructuralKey {
+        if let Some(k) = cache.get(&id) {
+            return k.clone();
+        }
+        if !on_path.insert(id) {
+            return StructuralKey::Cyclic; // not cached: path-dependent
+        }
+        let key = match types.kind(id) {
+            TypeKind::Basic { name } => StructuralKey::Basic(name.clone()),
+            TypeKind::Named { name, underlying } => StructuralKey::Named(
+                name.clone(),
+                Box::new(Self::compute(types, *underlying, cache, on_path)),
+            ),
+            TypeKind::Pointer { elem } => {
+                StructuralKey::Pointer(Box::new(Self::compute(types, *elem, cache, on_path)))
+            }
+            TypeKind::Slice { elem } => {
+                StructuralKey::Slice(Box::new(Self::compute(types, *elem, cache, on_path)))
+            }
+            TypeKind::Array { elem, len } => {
+                StructuralKey::Array(Box::new(Self::compute(types, *elem, cache, on_path)), *len)
+            }
+            TypeKind::Map { key, value } => StructuralKey::Map(
+                Box::new(Self::compute(types, *key, cache, on_path)),
+                Box::new(Self::compute(types, *value, cache, on_path)),
+            ),
+            TypeKind::Chan { elem, dir } => {
+                StructuralKey::Chan(Box::new(Self::compute(types, *elem, cache, on_path)), *dir)
+            }
+            TypeKind::Struct { fields } => StructuralKey::Struct(
+                fields
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.name.clone(),
+                            Self::compute(types, f.ty, cache, on_path),
+                            f.embedded,
+                        )
+                    })
+                    .collect(),
+            ),
+            TypeKind::Interface => StructuralKey::Interface,
+            TypeKind::Signature {
+                params,
+                results,
+                variadic,
+            } => StructuralKey::Signature(
+                params
+                    .iter()
+                    .map(|&t| Self::compute(types, t, cache, on_path))
+                    .collect(),
+                results
+                    .iter()
+                    .map(|&t| Self::compute(types, t, cache, on_path))
+                    .collect(),
+                *variadic,
+            ),
+            TypeKind::Tuple { elems } => StructuralKey::Tuple(
+                elems
+                    .iter()
+                    .map(|&t| Self::compute(types, t, cache, on_path))
+                    .collect(),
+            ),
+            TypeKind::TypeParam => StructuralKey::TypeParam,
+            TypeKind::Unknown => StructuralKey::Unknown,
+        };
+        on_path.remove(&id);
+        cache.insert(id, key.clone());
+        key
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +407,143 @@ mod tests {
         if overflow_id < map.len() {
             assert!(matches!(table.kind(map[overflow_id]), TypeKind::Unknown));
         }
+    }
+
+    /// Regression (final-review C1): two `Signature` `TypeId`s interned
+    /// from different top-level reprs — as `emit.go`'s `typeID` would for
+    /// `func(p []byte) (n int, err error)` vs `func(b []byte) (int,
+    /// error)` — but with identical structural components (same
+    /// param/result component `TypeId`s) must produce the same
+    /// `StructuralKey`.
+    #[test]
+    fn structural_key_ignores_signature_param_names() {
+        use goverify_extract::gvir;
+        let pkg = vec![
+            gvir::Type {
+                id: 1,
+                repr: "[]byte".into(),
+                kind: gvir::TypeKind::Slice as i32,
+                elem: 2,
+                ..Default::default()
+            },
+            gvir::Type {
+                id: 2,
+                repr: "byte".into(),
+                kind: gvir::TypeKind::Basic as i32,
+                name: "byte".into(),
+                ..Default::default()
+            },
+            gvir::Type {
+                id: 3,
+                repr: "int".into(),
+                kind: gvir::TypeKind::Basic as i32,
+                name: "int".into(),
+                ..Default::default()
+            },
+            gvir::Type {
+                id: 4,
+                repr: "error".into(),
+                kind: gvir::TypeKind::Basic as i32,
+                name: "error".into(),
+                ..Default::default()
+            },
+            gvir::Type {
+                id: 5,
+                repr: "func(p []byte) (n int, err error)".into(),
+                kind: gvir::TypeKind::Signature as i32,
+                params: vec![1],
+                results: vec![3, 4],
+                ..Default::default()
+            },
+            gvir::Type {
+                id: 6,
+                repr: "func(b []byte) (int, error)".into(),
+                kind: gvir::TypeKind::Signature as i32,
+                params: vec![1],
+                results: vec![3, 4],
+                ..Default::default()
+            },
+        ];
+        let mut table = TypeTable::default();
+        let map = table.import_package(&pkg);
+        assert_ne!(
+            map[5], map[6],
+            "the two reprs must intern to different TypeIds (that's the bug's precondition)"
+        );
+        let mut keys = StructuralKeyCache::new();
+        assert_eq!(
+            keys.key(&table, map[5]),
+            keys.key(&table, map[6]),
+            "signatures differing only in param/result names must key identically"
+        );
+    }
+
+    #[test]
+    fn structural_key_distinguishes_genuinely_different_signatures() {
+        use goverify_extract::gvir;
+        let pkg = vec![
+            gvir::Type {
+                id: 1,
+                repr: "int".into(),
+                kind: gvir::TypeKind::Basic as i32,
+                name: "int".into(),
+                ..Default::default()
+            },
+            gvir::Type {
+                id: 2,
+                repr: "string".into(),
+                kind: gvir::TypeKind::Basic as i32,
+                name: "string".into(),
+                ..Default::default()
+            },
+            gvir::Type {
+                id: 3,
+                repr: "func(int) int".into(),
+                kind: gvir::TypeKind::Signature as i32,
+                params: vec![1],
+                results: vec![1],
+                ..Default::default()
+            },
+            gvir::Type {
+                id: 4,
+                repr: "func(string) int".into(),
+                kind: gvir::TypeKind::Signature as i32,
+                params: vec![2],
+                results: vec![1],
+                ..Default::default()
+            },
+        ];
+        let mut table = TypeTable::default();
+        let map = table.import_package(&pkg);
+        let mut keys = StructuralKeyCache::new();
+        assert_ne!(
+            keys.key(&table, map[3]),
+            keys.key(&table, map[4]),
+            "genuinely different param types must not collapse to the same key"
+        );
+    }
+
+    /// A self-referential `Named` type (malformed/fuzzed `.gvir` — never
+    /// legitimate Go) must degrade to `StructuralKey::Cyclic`, not recurse
+    /// forever.
+    #[test]
+    fn structural_key_handles_cyclic_type_without_hanging() {
+        use goverify_extract::gvir;
+        let pkg = vec![gvir::Type {
+            id: 1,
+            repr: "t.Self".into(),
+            kind: gvir::TypeKind::Named as i32,
+            name: "t.Self".into(),
+            elem: 1, // self-referential
+            ..Default::default()
+        }];
+        let mut table = TypeTable::default();
+        let map = table.import_package(&pkg);
+        let mut keys = StructuralKeyCache::new();
+        let k = keys.key(&table, map[1]); // must return, not hang
+        assert_eq!(
+            k,
+            StructuralKey::Named("t.Self".into(), Box::new(StructuralKey::Cyclic))
+        );
     }
 }

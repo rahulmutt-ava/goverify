@@ -380,7 +380,7 @@ mod tests {
     use super::*;
     use crate::SatResult;
     use crate::printer::{Logic, Query};
-    use crate::sort::ptr_sort;
+    use crate::sort::{Sort, ptr_sort};
     use crate::term::{Term, ptr_is_nil};
 
     #[test]
@@ -428,16 +428,51 @@ mod tests {
             "print∘parse must be a fixpoint"
         );
     }
+
+    /// Deterministic (non-random) coverage for the five `parse_term` arms
+    /// the round-trip property's generators previously never reached:
+    /// `or`, `=>`, `ite`, a constructor applied to non-empty args
+    /// (`ptr-addr`), and a field accessor (`ptr-addr-val`). Random
+    /// sampling can still miss rare branches by luck; this pins each one
+    /// down explicitly so none of them silently regress.
+    #[test]
+    fn query_round_trips_covers_or_implies_ite_ctor_and_accessor() {
+        use crate::sort::ptr_datatype;
+
+        let b = Term::var("b", Sort::Bool);
+        let addr = Term::dt_ctor(&ptr_datatype(), "ptr-addr", vec![Term::bv_lit(64, 7)])
+            .expect("ptr-addr is a valid unary constructor");
+        let val = Term::dt_get(&ptr_datatype(), "ptr-addr", "ptr-addr-val", addr.clone())
+            .expect("ptr-addr-val is a valid accessor");
+        let asserts = vec![
+            Term::or(vec![b.clone(), Term::bool_lit(false)]).unwrap(),
+            Term::implies(b.clone(), Term::bool_lit(true)).unwrap(),
+            Term::ite(b, Term::bv_lit(8, 1), Term::bv_lit(8, 2)).unwrap(),
+            Term::eq(val, Term::bv_lit(64, 7)).unwrap(),
+            Term::not(ptr_is_nil(addr).unwrap()).unwrap(),
+        ];
+        for a in asserts {
+            let q = Query::for_asserts(Logic::All, vec![a]);
+            let text = q.canonical_text();
+            let parsed = parse_query(&text)
+                .unwrap_or_else(|e| panic!("canonical text must parse: {e}\n{text}"));
+            assert_eq!(
+                parsed.canonical_text(),
+                text,
+                "print∘parse must be a fixpoint:\n{text}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod props {
     use proptest::prelude::*;
-    use proptest::strategy::BoxedStrategy;
+    use proptest::strategy::{BoxedStrategy, Union};
 
     use super::*;
     use crate::printer::{Logic, Query};
-    use crate::sort::{Sort, ptr_sort};
+    use crate::sort::{Sort, ptr_datatype, ptr_sort};
     use crate::term::{BvBinOp, BvCmpOp, Term, ptr_is_nil, ptr_nil};
 
     // Sort-directed generators: each function only ever produces terms of
@@ -447,7 +482,10 @@ mod props {
     // generate-then-filter-and-retry, which (tried first) compounds
     // across recursion into a reject rate no budget converges on in
     // reasonable time. Every theory (bool, bitvec, array, Ptr datatype)
-    // still shows up, same as the flat leaf pool this replaces.
+    // shows up, AND every `parse_term` node kind is reachable: `eq`,
+    // `not`, `and`, `or`, `=>`, `ite`, `bvult`/`bvadd`, `select`/`store`,
+    // `(_ is ptr-nil)`, a constructor applied to non-empty args
+    // (`ptr-addr`), and a field accessor (`ptr-addr-val`).
     const DEPTH: u32 = 3;
 
     fn arb_bool(depth: u32) -> BoxedStrategy<Term> {
@@ -465,36 +503,92 @@ mod props {
             1 => arb_bool(d).prop_map(|a| Term::not(a).unwrap()),
             1 => prop::collection::vec(arb_bool(d), 1..3)
                 .prop_map(|ts| Term::and(ts).unwrap()),
-            1 => (arb_bv(d), arb_bv(d))
+            1 => prop::collection::vec(arb_bool(d), 1..3)
+                .prop_map(|ts| Term::or(ts).unwrap()),
+            1 => (arb_bool(d), arb_bool(d))
+                .prop_map(|(a, b)| Term::implies(a, b).unwrap()),
+            1 => (arb_bool(d), arb_bool(d), arb_bool(d))
+                .prop_map(|(c, t, e)| Term::ite(c, t, e).unwrap()),
+            1 => (arb_bv(d, 8), arb_bv(d, 8))
                 .prop_map(|(a, b)| Term::bv_cmp(BvCmpOp::Ult, a, b).unwrap()),
             1 => arb_ptr(d).prop_map(|a| ptr_is_nil(a).unwrap()),
-            1 => (arb_arr(d), arb_bv(d)).prop_map(|(a, i)| Term::select(a, i).unwrap()),
+            1 => (arb_arr(d), arb_bv(d, 8)).prop_map(|(a, i)| Term::select(a, i).unwrap()),
         ]
         .boxed()
     }
 
-    fn arb_bv(depth: u32) -> BoxedStrategy<Term> {
-        let leaf = prop_oneof![
-            (0u128..256).prop_map(|v| Term::bv_lit(8, v)),
-            Just(Term::var("x", Sort::BitVec(8))),
+    /// `width` is either 8 (the array/comparison/general-purpose BitVec
+    /// sort used everywhere else) or 64 (only ever needed for the
+    /// `ptr-addr` field, `ptr-addr-val`); kept as one parameterized
+    /// generator, rather than a near-duplicate second function, so the
+    /// `ptr-addr-val` accessor path is visibly "arb_bv at width 64" and
+    /// not a special case bolted on elsewhere.
+    fn arb_bv(depth: u32, width: u32) -> BoxedStrategy<Term> {
+        let max: u128 = if width >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << width) - 1
+        };
+        let lit = (0..=max).prop_map(move |v| Term::bv_lit(width, v));
+        let leaf = if width == 8 {
+            prop_oneof![lit, Just(Term::var("x", Sort::BitVec(8)))].boxed()
+        } else {
+            lit.boxed()
+        };
+        if depth == 0 {
+            return leaf;
+        }
+        let d = depth - 1;
+        let mut arms = vec![
+            (3, leaf),
+            (
+                1,
+                (arb_bv(d, width), arb_bv(d, width))
+                    .prop_map(move |(a, b)| Term::bv_bin(BvBinOp::Add, a, b).unwrap())
+                    .boxed(),
+            ),
+            (
+                1,
+                (arb_bool(d), arb_bv(d, width), arb_bv(d, width))
+                    .prop_map(|(c, t, e)| Term::ite(c, t, e).unwrap())
+                    .boxed(),
+            ),
         ];
+        if width == 64 {
+            // The only BitVec(64)-sorted term in v1's theories besides a
+            // literal: read the address back out of a Ptr via the
+            // `ptr-addr-val` accessor. `dt_get` only checks that its
+            // argument has Ptr sort — it doesn't care whether that Ptr
+            // was actually built via the `ptr-addr` constructor — so
+            // this is always well-sorted for any `arb_ptr` output.
+            arms.push((
+                1,
+                arb_ptr(d)
+                    .prop_map(|p| {
+                        Term::dt_get(&ptr_datatype(), "ptr-addr", "ptr-addr-val", p).unwrap()
+                    })
+                    .boxed(),
+            ));
+        }
+        Union::new_weighted(arms).boxed()
+    }
+
+    fn arb_ptr(depth: u32) -> BoxedStrategy<Term> {
+        let leaf = prop_oneof![Just(Term::var("p0", ptr_sort())), Just(ptr_nil())];
         if depth == 0 {
             return leaf.boxed();
         }
         let d = depth - 1;
         prop_oneof![
-            3 => leaf,
-            1 => (arb_bv(d), arb_bv(d))
-                .prop_map(|(a, b)| Term::bv_bin(BvBinOp::Add, a, b).unwrap()),
+            2 => leaf,
+            // Constructor applied to non-empty args: `(ptr-addr <bv64>)`.
+            1 => arb_bv(d, 64).prop_map(|addr| {
+                Term::dt_ctor(&ptr_datatype(), "ptr-addr", vec![addr]).unwrap()
+            }),
+            1 => (arb_bool(d), arb_ptr(d), arb_ptr(d))
+                .prop_map(|(c, t, e)| Term::ite(c, t, e).unwrap()),
         ]
         .boxed()
-    }
-
-    /// The Ptr datatype pool this exercises (nil | var) has no recursive
-    /// constructor here, so `depth` is unused; kept for a uniform
-    /// signature across the four sort-directed generators.
-    fn arb_ptr(_depth: u32) -> BoxedStrategy<Term> {
-        prop_oneof![Just(Term::var("p0", ptr_sort())), Just(ptr_nil())].boxed()
     }
 
     fn arb_arr(depth: u32) -> BoxedStrategy<Term> {
@@ -508,8 +602,10 @@ mod props {
         let d = depth - 1;
         prop_oneof![
             2 => leaf,
-            1 => (arb_arr(d), arb_bv(d), arb_bool(d))
+            1 => (arb_arr(d), arb_bv(d, 8), arb_bool(d))
                 .prop_map(|(a, i, v)| Term::store(a, i, v).unwrap()),
+            1 => (arb_bool(d), arb_arr(d), arb_arr(d))
+                .prop_map(|(c, t, e)| Term::ite(c, t, e).unwrap()),
         ]
         .boxed()
     }
@@ -519,10 +615,89 @@ mod props {
     fn arb_term() -> impl Strategy<Value = Term> {
         prop_oneof![
             arb_bool(DEPTH),
-            arb_bv(DEPTH),
+            arb_bv(DEPTH, 8),
             arb_ptr(DEPTH),
             arb_arr(DEPTH)
         ]
+    }
+
+    /// Not a property test: a fixed-sample-count check that `arb_term()`
+    /// actually produces every node kind `parse_term` understands,
+    /// somewhere in the tree — not just theoretically, per the review
+    /// finding that the previous generator never constructed `or`,
+    /// `=>`, `ite`, a non-empty-args constructor, or a field accessor.
+    /// (`print_parse_print_fixpoint` only proves round-tripping for
+    /// whatever the sampled terms happen to contain; this proves they
+    /// actually contain everything.)
+    #[test]
+    fn generator_reaches_every_node_kind() {
+        use std::collections::HashSet;
+
+        use crate::term::Node;
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+
+        fn walk(t: &Term, tags: &mut HashSet<&'static str>) {
+            match &t.node {
+                Node::Or(ts) => {
+                    tags.insert("or");
+                    ts.iter().for_each(|s| walk(s, tags));
+                }
+                Node::Implies(a, b) => {
+                    tags.insert("implies");
+                    walk(a, tags);
+                    walk(b, tags);
+                }
+                Node::Ite(c, a, b) => {
+                    tags.insert("ite");
+                    walk(c, tags);
+                    walk(a, tags);
+                    walk(b, tags);
+                }
+                Node::DtCtor { args, .. } => {
+                    if !args.is_empty() {
+                        tags.insert("ctor_with_args");
+                    }
+                    args.iter().for_each(|a| walk(a, tags));
+                }
+                Node::DtGet { arg, .. } => {
+                    tags.insert("dt_get");
+                    walk(arg, tags);
+                }
+                Node::Not(a) | Node::DtIs { arg: a, .. } => walk(a, tags),
+                Node::And(ts) => ts.iter().for_each(|s| walk(s, tags)),
+                Node::Eq(a, b)
+                | Node::BvBin { lhs: a, rhs: b, .. }
+                | Node::BvCmp { lhs: a, rhs: b, .. }
+                | Node::Select(a, b) => {
+                    walk(a, tags);
+                    walk(b, tags);
+                }
+                Node::Store(a, b, c) => {
+                    walk(a, tags);
+                    walk(b, tags);
+                    walk(c, tags);
+                }
+                Node::BoolLit(_) | Node::BvLit { .. } | Node::Var(_) => {}
+            }
+        }
+
+        let mut runner = TestRunner::default();
+        let strat = arb_term();
+        let mut tags = HashSet::new();
+        for _ in 0..500 {
+            let t = strat
+                .new_tree(&mut runner)
+                .expect("arb_term() must always produce a value")
+                .current();
+            walk(&t, &mut tags);
+        }
+        for want in ["or", "implies", "ite", "ctor_with_args", "dt_get"] {
+            assert!(
+                tags.contains(want),
+                "generator never produced a `{want}` node across 500 samples: {tags:?}"
+            );
+        }
     }
 
     proptest! {

@@ -20,6 +20,37 @@ pub fn go_call(target: &str) -> gvir::Instruction {
     }
 }
 
+pub fn defer_call(target: &str) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "Defer".into(),
+        ..call(target)
+    }
+}
+
+/// `<kind>(<chan_operand>)`-shaped `Call`/`Go`/`Defer` on the `close`
+/// builtin, matching `lower.rs`'s operand layout: `[<callee slot>,
+/// args…]` (the callee slot itself is unused for a builtin, so any
+/// placeholder value works).
+fn builtin_close(kind: &str, chan_operand: u32) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: kind.into(),
+        operands: vec![0, chan_operand],
+        sem: Some(gvir::instruction::Sem::Call(gvir::CallSem {
+            builtin: "close".into(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+}
+
+pub fn defer_close(chan_operand: u32) -> gvir::Instruction {
+    builtin_close("Defer", chan_operand)
+}
+
+pub fn go_close(chan_operand: u32) -> gvir::Instruction {
+    builtin_close("Go", chan_operand)
+}
+
 pub fn instr(kind: &str) -> gvir::Instruction {
     gvir::Instruction {
         kind: kind.into(),

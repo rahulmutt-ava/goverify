@@ -77,3 +77,20 @@ func NamedParamImpl(m string) int { return len(m) }
 func UseNamedParamImpl() int {
 	return InvokeCB(NamedParamImpl)
 }
+
+// DeferClose/GoClose regression (final-review C2): `defer close(ch)` and
+// `go close(ch)` don't go through lower.rs's plain-call intrinsic
+// rewrite (that rewrite only applies to a plain, non-deferred,
+// non-goroutine `Op::Call`), so they stay `Op::Defer`/`Op::Go` with a
+// `Callee::Builtin("close")` callee. Unlike `Fan`'s `go func(){
+// close(done) }()` above (where `close` is a plain call *inside* the
+// closure body, already covered by the plain-call rewrite), these call
+// `close` directly as the deferred/spawned operation itself — the exact
+// shape effects::collect must still record as ChanOp::Close.
+func DeferClose(ch chan int) {
+	defer close(ch)
+}
+
+func GoClose(ch chan int) {
+	go close(ch)
+}

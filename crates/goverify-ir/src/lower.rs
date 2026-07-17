@@ -527,7 +527,12 @@ fn resolve_ty(tmap: &[TypeId], unknown: TypeId, local: u32) -> TypeId {
 
 /// Maps the static callee of a `sync.Mutex`/`sync.RWMutex` lock method to
 /// its `Op::Lock` intrinsic kind; `None` for every other function name.
-fn lock_kind(name: &str) -> Option<LockKind> {
+/// `pub` (re-exported at the crate root) so `goverify-analysis`'s
+/// `effects::collect` can reuse this exact string list for `Defer`/`Go`
+/// callees, which don't go through `lower_plain_call`'s rewrite (see that
+/// function's doc comment) and so need the same name match applied at the
+/// effects level instead of the IR level.
+pub fn lock_kind(name: &str) -> Option<LockKind> {
     match name {
         "(*sync.Mutex).Lock" | "(*sync.RWMutex).Lock" => Some(LockKind::Lock),
         "(*sync.Mutex).Unlock" | "(*sync.RWMutex).Unlock" => Some(LockKind::Unlock),

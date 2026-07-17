@@ -317,12 +317,22 @@ impl Sccs {
         }
         // Callee-SCC deps per schedule slot: which other SCCs does this
         // one call into (excluding itself — a self-edge from recursion
-        // within the SCC isn't an inter-SCC dependency).
+        // within the SCC isn't an inter-SCC dependency). `scc_of.get(...)`
+        // (not direct indexing) mirrors the main traversal loop's `if ci
+        // >= n { continue; }` guard: a caller-supplied `g` can have a
+        // callee id out of range for this `n` (a future Task 13-15 caller
+        // passing a stale/mismatched graph, or a hand-built test graph),
+        // and this must degrade — skip the bad edge — rather than index
+        // out of bounds and panic.
         let mut callee_sccs: Vec<Vec<usize>> = vec![Vec::new(); schedule.len()];
         for (si, members) in schedule.iter().enumerate() {
             let mut deps: Vec<usize> = members
                 .iter()
-                .flat_map(|&m| g.callees(m).iter().map(|&c| scc_of[c.0 as usize]))
+                .flat_map(|&m| {
+                    g.callees(m)
+                        .iter()
+                        .filter_map(|&c| scc_of.get(c.0 as usize).copied())
+                })
                 .filter(|&d| d != si && d != usize::MAX)
                 .collect();
             deps.sort_unstable();
@@ -505,6 +515,27 @@ mod tests {
             sccs.callee_sccs(1),
             &[0],
             "Sccs::callee_sccs() must exclude the self-edge"
+        );
+    }
+
+    /// Regression (review fix): `from_edges` doesn't validate that edge
+    /// targets are `< n`, so it can hand-build the same malformed-graph
+    /// shape a real caller might pass — e.g. a future Task 13-15 caller
+    /// with a `g`/`n` mismatch, or any fuzzed/inconsistent input reaching
+    /// `Sccs` through `Program`/`CallGraph`. FuncId(5) is out of range for
+    /// n=2. Before the fix, the callee-SCC pass indexed `scc_of` directly
+    /// with an unchecked callee id and panicked; the main traversal loop
+    /// already guarded the same input class (`if ci >= n { continue; }`),
+    /// so this must degrade the same way, not panic.
+    #[test]
+    fn callee_sccs_ignores_out_of_range_callee_ids() {
+        let g = from_edges(2, &[(0, 1), (0, 5)]);
+        let sccs = Sccs::compute_from_graph(2, &g);
+        assert_eq!(sccs.schedule(), &[vec![FuncId(1)], vec![FuncId(0)]]);
+        assert_eq!(
+            sccs.callee_sccs(1), // schedule slot for {FuncId(0)}
+            &[0],
+            "the out-of-range callee (FuncId(5)) must be dropped, not panic"
         );
     }
 }

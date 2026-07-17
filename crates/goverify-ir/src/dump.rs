@@ -103,6 +103,12 @@ pub fn dump_callgraph(p: &Program, g: &CallGraph) -> String {
 /// rebuilding the graph, rather than re-deriving self-calls from op scans
 /// — `CallGraph::build` already resolves the Static/Invoke/Dynamic cases
 /// correctly and it's the one place that logic should live.
+///
+/// Precondition (not checked): `s` must have been computed from
+/// `CallGraph::build(p)` for this same `p` — a mismatched pair won't
+/// panic (function names index safely; the rebuilt graph just describes a
+/// different program than `s`'s schedule), but the `[recursive]` tag and
+/// member names can disagree with `s`'s actual SCCs.
 pub fn dump_sccs(p: &Program, s: &Sccs) -> String {
     let g = CallGraph::build(p);
     let mut out = String::new();

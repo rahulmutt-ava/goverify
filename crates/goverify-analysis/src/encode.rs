@@ -8,10 +8,12 @@
 use std::collections::BTreeMap;
 
 use goverify_ir::{
-    ConstVal, FuncId, Function, Op, Program, TypeId, TypeKind, TypeTable, ValueId, ValueKind,
+    BinOpKind, ConstVal, FuncId, Function, MakeKind, Op, Program, TypeId, TypeKind, TypeTable,
+    UnOpKind, ValueId, ValueKind,
 };
 use goverify_solver::{
-    BvCmpOp, CtorDecl, DatatypeDecl, Logic, Query, Sort, Term, ptr_datatype, ptr_nil, ptr_sort,
+    BvBinOp, BvCmpOp, CtorDecl, DatatypeDecl, Logic, Query, Sort, Term, ptr_datatype, ptr_nil,
+    ptr_sort,
 };
 
 /// Slices/strings as length-carrying opaque values: contents havoc,
@@ -180,14 +182,21 @@ pub fn encode_func(p: &Program, f: FuncId) -> Result<EncodedFunc, String> {
     for b in 0..n {
         enc.consts.push((guard_name(b), Sort::Bool));
     }
-    // Params first: their terms exist before any op reads them.
+    // (1) Params first: their terms exist before any op reads them.
     for &pv in &func.params {
         declare_value(p, func, pv, &mut enc);
     }
-    // Pass 1: declare/const-define every value an instruction reads or
-    // writes (Task 4 fills op semantics; this pass makes havoc sound).
-    // Pass 2 (below): guard structure.
+    // (2) Declare every value an instruction reads or writes, then pin
+    // havoc'd branch conditions to a stable `hc<b>` const — the single
+    // source of truth guards and phi both read. Splitting declaration out
+    // of `encode_ops` lets guards (which need Branch conds declared) run
+    // before op defining-equalities (which need edge guards for phi).
+    declare_pass(p, func, &mut enc);
+    // (3) Guard structure over the cut DAG.
     encode_guards(func, &mut enc)?;
+    // (4) Defining equalities for modeled ops (Assign/BinOp/UnOp/Phi/Make);
+    // everything else keeps its declared-but-unconstrained (havoc) dst.
+    encode_ops(p, func, &mut enc);
     if enc.asserts.len() > ASSERT_CAP {
         return Err(format!(
             "{}: encoding exceeds {ASSERT_CAP} assertions; skipped",
@@ -273,37 +282,17 @@ fn seq_lit(len: u64, cap: u64) -> Option<Term> {
 /// whose every in-edge was cut is unreachable in the DAG: g_b = false.
 fn encode_guards(func: &Function, enc: &mut EncodedFunc) -> Result<(), String> {
     let n = func.blocks.len();
-    // edge_guard[(from, to)] considering only DAG edges
+    // Incoming edge guards per block, over the cut DAG only.
     let mut incoming: Vec<Vec<Term>> = vec![Vec::new(); n];
-    for (b, block) in func.blocks.iter().enumerate() {
-        let gb = enc.guards[b].clone();
-        let cond = block.instrs.last().and_then(|i| match &i.op {
-            Op::Branch { cond } => enc.values.get(cond).cloned().or_else(|| {
-                // Unmodelable condition: havoc it as a fresh bool so both
-                // branches stay possible (missing info = nondeterminism).
-                let name = format!("hc{b}");
-                enc.consts.push((name.clone(), Sort::Bool));
-                Some(Term::var(&name, Sort::Bool))
-            }),
-            _ => None,
-        });
+    for b in 0..n {
         for &s in &enc.dag_succs[b] {
             let s = s as usize;
             if s >= n {
                 continue;
             }
-            // Positional index within the ORIGINAL succs decides the
-            // branch polarity (dag_succs preserves order).
-            let orig_pos = func.blocks[b].succs.iter().position(|&x| x as usize == s);
-            let edge = match (&cond, orig_pos) {
-                (Some(c), Some(0)) => Term::and(vec![gb.clone(), c.clone()]),
-                (Some(c), Some(1)) => {
-                    Term::not(c.clone()).and_then(|nc| Term::and(vec![gb.clone(), nc]))
-                }
-                _ => Ok(gb.clone()),
+            if let Some(edge) = edge_guard(func, enc, b, s) {
+                incoming[s].push(edge);
             }
-            .map_err(|e| format!("edge guard: {e}"))?;
-            incoming[s].push(edge);
         }
     }
     for (b, edges) in incoming.into_iter().enumerate() {
@@ -321,6 +310,271 @@ fn encode_guards(func: &Function, enc: &mut EncodedFunc) -> Result<(), String> {
             .push(Term::eq(gb, rhs).map_err(|e| format!("guard eq: {e}"))?);
     }
     Ok(())
+}
+
+/// The guard on edge `from -> to`: the source block's guard, conjoined
+/// with the branch condition when `from` ends in a two-way Branch
+/// (positional: succs[0] = cond, succs[1] = ¬cond). SINGLE source of
+/// truth — phi (`op_def`) reuses this so its ite conditions can never
+/// diverge from the guard structure. Read-only: any havoc'd condition
+/// was already pinned to `hc<from>` by `declare_pass`.
+fn edge_guard(func: &Function, enc: &EncodedFunc, from: usize, to: usize) -> Option<Term> {
+    let gb = enc.guards.get(from)?.clone();
+    // Positional index within the ORIGINAL succs decides branch polarity
+    // (dag_succs preserves order).
+    let orig_pos = func
+        .blocks
+        .get(from)?
+        .succs
+        .iter()
+        .position(|&x| x as usize == to);
+    match (branch_cond(func, enc, from), orig_pos) {
+        (Some(c), Some(0)) => Term::and(vec![gb, c]).ok(),
+        (Some(c), Some(1)) => Term::not(c)
+            .ok()
+            .and_then(|nc| Term::and(vec![gb, nc]).ok()),
+        _ => Some(gb),
+    }
+}
+
+/// The branch condition term for block `b` when it ends in a Branch: the
+/// modeled operand term, else the `hc<b>` havoc const `declare_pass`
+/// pinned (missing info = nondeterminism, both branches stay possible).
+/// `None` when `b` does not end in a Branch.
+fn branch_cond(func: &Function, enc: &EncodedFunc, b: usize) -> Option<Term> {
+    match &func.blocks.get(b)?.instrs.last()?.op {
+        Op::Branch { cond } => Some(
+            enc.values
+                .get(cond)
+                .cloned()
+                .unwrap_or_else(|| Term::var(&format!("hc{b}"), Sort::Bool)),
+        ),
+        _ => None,
+    }
+}
+
+/// Declare every value an instruction reads or writes (making havoc
+/// sound: even an unmodeled op's dst gets a typed const), then register a
+/// stable `hc<b>` const for each Branch whose condition stays havoc'd, so
+/// guards and phi reference the SAME symbol instead of each minting one.
+fn declare_pass(p: &Program, func: &Function, enc: &mut EncodedFunc) {
+    for block in &func.blocks {
+        for ins in &block.instrs {
+            for v in op_values(&ins.op) {
+                declare_value(p, func, v, enc);
+            }
+        }
+    }
+    for (b, block) in func.blocks.iter().enumerate() {
+        if let Some(Op::Branch { cond }) = block.instrs.last().map(|i| &i.op)
+            && !enc.values.contains_key(cond)
+        {
+            enc.consts.push((format!("hc{b}"), Sort::Bool));
+        }
+    }
+}
+
+/// Every value id an op reads or writes (dsts included; `Option` dsts and
+/// operands flattened). Mechanical — the declare pass runs this over every
+/// instruction so unmodeled writes still get a declared const.
+fn op_values(op: &Op) -> Vec<ValueId> {
+    let mut vs = Vec::new();
+    match op {
+        Op::Assign { dst, src }
+        | Op::Convert { dst, src }
+        | Op::MakeInterface { dst, src }
+        | Op::TypeAssert { dst, src, .. } => vs.extend([*dst, *src]),
+        Op::Alloc { dst, .. } => vs.push(*dst),
+        Op::Load { dst, addr } => vs.extend([*dst, *addr]),
+        Op::Store { addr, val } => vs.extend([*addr, *val]),
+        Op::FieldAddr { dst, base, .. } | Op::Field { dst, base, .. } => vs.extend([*dst, *base]),
+        Op::IndexAddr { dst, base, index } | Op::Index { dst, base, index } => {
+            vs.extend([*dst, *base, *index])
+        }
+        Op::Lookup { dst, map, key, .. } => vs.extend([*dst, *map, *key]),
+        Op::Slice {
+            dst,
+            base,
+            low,
+            high,
+            max,
+        } => {
+            vs.extend([*dst, *base]);
+            vs.extend(low.iter().chain(high.iter()).chain(max.iter()).copied());
+        }
+        Op::BinOp { dst, lhs, rhs, .. } => vs.extend([*dst, *lhs, *rhs]),
+        Op::UnOp { dst, operand, .. } => vs.extend([*dst, *operand]),
+        Op::Extract { dst, tuple, .. } => vs.extend([*dst, *tuple]),
+        Op::Phi { dst, edges } => {
+            vs.push(*dst);
+            vs.extend(edges.iter().copied());
+        }
+        Op::Call { dst, args, .. } => {
+            vs.extend(dst.iter().copied());
+            vs.extend(args.iter().copied());
+        }
+        Op::MakeClosure { dst, bindings, .. } => {
+            vs.push(*dst);
+            vs.extend(bindings.iter().copied());
+        }
+        Op::Make { dst, args, .. } => {
+            vs.push(*dst);
+            vs.extend(args.iter().copied());
+        }
+        Op::Send { chan, val } => vs.extend([*chan, *val]),
+        Op::Recv { dst, chan, .. } => vs.extend([*dst, *chan]),
+        Op::CloseChan { chan } => vs.push(*chan),
+        Op::Select { dst, arms, .. } => {
+            vs.push(*dst);
+            for a in arms {
+                vs.push(a.chan);
+                vs.extend(a.send.iter().copied());
+            }
+        }
+        Op::Go { args, .. } | Op::Defer { args, .. } => vs.extend(args.iter().copied()),
+        Op::Return { vals } => vs.extend(vals.iter().copied()),
+        Op::Branch { cond } => vs.push(*cond),
+        Op::Panic { val } => vs.push(*val),
+        Op::Lock { mu, .. } => vs.push(*mu),
+        Op::Havoc { dst } => vs.extend(dst.iter().copied()),
+        Op::Jump => {}
+    }
+    vs
+}
+
+/// Assert the defining equality for each modeled op; unmodeled ops leave
+/// their dsts declared but unconstrained (havoc).
+fn encode_ops(p: &Program, func: &Function, enc: &mut EncodedFunc) {
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for ins in &block.instrs {
+            if let Some(def) = op_def(p, func, bi, &ins.op, enc) {
+                enc.asserts.push(def);
+            }
+        }
+    }
+}
+
+/// The defining equality for a modeled op, if every term it needs exists;
+/// `None` = havoc (dst stays declared but unconstrained). Never panics:
+/// missing terms and out-of-range preds degrade to `None`.
+fn op_def(p: &Program, func: &Function, block: usize, op: &Op, enc: &EncodedFunc) -> Option<Term> {
+    let t = |v: &ValueId| enc.values.get(v).cloned();
+    match op {
+        Op::Assign { dst, src } => Term::eq(t(dst)?, t(src)?).ok(),
+        Op::BinOp {
+            dst,
+            kind,
+            lhs,
+            rhs,
+        } => {
+            let d = t(dst)?;
+            let rhs_term = binop_term(p, func, *kind, lhs, t(lhs)?, t(rhs)?)?;
+            Term::eq(d, rhs_term).ok()
+        }
+        Op::UnOp { dst, kind, operand } => {
+            let d = t(dst)?;
+            let o = t(operand)?;
+            let rhs = match kind {
+                UnOpKind::Not => Term::not(o).ok()?,
+                UnOpKind::Neg => {
+                    // -x = 0 - x at the operand's width.
+                    let (w, _) = int_repr(p.types(), func.value(*operand).ty)?;
+                    Term::bv_bin(BvBinOp::Sub, Term::bv_lit(w, 0), o).ok()?
+                }
+                UnOpKind::BitNot => {
+                    // ^x = x xor all-ones at the operand's width.
+                    let (w, _) = int_repr(p.types(), func.value(*operand).ty)?;
+                    let ones = u128::MAX >> (128 - w);
+                    Term::bv_bin(BvBinOp::Xor, o, Term::bv_lit(w, ones)).ok()?
+                }
+            };
+            Term::eq(d, rhs).ok()
+        }
+        Op::Phi { dst, edges } => {
+            let d = t(dst)?;
+            let preds = &func.blocks.get(block)?.preds;
+            // Keep only edges whose pred edge survives in the cut DAG;
+            // `Op::Phi` operand i pairs with preds[i].
+            let mut kept: Vec<(Term, Term)> = Vec::new(); // (edge guard, value)
+            for (i, ev) in edges.iter().enumerate() {
+                let pr = *preds.get(i)? as usize;
+                if pr >= func.blocks.len() {
+                    return None;
+                }
+                if !enc.dag_succs[pr].contains(&(block as u32)) {
+                    continue; // back edge: cut
+                }
+                kept.push((edge_guard(func, enc, pr, block)?, t(ev)?));
+            }
+            let (_last_g, last_v) = kept.pop()?;
+            // The final (else) branch needs no test.
+            let mut acc = last_v;
+            for (g, v) in kept.into_iter().rev() {
+                acc = Term::ite(g, v, acc).ok()?;
+            }
+            Term::eq(d, acc).ok()
+        }
+        Op::Make {
+            dst,
+            kind: MakeKind::Slice,
+            args,
+        } => {
+            let d = t(dst)?;
+            let len = args.first().and_then(t)?;
+            let cap = args.get(1).and_then(t).unwrap_or_else(|| len.clone());
+            let ctor = Term::dt_ctor(&seq_datatype(), "seq-val", vec![len, cap]).ok()?;
+            Term::eq(d, ctor).ok()
+        }
+        _ => None, // Load/Store/Call/Convert/... havoc (declared, unconstrained)
+    }
+}
+
+/// The RHS term for a modeled BinOp. Signedness (and the mask width for
+/// `&^`) come from the OPERAND type (`lhs`), never the dst: a comparison's
+/// dst is Bool but the signed/unsigned choice is the compared ints'.
+/// `None` for ops with no bitvector model (string concat `+`, float
+/// arithmetic — operands lack `int_repr` and aren't Eq/Neq) → havoc.
+fn binop_term(
+    p: &Program,
+    func: &Function,
+    kind: BinOpKind,
+    lhs: &ValueId,
+    l: Term,
+    r: Term,
+) -> Option<Term> {
+    use BinOpKind as K;
+    // Eq/Neq are defined for every sort (Ptr/Seq/Bool/BitVec).
+    match kind {
+        K::Eq => return Term::eq(l, r).ok(),
+        K::Neq => return Term::not(Term::eq(l, r).ok()?).ok(),
+        _ => {}
+    }
+    // Every remaining op is bitvector-only.
+    let (w, signed) = int_repr(p.types(), func.value(*lhs).ty)?;
+    match kind {
+        K::Add => Term::bv_bin(BvBinOp::Add, l, r).ok(),
+        K::Sub => Term::bv_bin(BvBinOp::Sub, l, r).ok(),
+        K::Mul => Term::bv_bin(BvBinOp::Mul, l, r).ok(),
+        K::And => Term::bv_bin(BvBinOp::And, l, r).ok(),
+        K::Or => Term::bv_bin(BvBinOp::Or, l, r).ok(),
+        K::Xor => Term::bv_bin(BvBinOp::Xor, l, r).ok(),
+        K::Shl => Term::bv_bin(BvBinOp::Shl, l, r).ok(),
+        K::Shr => Term::bv_bin(if signed { BvBinOp::Ashr } else { BvBinOp::Lshr }, l, r).ok(),
+        K::Div => Term::bv_bin(if signed { BvBinOp::Sdiv } else { BvBinOp::Udiv }, l, r).ok(),
+        K::Rem => Term::bv_bin(if signed { BvBinOp::Srem } else { BvBinOp::Urem }, l, r).ok(),
+        K::AndNot => {
+            // x &^ y = x & ~y ; ~y = y xor all-ones.
+            let ones = u128::MAX >> (128 - w);
+            let noty = Term::bv_bin(BvBinOp::Xor, r, Term::bv_lit(w, ones)).ok()?;
+            Term::bv_bin(BvBinOp::And, l, noty).ok()
+        }
+        K::Lt => Term::bv_cmp(if signed { BvCmpOp::Slt } else { BvCmpOp::Ult }, l, r).ok(),
+        K::Leq => Term::bv_cmp(if signed { BvCmpOp::Sle } else { BvCmpOp::Ule }, l, r).ok(),
+        // x > y  ⇒  y < x ; x >= y  ⇒  y <= x (swap operands).
+        K::Gt => Term::bv_cmp(if signed { BvCmpOp::Slt } else { BvCmpOp::Ult }, r, l).ok(),
+        K::Geq => Term::bv_cmp(if signed { BvCmpOp::Sle } else { BvCmpOp::Ule }, r, l).ok(),
+        K::Eq | K::Neq => None, // handled above
+    }
 }
 
 #[cfg(test)]
@@ -608,5 +862,383 @@ mod tests {
         let enc = encode_func(&p, id).unwrap();
         let text = enc.reach_query(3, vec![]).canonical_text();
         assert!(text.contains("(= g3 (or g1 g2))"), "merge guard:\n{text}");
+    }
+
+    // ---- Task 4: op semantics & phi ----------------------------------
+
+    /// Dense type table (ids 1..=6) shared by the op-encoding fixtures:
+    /// 1 int, 2 uint8, 3 bool, 4 struct T, 5 *T, 6 []int.
+    fn std_type_list() -> Vec<goverify_extract::gvir::Type> {
+        use goverify_extract::gvir;
+        let basic = |id: u32, repr: &str| gvir::Type {
+            id,
+            repr: repr.into(),
+            kind: gvir::TypeKind::Basic as i32,
+            name: repr.into(),
+            ..Default::default()
+        };
+        vec![
+            basic(1, "int"),
+            basic(2, "uint8"),
+            basic(3, "bool"),
+            gvir::Type {
+                id: 4,
+                repr: "T".into(),
+                kind: gvir::TypeKind::Struct as i32,
+                ..Default::default()
+            },
+            gvir::Type {
+                id: 5,
+                repr: "*T".into(),
+                kind: gvir::TypeKind::Pointer as i32,
+                elem: 4,
+                ..Default::default()
+            },
+            gvir::Type {
+                id: 6,
+                repr: "[]int".into(),
+                kind: gvir::TypeKind::Slice as i32,
+                elem: 1,
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn program_with(f: goverify_extract::gvir::Function) -> (Program, FuncId) {
+        use goverify_extract::gvir;
+        let package = gvir::Package {
+            import_path: "t".into(),
+            types: std_type_list(),
+            functions: vec![f],
+            ..Default::default()
+        };
+        let p = Program::from_packages(vec![package]);
+        let id = p.lookup_func("t.F").unwrap();
+        (p, id)
+    }
+
+    fn param(id: u32, ty: u32) -> goverify_extract::gvir::Param {
+        goverify_extract::gvir::Param {
+            id,
+            name: format!("a{id}"),
+            r#type: ty,
+        }
+    }
+
+    fn binop(reg: u32, ty: u32, op: &str, l: u32, r: u32) -> goverify_extract::gvir::Instruction {
+        use goverify_extract::gvir;
+        gvir::Instruction {
+            kind: "BinOp".into(),
+            register: reg,
+            r#type: ty,
+            operands: vec![l, r],
+            sem: Some(gvir::instruction::Sem::Binop(gvir::BinOpSem {
+                op: op.into(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn ret(vals: Vec<u32>) -> goverify_extract::gvir::Instruction {
+        goverify_extract::gvir::Instruction {
+            kind: "Return".into(),
+            operands: vals,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn binop_add_encodes_bvadd() {
+        use goverify_extract::gvir;
+        // v2 = p0 + 1 (int): p0 = param id 1, the const 1 = aux id 3.
+        // Operands mirror lower.rs's BinOp arm: [lhs, rhs] = [1, 3].
+        let f = gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 1)],
+            aux: vec![gvir::AuxValue {
+                id: 3,
+                kind: "Const".into(),
+                r#type: 1,
+                r#const: Some(gvir::ConstValue {
+                    value: Some(gvir::const_value::Value::Int(1)),
+                }),
+                ..Default::default()
+            }],
+            blocks: vec![block_p(
+                0,
+                vec![binop(2, 1, "+", 1, 3), ret(vec![2])],
+                vec![],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let text = encode_func(&p, id)
+            .unwrap()
+            .reach_query(0, vec![])
+            .canonical_text();
+        // Operands are declared vars; the const's value lands in its own
+        // defining equality (printer bv-literal syntax: `(_ bv1 64)`).
+        assert!(text.contains("(= v2 (bvadd p0 v3))"), "add def:\n{text}");
+        assert!(
+            text.contains("(= v3 (_ bv1 64))"),
+            "const 1 literal:\n{text}"
+        );
+    }
+
+    #[test]
+    fn signed_and_unsigned_div_pick_sdiv_udiv() {
+        use goverify_extract::gvir;
+        // `a / b`: int operands -> bvsdiv; uint8 operands -> bvudiv.
+        let mk = |ty: u32| gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, ty), param(2, ty)],
+            blocks: vec![block_p(
+                0,
+                vec![binop(3, ty, "/", 1, 2), ret(vec![3])],
+                vec![],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let (p, id) = program_with(mk(1));
+        let text = encode_func(&p, id)
+            .unwrap()
+            .reach_query(0, vec![])
+            .canonical_text();
+        assert!(
+            text.contains("(= v3 (bvsdiv p0 p1))"),
+            "signed div:\n{text}"
+        );
+        let (p, id) = program_with(mk(2));
+        let text = encode_func(&p, id)
+            .unwrap()
+            .reach_query(0, vec![])
+            .canonical_text();
+        assert!(
+            text.contains("(= v3 (bvudiv p0 p1))"),
+            "unsigned div:\n{text}"
+        );
+    }
+
+    #[test]
+    fn comparison_binops_encode_bool_dsts() {
+        use goverify_extract::gvir;
+        // `a < b`: signedness from the OPERAND type. int -> bvslt,
+        // uint8 -> bvult; the dst is Bool either way.
+        let mk = |ty: u32| gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, ty), param(2, ty)],
+            blocks: vec![block_p(
+                0,
+                vec![binop(3, 3, "<", 1, 2), ret(vec![3])],
+                vec![],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let (p, id) = program_with(mk(1));
+        let text = encode_func(&p, id)
+            .unwrap()
+            .reach_query(0, vec![])
+            .canonical_text();
+        assert!(text.contains("(= v3 (bvslt p0 p1))"), "signed lt:\n{text}");
+        let (p, id) = program_with(mk(2));
+        let text = encode_func(&p, id)
+            .unwrap()
+            .reach_query(0, vec![])
+            .canonical_text();
+        assert!(
+            text.contains("(= v3 (bvult p0 p1))"),
+            "unsigned lt:\n{text}"
+        );
+    }
+
+    #[test]
+    fn phi_is_ite_over_incoming_edge_guards() {
+        use goverify_extract::gvir;
+        // diamond 0 -> {1,2} -> 3; phi at 3 merges p0,p1 over edges from
+        // blocks 1,2 (both Jump). preds [1,2], edges [p0,p1]. The 1->3
+        // edge guard is g1 (Jump passes the guard through); with two
+        // incoming edges the last edge is the ite's else branch.
+        let br = gvir::Instruction {
+            kind: "If".into(),
+            operands: vec![3], // cond = p2 (bool)
+            ..Default::default()
+        };
+        let phi = gvir::Instruction {
+            kind: "Phi".into(),
+            register: 4,
+            r#type: 1,
+            operands: vec![1, 2],
+            ..Default::default()
+        };
+        let f = gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 1), param(2, 1), param(3, 3)],
+            blocks: vec![
+                block_p(0, vec![br], vec![], vec![1, 2]),
+                block_p(1, vec![instr("Jump")], vec![0], vec![3]),
+                block_p(2, vec![instr("Jump")], vec![0], vec![3]),
+                block_p(3, vec![phi, ret(vec![4])], vec![1, 2], vec![]),
+            ],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let text = encode_func(&p, id)
+            .unwrap()
+            .reach_query(3, vec![])
+            .canonical_text();
+        assert!(text.contains("(= v4 (ite g1 p0 p1))"), "phi ite:\n{text}");
+    }
+
+    #[test]
+    fn phi_with_cut_back_edge_keeps_preheader_value_only() {
+        use goverify_extract::gvir;
+        // loop: 0 -> 1(header); 1 -> {2,3}; 2 -> 1 (back edge cut); 3 exit.
+        // phi at header, preds [0,2], edges [p0(preheader), p1(loop)].
+        // The 2->1 edge is cut, so the phi collapses to just p0 — no ite.
+        let br = gvir::Instruction {
+            kind: "If".into(),
+            operands: vec![3],
+            ..Default::default()
+        };
+        let phi = gvir::Instruction {
+            kind: "Phi".into(),
+            register: 4,
+            r#type: 1,
+            operands: vec![1, 2],
+            ..Default::default()
+        };
+        let f = gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 1), param(2, 1), param(3, 3)],
+            blocks: vec![
+                block_p(0, vec![instr("Jump")], vec![], vec![1]),
+                block_p(1, vec![phi, br], vec![0, 2], vec![2, 3]),
+                block_p(2, vec![instr("Jump")], vec![1], vec![1]),
+                block_p(3, vec![ret(vec![4])], vec![1], vec![]),
+            ],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let text = encode_func(&p, id)
+            .unwrap()
+            .reach_query(1, vec![])
+            .canonical_text();
+        assert!(text.contains("(= v4 p0)"), "phi keeps preheader:\n{text}");
+        assert!(!text.contains("ite"), "no ite for cut back edge:\n{text}");
+    }
+
+    #[test]
+    fn makeslice_defines_len_and_cap() {
+        use goverify_extract::gvir;
+        // Make{Slice, args [len, cap]} => (= v3 (seq-val p0 p1)).
+        let mk = gvir::Instruction {
+            kind: "MakeSlice".into(),
+            register: 3,
+            r#type: 6, // []int
+            operands: vec![1, 2],
+            ..Default::default()
+        };
+        let f = gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 1), param(2, 1)],
+            blocks: vec![block_p(0, vec![mk, ret(vec![3])], vec![], vec![])],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let text = encode_func(&p, id)
+            .unwrap()
+            .reach_query(0, vec![])
+            .canonical_text();
+        assert!(
+            text.contains("(= v3 (seq-val p0 p1))"),
+            "makeslice len/cap:\n{text}"
+        );
+    }
+
+    #[test]
+    fn unmodeled_ops_havoc_but_declare() {
+        use goverify_extract::gvir;
+        // A Call dst of type *T gets a Ptr-sorted const with NO defining
+        // equality; encode_func must not error.
+        let callins = gvir::Instruction {
+            kind: "Call".into(),
+            register: 2,
+            r#type: 5, // *T
+            operands: vec![0],
+            sem: Some(gvir::instruction::Sem::Call(gvir::CallSem {
+                static_callee: "t.G".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let f = gvir::Function {
+            id: "t.F".into(),
+            blocks: vec![block_p(0, vec![callins, ret(vec![2])], vec![], vec![])],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let enc = encode_func(&p, id).expect("unmodeled op must not error");
+        let text = enc.reach_query(0, vec![]).canonical_text();
+        assert!(
+            text.contains("(declare-const v2 Ptr)"),
+            "call dst declared:\n{text}"
+        );
+        assert!(
+            !text.contains("(= v2"),
+            "call dst has no defining equality:\n{text}"
+        );
+    }
+
+    #[test]
+    fn eq_neq_work_across_sorts() {
+        use goverify_extract::gvir;
+        // BinOp Eq on pointers => (= v3 (= p0 p1)); Neq => (not (= …)).
+        let mk = |op: &str| gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 5), param(2, 5)], // *T pointers
+            blocks: vec![block_p(
+                0,
+                vec![binop(3, 3, op, 1, 2), ret(vec![3])],
+                vec![],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let (p, id) = program_with(mk("=="));
+        let text = encode_func(&p, id)
+            .unwrap()
+            .reach_query(0, vec![])
+            .canonical_text();
+        assert!(text.contains("(= v3 (= p0 p1))"), "ptr eq:\n{text}");
+        let (p, id) = program_with(mk("!="));
+        let text = encode_func(&p, id)
+            .unwrap()
+            .reach_query(0, vec![])
+            .canonical_text();
+        assert!(text.contains("(= v3 (not (= p0 p1)))"), "ptr neq:\n{text}");
+    }
+
+    #[test]
+    fn encoding_is_deterministic() {
+        let p = goverify_ir::testutil::load_corpus("ops");
+        for f in p.func_ids() {
+            if p.func(f).is_none() {
+                continue;
+            }
+            let (Ok(a), Ok(b)) = (encode_func(&p, f), encode_func(&p, f)) else {
+                continue;
+            };
+            for bi in 0..a.guards.len() {
+                assert_eq!(
+                    a.reach_query(bi, vec![]).canonical_text(),
+                    b.reach_query(bi, vec![]).canonical_text(),
+                    "{} block {bi}",
+                    p.func_name(f)
+                );
+            }
+        }
     }
 }

@@ -327,8 +327,8 @@ Validation forms, cheapest layer first:
    on the corpus — guards the canonical printer.
 
 **Speed tiering.** Blocking PR tier (wall-clock budget: 10 minutes): static
-checks, unit, property (bounded case counts), corpus, and the small
-determinism suite. Nightly tier: fuzz campaigns, the avalanchego benchmark,
+checks, secret scan, dependency audit, unit, property (bounded case
+counts), corpus, and the small determinism suite. Nightly tier: fuzz campaigns, the avalanchego benchmark,
 full differential-solver sweep, and mutation testing (cargo-mutants) as a
 suite-strength audit. Flaky tests are quarantined out of the blocking tier
 immediately, then fixed or deleted.

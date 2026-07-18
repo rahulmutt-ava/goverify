@@ -207,7 +207,7 @@ pub fn analyze_full(
     }
     // Single-threaded, ascending-FuncId pass: deterministic regardless of
     // which wave/thread produced each diagnostic.
-    let diagnostics: Vec<String> = p
+    let mut diagnostics: Vec<String> = p
         .func_ids()
         .filter_map(|f| diag_slots[f.0 as usize].lock().unwrap().clone())
         .collect();
@@ -219,36 +219,59 @@ pub fn analyze_full(
     // determinism first. Parallelize in phase 5 with the same slot
     // pattern as summaries above if profiling asks.
     let mut findings: Vec<Finding> = Vec::new();
+    let mut findings_diagnostics: Vec<String> = Vec::new();
     if !checkers.is_empty() {
         let mut backend = mk_backend();
         let summary_of = |f: FuncId| summaries.get(&f).cloned().unwrap_or_else(Summary::havoc);
         for f in p.func_ids() {
-            let mut per_func: Vec<Finding> = Vec::new();
-            for checker in checkers {
-                for ob in checker.obligations(p, f, &summary_of) {
-                    // Bug-finder semantics (parent spec §8): only a
-                    // confirmed Sat verdict becomes a Finding; Unsat and
-                    // Unknown (incl. timeouts) stay silent.
-                    let outcome = discharge_query(
-                        &ob.query,
-                        &mut *backend,
-                        cache.as_ref(),
-                        emit_dir.as_deref(),
-                    );
-                    if outcome.result == SatResult::Sat {
-                        per_func.push(Finding {
-                            checker: checker.name().to_string(),
-                            func: p.func_name(f).to_string(),
-                            pos: ob.pos,
-                            message: ob.message,
-                        });
+            // A `Checker` is the phase-4 plugin surface: `obligations` +
+            // `discharge_query` runs untrusted (to this engine) code, same
+            // as `analyze_function`'s body above. Wrap it in the same
+            // catch_unwind + diagnostic pattern so one panicking checker
+            // can't kill the whole sequential findings pass — a panicking
+            // function just contributes zero findings (degrade, never
+            // die).
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut per_func: Vec<Finding> = Vec::new();
+                for checker in checkers {
+                    for ob in checker.obligations(p, f, &summary_of) {
+                        // Bug-finder semantics (parent spec §8): only a
+                        // confirmed Sat verdict becomes a Finding; Unsat and
+                        // Unknown (incl. timeouts) stay silent.
+                        let outcome = discharge_query(
+                            &ob.query,
+                            &mut *backend,
+                            cache.as_ref(),
+                            emit_dir.as_deref(),
+                        );
+                        if outcome.result == SatResult::Sat {
+                            per_func.push(Finding {
+                                checker: checker.name().to_string(),
+                                func: p.func_name(f).to_string(),
+                                pos: ob.pos,
+                                message: ob.message,
+                            });
+                        }
                     }
                 }
+                per_func
+            }));
+            match run {
+                Ok(mut per_func) => {
+                    per_func
+                        .sort_by(|a, b| a.pos.cmp(&b.pos).then_with(|| a.message.cmp(&b.message)));
+                    findings.extend(per_func);
+                }
+                Err(_) => {
+                    findings_diagnostics.push(format!(
+                        "internal: panic while checking {}; findings for this function dropped",
+                        p.func_name(f)
+                    ));
+                }
             }
-            per_func.sort_by(|a, b| a.pos.cmp(&b.pos).then_with(|| a.message.cmp(&b.message)));
-            findings.extend(per_func);
         }
     }
+    diagnostics.extend(findings_diagnostics);
 
     Analysis {
         summaries,
@@ -589,6 +612,87 @@ mod tests {
                 ),
             }]
         }
+    }
+
+    /// Raises one obligation per function like `FakeChecker`, except it
+    /// panics instead of returning obligations for one specific function
+    /// name — the findings-pass analogue of `analyze_function`'s
+    /// panicking-body regression coverage.
+    struct PanicOnChecker(&'static str);
+    impl Checker for PanicOnChecker {
+        fn name(&self) -> &'static str {
+            "panic-on"
+        }
+        fn infer_requires(
+            &self,
+            _p: &Program,
+            _f: FuncId,
+            _discharge: &mut dyn FnMut(&Query) -> SatResult,
+        ) -> Vec<crate::summary::Clause> {
+            Vec::new()
+        }
+        fn obligations(
+            &self,
+            p: &Program,
+            f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
+        ) -> Vec<crate::checker::Obligation> {
+            if p.func_name(f) == self.0 {
+                panic!("PanicOnChecker: intentional panic analyzing {}", self.0);
+            }
+            vec![crate::checker::Obligation {
+                tag: "panic-on".into(),
+                message: "survives".into(),
+                pos: None,
+                query: Query::for_asserts(
+                    goverify_solver::Logic::All,
+                    vec![goverify_solver::Term::bool_lit(true)],
+                ),
+            }]
+        }
+    }
+
+    #[test]
+    fn findings_pass_panic_is_caught_and_other_functions_survive() {
+        // Three independent (non-calling) functions; the checker panics
+        // only while checking t.B. Degrade-never-die (parent spec's
+        // panic policy) must hold for the findings pass exactly as it
+        // does for `analyze_function`: t.A and t.C still get their
+        // findings, the whole run completes rather than unwinding out of
+        // `analyze_full`, and a diagnostic names the panicking function.
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                straight("t.A", vec![]),
+                straight("t.B", vec![]),
+                straight("t.C", vec![]),
+            ],
+        )]);
+        let checkers: Vec<&dyn Checker> = vec![&PanicOnChecker("t.B")];
+        let cfg = EngineConfig::default();
+        let a = analyze_full(&p, &cfg, &checkers, &|| Box::new(AlwaysSat));
+
+        let found_funcs: BTreeSet<&str> = a.findings.iter().map(|f| f.func.as_str()).collect();
+        assert!(
+            found_funcs.contains("t.A"),
+            "t.A's finding must survive t.B's panic: {:?}",
+            a.findings
+        );
+        assert!(
+            found_funcs.contains("t.C"),
+            "t.C's finding must survive t.B's panic: {:?}",
+            a.findings
+        );
+        assert!(
+            !found_funcs.contains("t.B"),
+            "the panicking function contributes zero findings: {:?}",
+            a.findings
+        );
+        assert!(
+            a.diagnostics.iter().any(|d| d.contains("t.B")),
+            "a diagnostic must mention the panicking function: {:?}",
+            a.diagnostics
+        );
     }
 
     #[test]

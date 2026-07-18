@@ -6,6 +6,24 @@ license.workspace = true
 
 [dependencies]
 z3-sys.workspace = true
+tempfile.workspace = true
+proptest = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
+
+[features]
+# Shared term generators (src/testgen.rs) for the reader's proptest
+# suite and the differential harness's nightly sweep. Kept out of the
+# unconditional dependency graph — bare `cargo test -p goverify-solver`
+# (what Task 8 runs) must still compile without pulling proptest into
+# [dependencies] permanently; `testgen` is compiled under
+# `#[cfg(any(test, feature = "testgen"))]`, so `cfg(test)` builds (this
+# crate's own `cargo test`, no feature needed) and `--features testgen`
+# builds (the differential integration test, a separate crate target)
+# both see it.
+testgen = ["dep:proptest"]
+
+[[test]]
+name = "differential"
+required-features = ["testgen"]

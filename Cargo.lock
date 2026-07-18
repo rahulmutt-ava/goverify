@@ -363,6 +363,7 @@ name = "goverify-solver"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "tempfile",
  "z3-sys",
 ]
 

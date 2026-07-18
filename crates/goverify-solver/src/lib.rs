@@ -4,12 +4,17 @@
 //! with the typed term language behind the same trait.
 
 mod printer;
+mod process;
 mod reader;
 mod sort;
 mod term;
+#[cfg(any(test, feature = "testgen"))]
+#[doc(hidden)]
+pub mod testgen;
 mod z3native;
 
 pub use printer::{Logic, Query};
+pub use process::SmtLib2Process;
 pub use reader::{ReadError, SExpr, parse_query, parse_response, parse_sexpr};
 pub use sort::{CtorDecl, DatatypeDecl, Sort, SortError, ptr_datatype, ptr_sort};
 pub use term::Term as AstTerm;

@@ -31,6 +31,18 @@ fn extract_conc(out: &Path) {
     );
 }
 
+fn extract_nil(out: &Path) {
+    let st = goverify(
+        &["extract", "--out", out.to_str().unwrap(), "./..."],
+        &repo_root().join("testdata/corpus/nil"),
+    );
+    assert!(
+        st.status.success(),
+        "extract failed: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+}
+
 #[test]
 fn debug_ir_prints_lowered_function() {
     let dir = tempfile::tempdir().unwrap();
@@ -97,6 +109,38 @@ fn func_flag_on_callgraph_warns() {
     assert!(
         stderr.contains("--func has no effect"),
         "expected ignore-warning on stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn debug_findings_contains_bad_finding() {
+    // Not byte-equality: the CLI prints unfiltered findings, so stdout
+    // may legitimately include stdlib-derived ones alongside nil.go's.
+    // Generous timeout: avoid a slow-CI Sat->Unknown flake (nil_corpus.rs
+    // has the same reasoning for its own Z3 backend).
+    let dir = tempfile::tempdir().unwrap();
+    extract_nil(dir.path());
+    let out = goverify(
+        &[
+            "debug",
+            "findings",
+            "--gvir-dir",
+            dir.path().to_str().unwrap(),
+            "--solver-timeout-ms",
+            "5000",
+        ],
+        &repo_root(),
+    );
+    assert!(
+        out.status.success(),
+        "debug findings: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.lines()
+            .any(|l| l.contains("nil.go") && l.contains("Bad")),
+        "expected the nil-corpus Bad finding in output:\n{text}"
     );
 }
 

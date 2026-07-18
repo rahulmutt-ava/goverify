@@ -1,6 +1,9 @@
 //! Bottom-up SCC engine (phase-2 spec §4.2–4.3): wave-parallel schedule,
 //! bounded fixpoint on recursive SCCs, widening to havoc after k rounds,
-//! catch_unwind per function.
+//! catch_unwind per function. Phase-3 (Task 12) adds the `Checker` plugin
+//! surface: requires-inference runs inside the fixpoint (per-SCC backend),
+//! and a separate, deliberately SEQUENTIAL findings pass runs after every
+//! wave has finished (determinism first — see the pass itself).
 //!
 //! Scheduling: **wave-parallel** — group SCCs by longest-path depth over
 //! the condensation DAG (leaves = depth 0), process depths in ascending
@@ -10,13 +13,16 @@
 //! inputs. Revisit only if phase-5 profiling says so.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rayon::prelude::*;
 
+use goverify_cache::QueryCache;
 use goverify_ir::{CallGraph, FuncId, Program, Sccs};
-use goverify_solver::{Solver, StubSolver};
+use goverify_solver::{Query, SatResult, SolverLimits, StubSolver, TextSolver, discharge_query};
 
+use crate::checker::{Checker, Finding};
 use crate::effects::{self, Effects, Loc, Root};
 use crate::prepass::{self, Domains};
 use crate::summary::{Provenance, Summary};
@@ -32,22 +38,58 @@ impl Default for Options {
     }
 }
 
+/// Everything `analyze_full` needs beyond the fixpoint options: solver
+/// limits (informational — the backend a `mk_backend` closure constructs
+/// already bakes its own limits in), an optional on-disk query cache, and
+/// an optional directory to dump every canonical SMT-LIB2 query to.
+#[derive(Debug, Clone, Default)]
+pub struct EngineConfig {
+    pub opts: Options,
+    pub limits: SolverLimits,
+    pub cache_dir: Option<PathBuf>,
+    pub emit_smt: Option<PathBuf>,
+}
+
 #[derive(Debug)]
 pub struct Analysis {
     pub summaries: BTreeMap<FuncId, Summary>,
     pub prepass: BTreeMap<FuncId, Domains>,
     pub diagnostics: Vec<String>,
+    pub findings: Vec<Finding>,
 }
 
+/// Phase-2-compatible entry point: no checkers, no findings, `StubSolver`
+/// (answers Unknown to everything) as the fixpoint's backend. Every
+/// existing caller/test survives unmodified — this is a thin `analyze_full`
+/// delegation, not a parallel implementation.
 pub fn analyze(p: &Program, opts: &Options) -> Analysis {
-    analyze_with_solver(p, opts, &|| Box::new(StubSolver))
+    analyze_full(
+        p,
+        &EngineConfig {
+            opts: opts.clone(),
+            ..EngineConfig::default()
+        },
+        &[],
+        &|| Box::new(StubSolver),
+    )
 }
 
-pub fn analyze_with_solver(
+/// The phase-3 tracer entry point (parent spec §8, §12): runs the same
+/// wave-parallel fixpoint as `analyze`, additionally letting `checkers`
+/// infer requires-clauses per function and, after every wave has settled,
+/// raising and discharging obligations in one sequential findings pass.
+///
+/// `mk_backend` is called once per SCC task, exactly like `mk_solver` used
+/// to be — each wave-worker gets its own backend instance, reused across
+/// every function/round in that worker's SCC.
+pub fn analyze_full(
     p: &Program,
-    opts: &Options,
-    mk_solver: &(dyn Fn() -> Box<dyn Solver> + Sync),
+    cfg: &EngineConfig,
+    checkers: &[&dyn Checker],
+    mk_backend: &(dyn Fn() -> Box<dyn TextSolver> + Sync),
 ) -> Analysis {
+    let cache = cfg.cache_dir.clone().map(QueryCache::open);
+    let emit_dir = cfg.emit_smt.clone();
     let graph = CallGraph::build(p);
     let sccs = Sccs::compute(p, &graph);
     let n_sccs = sccs.schedule().len();
@@ -95,8 +137,15 @@ pub fn analyze_with_solver(
                 .iter()
                 .map(|&m| (m, Summary::default())) // optimistic start
                 .collect();
-            let mut solver = mk_solver();
+            let mut backend = mk_backend();
             let mut rounds = 0u32;
+            // `analyze_function` re-runs every checker's `infer_requires`
+            // on every round of a recursive SCC's fixpoint (it never reads
+            // callee summaries, only `f`'s own body) — wasteful but
+            // harmless: same function body ⇒ same clauses every time, so
+            // the `current[&m] != new` convergence check below still
+            // terminates exactly as it does for effects alone. Fine for
+            // phase 3; revisit only if profiling says so.
             loop {
                 let mut changed = false;
                 for &m in members {
@@ -105,7 +154,10 @@ pub fn analyze_with_solver(
                         &graph,
                         m,
                         &|f| read_slot(&slots, f, &current),
-                        &mut *solver,
+                        checkers,
+                        &mut *backend,
+                        cache.as_ref(),
+                        emit_dir.as_deref(),
                         &diag_slots,
                     );
                     if current[&m] != new {
@@ -116,7 +168,7 @@ pub fn analyze_with_solver(
                 if !recursive || !changed {
                     break;
                 }
-                if rounds >= opts.widen_after {
+                if rounds >= cfg.opts.widen_after {
                     // Widen: havoc every member. Widening only ever moves
                     // up the lattice (toward top), never invents
                     // constraints — `Summary::havoc()` has no requires.
@@ -159,10 +211,50 @@ pub fn analyze_with_solver(
         .func_ids()
         .filter_map(|f| diag_slots[f.0 as usize].lock().unwrap().clone())
         .collect();
+
+    // Findings pass (phase-3 spec §8, §12): SEQUENTIAL, not lazy. Every
+    // summary is final at this point, so this is deliberately a second,
+    // single-threaded scan over `p.func_ids()` (ascending order, itself
+    // derived from sorted function names) with one fresh backend —
+    // determinism first. Parallelize in phase 5 with the same slot
+    // pattern as summaries above if profiling asks.
+    let mut findings: Vec<Finding> = Vec::new();
+    if !checkers.is_empty() {
+        let mut backend = mk_backend();
+        let summary_of = |f: FuncId| summaries.get(&f).cloned().unwrap_or_else(Summary::havoc);
+        for f in p.func_ids() {
+            let mut per_func: Vec<Finding> = Vec::new();
+            for checker in checkers {
+                for ob in checker.obligations(p, f, &summary_of) {
+                    // Bug-finder semantics (parent spec §8): only a
+                    // confirmed Sat verdict becomes a Finding; Unsat and
+                    // Unknown (incl. timeouts) stay silent.
+                    let outcome = discharge_query(
+                        &ob.query,
+                        &mut *backend,
+                        cache.as_ref(),
+                        emit_dir.as_deref(),
+                    );
+                    if outcome.result == SatResult::Sat {
+                        per_func.push(Finding {
+                            checker: checker.name().to_string(),
+                            func: p.func_name(f).to_string(),
+                            pos: ob.pos,
+                            message: ob.message,
+                        });
+                    }
+                }
+            }
+            per_func.sort_by(|a, b| a.pos.cmp(&b.pos).then_with(|| a.message.cmp(&b.message)));
+            findings.extend(per_func);
+        }
+    }
+
     Analysis {
         summaries,
         prepass: pre,
         diagnostics,
+        findings,
     }
 }
 
@@ -185,12 +277,16 @@ fn read_slot(
         .unwrap_or_else(Summary::havoc)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_function(
     p: &Program,
     graph: &CallGraph,
     f: FuncId,
     summary_of: &dyn Fn(FuncId) -> Summary,
-    _solver: &mut dyn Solver,
+    checkers: &[&dyn Checker],
+    backend: &mut dyn TextSolver,
+    cache: Option<&QueryCache>,
+    emit_dir: Option<&Path>,
     diag_slots: &[Mutex<Option<String>>],
 ) -> Summary {
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -199,8 +295,19 @@ fn analyze_function(
         }
         let effects = effects::collect(p, f, graph, &|c| summary_of(c).effects);
 
+        // Union of every checker's inferred requires: checker order (as
+        // given by the caller), then per-checker clause order (Task 12
+        // design). See the recursive-SCC caveat above the calling loop.
+        let mut requires = Vec::new();
+        for checker in checkers {
+            let mut discharge =
+                |q: &Query| discharge_query(q, &mut *backend, cache, emit_dir).result;
+            requires.extend(checker.infer_requires(p, f, &mut discharge));
+        }
+
         Summary {
             effects,
+            requires,
             ..Summary::default()
         }
     }));
@@ -301,6 +408,29 @@ pub fn dump_summaries(p: &Program, a: &Analysis, filter: Option<&str>) -> String
         })
         .collect();
     lines.sort_unstable();
+    render_lines(lines)
+}
+
+/// One line per finding, in already-sorted assembly order (per-function
+/// groups sorted by `(pos, message)`, functions visited in
+/// `p.func_ids()` order) — unlike `dump_prepass`/`dump_summaries`, this
+/// does NOT re-sort by name: the assembly order IS the deterministic
+/// order. `filter` is a substring match on `func` (same convention as
+/// `dump_summaries`); whole-DAG extraction includes stdlib, so an
+/// unfiltered corpus golden would flake on Go toolchain bumps.
+pub fn dump_findings(a: &Analysis, filter: Option<&str>) -> String {
+    let lines: Vec<String> = a
+        .findings
+        .iter()
+        .filter(|f| filter.is_none_or(|s| f.func.contains(s)))
+        .map(|f| {
+            let pos = match &f.pos {
+                Some(p) => format!("{}:{}:{}", p.file, p.line, p.col),
+                None => "-:-:-".to_string(),
+            };
+            format!("{pos}: {}: {} [{}]", f.checker, f.message, f.func)
+        })
+        .collect();
     render_lines(lines)
 }
 
@@ -408,5 +538,80 @@ mod tests {
         // Sanity: with the default k the same SCC converges Inferred.
         let a3 = analyze(&p, &Options::default());
         assert_eq!(a3.summaries[&even].provenance, Provenance::Inferred);
+    }
+
+    /// Scripted always-Sat backend: every obligation it discharges comes
+    /// back Sat, so a fake checker's obligation must become a Finding.
+    struct AlwaysSat;
+    impl TextSolver for AlwaysSat {
+        fn identity(&self) -> String {
+            "always-sat".into()
+        }
+        fn limits(&self) -> SolverLimits {
+            SolverLimits::default()
+        }
+        fn solve_text(&mut self, _canonical: &str) -> goverify_solver::QueryOutcome {
+            goverify_solver::QueryOutcome {
+                result: SatResult::Sat,
+                model: None,
+            }
+        }
+    }
+
+    /// Infers nothing; raises exactly one obligation per function it is
+    /// asked about.
+    struct FakeChecker;
+    impl Checker for FakeChecker {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn infer_requires(
+            &self,
+            _p: &Program,
+            _f: FuncId,
+            _discharge: &mut dyn FnMut(&Query) -> SatResult,
+        ) -> Vec<crate::summary::Clause> {
+            Vec::new()
+        }
+        fn obligations(
+            &self,
+            _p: &Program,
+            _f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
+        ) -> Vec<crate::checker::Obligation> {
+            vec![crate::checker::Obligation {
+                tag: "fake".into(),
+                message: "fake finding".into(),
+                pos: None,
+                query: Query::for_asserts(
+                    goverify_solver::Logic::All,
+                    vec![goverify_solver::Term::bool_lit(true)],
+                ),
+            }]
+        }
+    }
+
+    #[test]
+    fn findings_pass_is_sequential_and_deterministic() {
+        // Single-function program: obligations() fires exactly once, the
+        // always-Sat backend confirms it, so exactly one Finding results
+        // — and, since the findings pass is a single-threaded scan (no
+        // rayon involved), it must come out byte-identical across runs.
+        let p = Program::from_packages(vec![pkg("t", vec![straight("t.F", vec![])])]);
+        let checkers: Vec<&dyn Checker> = vec![&FakeChecker];
+        let cfg = EngineConfig::default();
+        let a1 = analyze_full(&p, &cfg, &checkers, &|| Box::new(AlwaysSat));
+        let a2 = analyze_full(&p, &cfg, &checkers, &|| Box::new(AlwaysSat));
+        assert_eq!(
+            a1.findings.len(),
+            1,
+            "one Sat obligation must yield one finding: {:?}",
+            a1.findings
+        );
+        assert_eq!(a1.findings[0].checker, "fake");
+        assert_eq!(
+            a1.findings, a2.findings,
+            "findings pass must be deterministic across runs"
+        );
     }
 }

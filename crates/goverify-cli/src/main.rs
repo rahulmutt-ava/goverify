@@ -66,6 +66,26 @@ enum DebugWhat {
     Prepass(DebugArgs),
     /// Dump instantiated function summaries.
     Summary(DebugArgs),
+    /// Run the analysis + checkers and print findings (phase-3 tracer).
+    Findings(FindingsArgs),
+}
+
+#[derive(clap::Args)]
+struct FindingsArgs {
+    #[command(flatten)]
+    common: DebugArgs,
+    /// Dump every canonical SMT-LIB2 query to this directory.
+    #[arg(long)]
+    emit_smt: Option<PathBuf>,
+    /// Solve via an external SMT-LIB2 binary instead of built-in Z3.
+    #[arg(long)]
+    solver_cmd: Option<String>,
+    /// Per-query timeout in milliseconds.
+    #[arg(long, default_value_t = 100)]
+    solver_timeout_ms: u32,
+    /// Query-cache directory (omit to run uncached).
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -107,6 +127,7 @@ fn run_debug(what: DebugWhat) -> Result<(), Box<dyn std::error::Error>> {
         DebugWhat::Sccs(a) => ("sccs", a),
         DebugWhat::Prepass(a) => ("prepass", a),
         DebugWhat::Summary(a) => ("summary", a),
+        DebugWhat::Findings(fa) => return run_findings(fa),
     };
     // --func filters per-function output; callgraph/sccs dumps are
     // whole-program (final-review deferred T15) — warn instead of
@@ -114,20 +135,7 @@ fn run_debug(what: DebugWhat) -> Result<(), Box<dyn std::error::Error>> {
     if args.func.is_some() && matches!(kind, "callgraph" | "sccs") {
         eprintln!("goverify: --func has no effect on `debug {kind}`; ignoring");
     }
-    let mut _tmp: Option<tempfile::TempDir> = None; // keep tempdir alive
-    let gvir_dir = match args.gvir_dir {
-        Some(d) => d,
-        None => {
-            let sidecar = Sidecar::build(&extractor_dir()?, &sidecar_build_dir())?;
-            let tmp = tempfile::tempdir()?;
-            let patterns: Vec<&str> = args.patterns.iter().map(String::as_str).collect();
-            sidecar.extract(Path::new("."), &patterns, tmp.path())?;
-            let d = tmp.path().to_path_buf();
-            _tmp = Some(tmp);
-            d
-        }
-    };
-    let program = goverify_ir::Program::load_dir(&gvir_dir)?;
+    let program = load_program(&args)?;
     for d in program.diagnostics() {
         eprintln!("goverify: {d}");
     }
@@ -170,6 +178,68 @@ fn run_debug(what: DebugWhat) -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => unreachable!(),
     }
+    Ok(())
+}
+
+/// Shared gvir-dir resolution: an explicit `--gvir-dir` is loaded as-is;
+/// otherwise extract the current directory into a fresh temp dir first
+/// (the tempdir is cleaned up once this function returns, after
+/// `Program::load_dir` has already copied everything it needs into
+/// memory).
+fn load_program(args: &DebugArgs) -> Result<goverify_ir::Program, Box<dyn std::error::Error>> {
+    let mut _tmp: Option<tempfile::TempDir> = None; // keep tempdir alive
+    let gvir_dir = match &args.gvir_dir {
+        Some(d) => d.clone(),
+        None => {
+            let sidecar = Sidecar::build(&extractor_dir()?, &sidecar_build_dir())?;
+            let tmp = tempfile::tempdir()?;
+            let patterns: Vec<&str> = args.patterns.iter().map(String::as_str).collect();
+            sidecar.extract(Path::new("."), &patterns, tmp.path())?;
+            let d = tmp.path().to_path_buf();
+            _tmp = Some(tmp);
+            d
+        }
+    };
+    let program = goverify_ir::Program::load_dir(&gvir_dir)?;
+    Ok(program)
+}
+
+/// `debug findings` (phase-3 tracer, this task's end-to-end milestone):
+/// extract/load, run the checkers through `analyze_full`, print every
+/// `Sat`-confirmed finding.
+fn run_findings(fa: FindingsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Filtering findings is a `check`-UX concern (phase 4); the flattened
+    // DebugArgs only contributes gvir-dir/patterns here, but clap still
+    // drags --func along, so warn instead of silently ignoring it (same
+    // convention as the callgraph/sccs arms above).
+    if fa.common.func.is_some() {
+        eprintln!("goverify: --func has no effect on `debug findings`; ignoring");
+    }
+    let program = load_program(&fa.common)?;
+    for d in program.diagnostics() {
+        eprintln!("goverify: {d}");
+    }
+    let limits = goverify_solver::SolverLimits {
+        timeout_ms: fa.solver_timeout_ms,
+        ..Default::default()
+    };
+    let cfg = goverify_analysis::EngineConfig {
+        opts: goverify_analysis::Options::default(),
+        limits,
+        cache_dir: fa.cache_dir.clone(),
+        emit_smt: fa.emit_smt.clone(),
+    };
+    let cmd = fa.solver_cmd.clone();
+    let mk: Box<dyn Fn() -> Box<dyn goverify_solver::TextSolver> + Sync> = match cmd {
+        Some(c) => Box::new(move || Box::new(goverify_solver::SmtLib2Process::new(&c, limits))),
+        None => Box::new(move || Box::new(goverify_solver::Z3Native::new(limits))),
+    };
+    let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&goverify_checkers::NilTracer];
+    let a = goverify_analysis::analyze_full(&program, &cfg, &checkers, &*mk);
+    for d in &a.diagnostics {
+        eprintln!("goverify: {d}");
+    }
+    print!("{}", goverify_analysis::dump_findings(&a, None));
     Ok(())
 }
 

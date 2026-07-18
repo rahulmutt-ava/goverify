@@ -310,6 +310,7 @@ dependencies = [
 name = "goverify-analysis"
 version = "0.1.0"
 dependencies = [
+ "goverify-cache",
  "goverify-extract",
  "goverify-ir",
  "goverify-solver",
@@ -342,8 +343,10 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "goverify-analysis",
+ "goverify-checkers",
  "goverify-extract",
  "goverify-ir",
+ "goverify-solver",
  "tempfile",
 ]
 

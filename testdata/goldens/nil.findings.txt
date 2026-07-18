@@ -1,0 +1,1 @@
+nil.go:21:30: nil: nil passed to example.com/nil.deref (violates its nil-deref requirement) [example.com/nil.Bad]

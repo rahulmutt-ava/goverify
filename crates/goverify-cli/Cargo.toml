@@ -13,4 +13,6 @@ clap.workspace = true
 goverify-extract.workspace = true
 goverify-ir.workspace = true
 goverify-analysis.workspace = true
+goverify-checkers.workspace = true
+goverify-solver.workspace = true
 tempfile.workspace = true

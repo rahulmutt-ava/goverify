@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+goverify-cache = { workspace = true }
 goverify-ir = { workspace = true }
 goverify-solver = { workspace = true }
 rayon = { workspace = true }

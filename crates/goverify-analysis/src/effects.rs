@@ -836,11 +836,25 @@ mod props {
                 ),
                 0..3,
             ),
+            prop::collection::btree_map(
+                arb_loc(),
+                prop::collection::btree_set(
+                    prop::sample::select(vec![
+                        ChanOp::Make,
+                        ChanOp::Send,
+                        ChanOp::Recv,
+                        ChanOp::Close,
+                        ChanOp::Select,
+                    ]),
+                    1..3,
+                ),
+                0..3,
+            ),
             prop::sample::select(vec![Spawns::None, Spawns::Bounded, Spawns::Unbounded]),
         )
-            .prop_map(|(lock_ops, spawns)| Effects {
+            .prop_map(|(lock_ops, chan_ops, spawns)| Effects {
                 spawns,
-                chan_ops: BTreeMap::new(),
+                chan_ops,
                 lock_ops,
             })
     }
@@ -855,6 +869,12 @@ mod props {
             prop_assert_eq!(&aa, &a, "idempotent");
             let mut a_top = a.clone(); a_top.join(&Effects::top());
             prop_assert_eq!(&a_top, &{ let mut t = Effects::top(); t.join(&a); t }, "top absorbs symmetrically");
+            // Monotone: a ⊑ a∨b. Joining `b` into `a` yields `ab`; if `a`
+            // is already ⊑ `ab` (i.e. `a` contributed nothing `ab` didn't
+            // already have), then joining `a` into `ab` must leave `ab`
+            // unchanged.
+            let mut ab_join_a = ab.clone(); ab_join_a.join(&a);
+            prop_assert_eq!(&ab_join_a, &ab, "monotone: a joined into a∨b changes nothing (a ⊑ a∨b)");
         }
     }
 }

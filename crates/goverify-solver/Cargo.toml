@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 z3-sys.workspace = true
 tempfile.workspace = true
+goverify-cache.workspace = true
+blake3.workspace = true
 proptest = { workspace = true, optional = true }
 
 [dev-dependencies]

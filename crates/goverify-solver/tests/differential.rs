@@ -4,8 +4,8 @@
 //! (`--ignored`).
 
 use goverify_solver::{
-    AstTerm as Term, BvCmpOp, Logic, Query, SatResult, SmtLib2Process, SolverLimits, Sort,
-    TextSolver, Z3Native, ptr_is_nil, ptr_nil, ptr_sort,
+    BvCmpOp, Logic, Query, SatResult, SmtLib2Process, SolverLimits, Sort, Term, TextSolver,
+    Z3Native, ptr_is_nil, ptr_nil, ptr_sort,
 };
 
 fn fixed_queries() -> Vec<(&'static str, Query)> {

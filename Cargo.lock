@@ -362,6 +362,8 @@ dependencies = [
 name = "goverify-solver"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "goverify-cache",
  "proptest",
  "tempfile",
  "z3-sys",

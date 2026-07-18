@@ -15,5 +15,6 @@ pub use engine::{
 };
 pub use prepass::{Domains, value_clean};
 pub use summary::{
-    BoundClause, Clause, IfaceVar, PlaceholderFormula, Provenance, Summary, instantiate_requires,
+    BoundClause, Clause, Formula, IfaceVar, Provenance, Summary, iface_var_name,
+    instantiate_requires,
 };

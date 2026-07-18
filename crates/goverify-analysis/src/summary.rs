@@ -1,28 +1,42 @@
-//! Function summaries (parent spec §5), phase-2 form: clause structure and
-//! instantiation are real; formulas are placeholders until phase 3's term
-//! language replaces `PlaceholderFormula` behind this same API.
+//! Function summaries (parent spec §5), phase-3 form: clause formulas are
+//! real terms over the function's symbolic interface. Free variables use
+//! the fixed naming p<i> (params) / r<i> (results) — `iface_var_name` is
+//! the single source of that convention.
 
-use goverify_ir::ValueId;
+use std::collections::BTreeMap;
+
+use goverify_solver::Term;
 
 use crate::effects::Effects;
 
 /// A variable of the function's symbolic interface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IfaceVar {
     Param(u32),
     Result(u32),
 }
 
+/// THE naming convention for interface variables in formulas. Checkers
+/// (Task 11) must build vars with exactly these names.
+pub fn iface_var_name(v: &IfaceVar) -> String {
+    match v {
+        IfaceVar::Param(i) => format!("p{i}"),
+        IfaceVar::Result(i) => format!("r{i}"),
+    }
+}
+
+/// A clause formula: a Bool-sorted term whose free variables are all
+/// p<i>/r<i>-named.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaceholderFormula {
-    /// Which fact this clause states, e.g. "nonnil". Opaque to phase 2.
-    pub tag: String,
-    pub vars: Vec<IfaceVar>,
+pub struct Formula {
+    pub term: Term,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clause {
-    pub formula: PlaceholderFormula,
+    /// Which checker/fact this clause states, e.g. "nil-deref".
+    pub tag: String,
+    pub formula: Formula,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,72 +77,115 @@ impl Summary {
     }
 }
 
-/// A callee clause bound to caller values. None = the interface var had no
-/// corresponding caller value (malformed input or Result var) — callers
-/// must treat None as "cannot evaluate; do not report".
+/// A callee requires-clause instantiated at a call site: `violation` is
+/// ¬formula with p<i> := arg_terms[i]. None = some needed variable had no
+/// caller term (unknown arg, Result var, sort mismatch, arity overflow) —
+/// callers MUST treat None as "cannot evaluate; do not report".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundClause {
     pub tag: String,
-    pub vars: Vec<Option<ValueId>>,
+    pub violation: Option<Term>,
 }
 
-pub fn instantiate_requires(callee: &Summary, args: &[ValueId]) -> Vec<BoundClause> {
+pub fn instantiate_requires(callee: &Summary, arg_terms: &[Option<Term>]) -> Vec<BoundClause> {
     callee
         .requires
         .iter()
         .map(|c| BoundClause {
-            tag: c.formula.tag.clone(),
-            vars: c
-                .formula
-                .vars
-                .iter()
-                .map(|v| match v {
-                    IfaceVar::Param(i) => args.get(*i as usize).copied(),
-                    IfaceVar::Result(_) => None,
-                })
-                .collect(),
+            tag: c.tag.clone(),
+            violation: bind_violation(&c.formula, arg_terms),
         })
         .collect()
 }
 
+fn bind_violation(f: &Formula, arg_terms: &[Option<Term>]) -> Option<Term> {
+    let mut map = BTreeMap::new();
+    for (name, _sort) in f.term.free_vars() {
+        // Only p<i> vars can be bound at a call site; anything else
+        // (r<i>, or a checker bug) makes the clause unevaluable here.
+        let idx: u32 = name.strip_prefix('p')?.parse().ok()?;
+        let t = arg_terms.get(idx as usize)?.clone()?;
+        map.insert(name, t);
+    }
+    let bound = f.term.substitute(&map).ok()?;
+    Term::not(bound).ok()
+}
+
 #[cfg(test)]
 mod tests {
+    use goverify_solver::{Term, ptr_is_nil, ptr_nil, ptr_sort};
+
     use super::*;
 
-    #[test]
-    fn instantiate_maps_params_to_args() {
-        let callee = Summary {
-            requires: vec![Clause {
-                formula: PlaceholderFormula {
-                    tag: "nonnil".into(),
-                    vars: vec![IfaceVar::Param(0), IfaceVar::Param(2)],
-                },
-            }],
+    fn nonnil_clause(param: u32) -> Clause {
+        let v = IfaceVar::Param(param);
+        let p = Term::var(&iface_var_name(&v), ptr_sort());
+        Clause {
+            tag: "nil-deref".into(),
+            formula: Formula {
+                term: Term::not(ptr_is_nil(p).unwrap()).unwrap(),
+            },
+        }
+    }
+
+    fn callee_with(requires: Vec<Clause>) -> Summary {
+        Summary {
+            requires,
             ..Summary::default()
-        };
-        let args = [ValueId(7), ValueId(8), ValueId(9)];
-        let bound = instantiate_requires(&callee, &args);
+        }
+    }
+
+    #[test]
+    fn nil_arg_binds_to_violation_term() {
+        let callee = callee_with(vec![nonnil_clause(0)]);
+        let bound = instantiate_requires(&callee, &[Some(ptr_nil())]);
+        assert_eq!(bound.len(), 1);
+        let v = bound[0].violation.as_ref().expect("bindable");
+        // violation = ¬¬(is-nil nil): no free vars left.
+        assert!(v.free_vars().is_empty(), "fully ground violation");
+    }
+
+    #[test]
+    fn unknown_arg_means_no_violation() {
+        let callee = callee_with(vec![nonnil_clause(0)]);
         assert_eq!(
-            bound,
-            vec![BoundClause {
-                tag: "nonnil".into(),
-                vars: vec![Some(ValueId(7)), Some(ValueId(9))],
-            }]
+            instantiate_requires(&callee, &[None])[0].violation,
+            None,
+            "unknown arg: cannot evaluate; do not report"
         );
     }
 
     #[test]
-    fn instantiate_out_of_range_param_binds_none() {
-        let callee = Summary {
-            requires: vec![Clause {
-                formula: PlaceholderFormula {
-                    tag: "t".into(),
-                    vars: vec![IfaceVar::Param(5)],
-                },
-            }],
-            ..Summary::default()
-        };
-        assert_eq!(instantiate_requires(&callee, &[])[0].vars, vec![None]);
+    fn out_of_range_param_means_no_violation() {
+        let callee = callee_with(vec![nonnil_clause(5)]);
+        assert_eq!(instantiate_requires(&callee, &[])[0].violation, None);
+    }
+
+    /// Folded fast-follow T12: a Result-var clause can never be bound at
+    /// a call site — violation must be None, not a bogus term.
+    #[test]
+    fn result_var_clause_means_no_violation() {
+        let r = Term::var(&iface_var_name(&IfaceVar::Result(0)), ptr_sort());
+        let callee = callee_with(vec![Clause {
+            tag: "t".into(),
+            formula: Formula {
+                term: ptr_is_nil(r).unwrap(),
+            },
+        }]);
+        assert_eq!(
+            instantiate_requires(&callee, &[Some(ptr_nil())])[0].violation,
+            None
+        );
+    }
+
+    #[test]
+    fn sort_mismatched_arg_means_no_violation() {
+        let callee = callee_with(vec![nonnil_clause(0)]);
+        assert_eq!(
+            instantiate_requires(&callee, &[Some(Term::bool_lit(true))])[0].violation,
+            None,
+            "substitute() sort check must degrade, not report"
+        );
     }
 
     #[test]

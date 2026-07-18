@@ -48,12 +48,19 @@ pub struct Finding {
 
 /// Discharge instantiated requires-clauses. Bug-finder semantics (parent
 /// spec §8): only Sat reports; Unsat and Unknown (incl. timeout) are
-/// silent. With `StubSolver` everything is Unknown ⇒ no findings.
+/// silent. Unbindable clauses (violation: None) are silent by
+/// construction.
 pub fn discharge(obligations: &[BoundClause], solver: &mut dyn Solver) -> Vec<Finding> {
     obligations
         .iter()
-        .filter(|_| solver.check_sat_assuming(&[]) == SatResult::Sat)
-        .map(|o| Finding { tag: o.tag.clone() })
+        .filter_map(|o| {
+            let v = o.violation.clone()?;
+            solver.push();
+            solver.assert(v);
+            let r = solver.check_sat_assuming(&[]);
+            solver.pop();
+            (r == SatResult::Sat).then(|| Finding { tag: o.tag.clone() })
+        })
         .collect()
 }
 
@@ -238,7 +245,9 @@ fn analyze_function(
                 } = &ins.op
                 {
                     let callee_summary = summary_of(*callee_id);
-                    let obligations = instantiate_requires(&callee_summary, args);
+                    let arg_terms: Vec<Option<goverify_solver::Term>> =
+                        args.iter().map(|_| None).collect();
+                    let obligations = instantiate_requires(&callee_summary, &arg_terms);
                     let _findings = discharge(&obligations, solver);
                 }
             }
@@ -431,7 +440,7 @@ mod tests {
     fn discharge_with_stub_solver_reports_nothing() {
         let obligations = vec![BoundClause {
             tag: "nonnil".into(),
-            vars: vec![],
+            violation: Some(goverify_solver::Term::bool_lit(true)),
         }];
         assert!(
             discharge(&obligations, &mut StubSolver).is_empty(),

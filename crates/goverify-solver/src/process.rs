@@ -161,13 +161,28 @@ mod tests {
         SmtLib2Process::new("z3", SolverLimits::default())
     }
 
+    /// Generous limits: these queries are trivial; a CI-box hiccup under
+    /// parallel load must not turn a verdict into Unknown and flake the
+    /// test (this one has flaked at the default 100ms under load, unlike
+    /// the plain `z3()` helper's default-limits instance used elsewhere
+    /// in this module where a flake was never observed).
+    fn z3_generous() -> SmtLib2Process {
+        SmtLib2Process::new(
+            "z3",
+            SolverLimits {
+                timeout_ms: 5_000,
+                mem_mb: 1024,
+            },
+        )
+    }
+
     #[test]
     fn sat_unsat_and_model() {
-        let sat =
-            z3().solve_text("(set-logic QF_BV)\n(declare-const b Bool)\n(assert b)\n(check-sat)\n");
+        let sat = z3_generous()
+            .solve_text("(set-logic QF_BV)\n(declare-const b Bool)\n(assert b)\n(check-sat)\n");
         assert_eq!(sat.result, SatResult::Sat);
         assert!(sat.model.is_some());
-        let unsat = z3().solve_text(
+        let unsat = z3_generous().solve_text(
             "(set-logic QF_BV)\n(declare-const b Bool)\n(assert (and b (not b)))\n(check-sat)\n",
         );
         assert_eq!(unsat.result, SatResult::Unsat);

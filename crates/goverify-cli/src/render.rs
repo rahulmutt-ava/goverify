@@ -3,11 +3,17 @@
 
 //! Human terminal rendering of `Finding`s (phase-4 spec §5, `check`
 //! subcommand, Task 11): span + caret snippet, violation path, model
-//! bindings, fired-clause message. Source-derived text (the snippet echo
-//! and model values) is untrusted-ish display input (threat-model): it
-//! passes through `sanitize` before ever reaching the terminal, and is
-//! never parsed for anything — verdicts are already final by the time a
-//! `Finding` reaches this module.
+//! bindings, fired-clause message. Source-derived text (the snippet echo,
+//! model values, and every displayed `Pos.file`) is untrusted-ish display
+//! input (threat-model): it passes through `sanitize` before ever
+//! reaching the terminal, and is never parsed for anything — verdicts
+//! are already final by the time a `Finding` reaches this module.
+//! `Pos.file` in particular has no structural guarantee of being clean
+//! text — POSIX allows any byte but `/` and NUL in a filename — so every
+//! interpolation of it into rendered output (header, `path:` lines) is
+//! sanitized; the one exception is `read_source_line`'s filesystem
+//! lookup, which uses the raw path (sanitizing there would just make a
+//! legitimate file unreadable, not safer).
 
 use std::path::Path;
 
@@ -39,7 +45,7 @@ fn render_one(f: &Finding, source_root: &Path) -> String {
     let mut lines: Vec<String> = Vec::new();
 
     let pos_str = match &f.pos {
-        Some(p) => format!("{}:{}:{}", p.file, p.line, p.col),
+        Some(p) => format!("{}:{}:{}", sanitize(&p.file), p.line, p.col),
         None => "-:-:-".to_string(),
     };
     lines.push(format!("{pos_str}: {}: {} [{}]", f.tag, f.message, f.func));
@@ -56,7 +62,7 @@ fn render_one(f: &Finding, source_root: &Path) -> String {
         .trace
         .iter()
         .filter_map(|step| step.pos.as_ref())
-        .map(|p| format!("{}:{}", p.file, p.line))
+        .map(|p| format!("{}:{}", sanitize(&p.file), p.line))
         .collect();
     if !path_parts.is_empty() {
         lines.push(format!("    path: {}", path_parts.join(" -> ")));
@@ -84,11 +90,12 @@ fn read_source_line(root: &Path, file: &str, line: u32) -> Option<String> {
     text.lines().nth(idx).map(str::to_string)
 }
 
-/// Strip ANSI/control chars from solver-derived text before terminal
-/// output (threat-model: model text is untrusted-ish display input).
-/// Every C0 control (`< 0x20`) plus DEL (`0x7f`) is dropped — no
-/// exceptions (traces/bindings are always single-line, so there's no
-/// legitimate tab/newline to preserve).
+/// Strip ANSI/control chars from solver- or extractor-derived text
+/// before terminal output (threat-model: model text and `Pos.file` are
+/// both untrusted-ish display input). Every C0 control (`< 0x20`) plus
+/// DEL (`0x7f`) is dropped — no exceptions (traces/bindings/paths are
+/// always single-line, so there's no legitimate tab/newline to
+/// preserve).
 fn sanitize(s: &str) -> String {
     s.chars()
         .filter(|&c| !((c as u32) < 0x20 || c as u32 == 0x7f))
@@ -173,6 +180,36 @@ m.go:3:9: nil-deref: nil passed to t.F (violates its nil-deref requirement) [t.B
         // keep \t? no: replace every C0 control except nothing — traces
         // are single-line; strip chars < 0x20 plus 0x7f.
         assert_eq!(sanitize("a\tb\nc\x7fd"), "abcd");
+    }
+
+    #[test]
+    fn pos_file_control_bytes_are_stripped_in_header_and_path() {
+        // Pos.file has no structural safety guarantee (POSIX filenames
+        // allow any byte but '/' and NUL) — a file named with a raw ESC
+        // byte must not reach the terminal unsanitized, in either the
+        // header span or a trace `path:` line. Pure string-level test:
+        // no filesystem needed (the finding's own pos.file need not
+        // exist on disk for the header/path lines to render).
+        let mut f = base_finding();
+        f.pos = Some(pos("ev\x1bil.go", 3, 9));
+        f.trace = vec![TraceStep {
+            block: 0,
+            pos: Some(pos("ev\x1bil.go", 2, 1)),
+        }];
+
+        let got = render_findings(&[f], Path::new("/nonexistent"));
+        assert!(
+            !got.contains('\x1b'),
+            "control byte from Pos.file leaked into rendered output: {got:?}"
+        );
+        assert!(
+            got.starts_with("evil.go:3:9:"),
+            "header must sanitize Pos.file: {got:?}"
+        );
+        assert!(
+            got.contains("path: evil.go:2"),
+            "path: line must sanitize Pos.file: {got:?}"
+        );
     }
 
     #[test]

@@ -229,9 +229,15 @@ fn run_findings(fa: FindingsArgs) -> Result<(), Box<dyn std::error::Error>> {
         emit_smt: fa.emit_smt.clone(),
     };
     let cmd = fa.solver_cmd.clone();
-    let mk: Box<dyn Fn() -> Box<dyn goverify_solver::TextSolver> + Sync> = match cmd {
-        Some(c) => Box::new(move || Box::new(goverify_solver::SmtLib2Process::new(&c, limits))),
-        None => Box::new(move || Box::new(goverify_solver::Z3Native::new(limits))),
+    // `debug findings` keeps one timeout for both backend roles; `check`
+    // (Task 11) differentiates Infer vs Findings.
+    let mk: Box<
+        dyn Fn(goverify_analysis::BackendRole) -> Box<dyn goverify_solver::TextSolver> + Sync,
+    > = match cmd {
+        Some(c) => {
+            Box::new(move |_role| Box::new(goverify_solver::SmtLib2Process::new(&c, limits)))
+        }
+        None => Box::new(move |_role| Box::new(goverify_solver::Z3Native::new(limits))),
     };
     let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&goverify_checkers::NilTracer];
     let a = goverify_analysis::analyze_full(&program, &cfg, &checkers, &*mk);

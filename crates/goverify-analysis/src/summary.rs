@@ -77,13 +77,15 @@ impl Summary {
     }
 }
 
-/// A callee requires-clause instantiated at a call site: `violation` is
-/// ¬formula with p<i> := arg_terms[i]. None = some needed variable had no
-/// caller term (unknown arg, Result var, sort mismatch, arity overflow) —
-/// callers MUST treat None as "cannot evaluate; do not report".
+/// A callee requires-clause instantiated at a call site: `bound` is the
+/// clause with p<i> := arg_terms[i] substituted (NOT negated); `violation`
+/// is ¬bound. Both None = some needed variable had no caller term (unknown
+/// arg, Result var, sort mismatch, arity overflow) — callers MUST treat
+/// None as "cannot evaluate; do not report".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundClause {
     pub tag: String,
+    pub bound: Option<Term>,
     pub violation: Option<Term>,
 }
 
@@ -91,14 +93,22 @@ pub fn instantiate_requires(callee: &Summary, arg_terms: &[Option<Term>]) -> Vec
     callee
         .requires
         .iter()
-        .map(|c| BoundClause {
-            tag: c.tag.clone(),
-            violation: bind_violation(&c.formula, arg_terms),
+        .map(|c| match bind(&c.formula, arg_terms) {
+            Some((b, v)) => BoundClause {
+                tag: c.tag.clone(),
+                bound: Some(b),
+                violation: Some(v),
+            },
+            None => BoundClause {
+                tag: c.tag.clone(),
+                bound: None,
+                violation: None,
+            },
         })
         .collect()
 }
 
-fn bind_violation(f: &Formula, arg_terms: &[Option<Term>]) -> Option<Term> {
+fn bind(f: &Formula, arg_terms: &[Option<Term>]) -> Option<(Term, Term)> {
     let mut map = BTreeMap::new();
     for (name, _sort) in f.term.free_vars() {
         // Only p<i> vars can be bound at a call site; anything else
@@ -108,7 +118,8 @@ fn bind_violation(f: &Formula, arg_terms: &[Option<Term>]) -> Option<Term> {
         map.insert(name, t);
     }
     let bound = f.term.substitute(&map).ok()?;
-    Term::not(bound).ok()
+    let violation = Term::not(bound.clone()).ok()?;
+    Some((bound, violation))
 }
 
 #[cfg(test)]

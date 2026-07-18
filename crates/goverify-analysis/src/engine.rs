@@ -27,6 +27,19 @@ use crate::effects::{self, Effects, Loc, Root};
 use crate::prepass::{self, Domains};
 use crate::summary::{Provenance, Summary};
 
+/// Which of the two solver-timeout tiers a `mk_backend` call is for: the
+/// fixpoint's per-SCC requires-inference backend runs many small queries
+/// inline with analysis (tight timeout budget), while the findings pass's
+/// backend discharges obligations that gate user-visible output (can
+/// afford to wait longer for a definitive Sat/Unsat before giving up and
+/// staying silent per the bug-finder policy). `debug findings` uses one
+/// timeout for both roles for now; `check` (Task 11) differentiates them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendRole {
+    Infer,
+    Findings,
+}
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub widen_after: u32,
@@ -70,7 +83,7 @@ pub fn analyze(p: &Program, opts: &Options) -> Analysis {
             ..EngineConfig::default()
         },
         &[],
-        &|| Box::new(StubSolver),
+        &|_role| Box::new(StubSolver),
     )
 }
 
@@ -86,10 +99,16 @@ pub fn analyze_full(
     p: &Program,
     cfg: &EngineConfig,
     checkers: &[&dyn Checker],
-    mk_backend: &(dyn Fn() -> Box<dyn TextSolver> + Sync),
+    mk_backend: &(dyn Fn(BackendRole) -> Box<dyn TextSolver> + Sync),
 ) -> Analysis {
     let cache = cfg.cache_dir.clone().map(QueryCache::open);
     let emit_dir = cfg.emit_smt.clone();
+    // Deterministic requires order (parent spec's determinism invariant):
+    // the caller's checker order is not guaranteed sorted, so sort once by
+    // name here rather than trusting call sites.
+    let mut checkers: Vec<&dyn Checker> = checkers.to_vec();
+    checkers.sort_by_key(|c| c.name());
+    let checkers = &checkers[..];
     let graph = CallGraph::build(p);
     let sccs = Sccs::compute(p, &graph);
     let n_sccs = sccs.schedule().len();
@@ -137,7 +156,7 @@ pub fn analyze_full(
                 .iter()
                 .map(|&m| (m, Summary::default())) // optimistic start
                 .collect();
-            let mut backend = mk_backend();
+            let mut backend = mk_backend(BackendRole::Infer);
             let mut rounds = 0u32;
             // `analyze_function` re-runs every checker's `infer_requires`
             // on every round of a recursive SCC's fixpoint (it never reads
@@ -221,7 +240,7 @@ pub fn analyze_full(
     let mut findings: Vec<Finding> = Vec::new();
     let mut findings_diagnostics: Vec<String> = Vec::new();
     if !checkers.is_empty() {
-        let mut backend = mk_backend();
+        let mut backend = mk_backend(BackendRole::Findings);
         let summary_of = |f: FuncId| summaries.get(&f).cloned().unwrap_or_else(Summary::havoc);
         for f in p.func_ids() {
             // A `Checker` is the phase-4 plugin surface: `obligations` +
@@ -247,9 +266,11 @@ pub fn analyze_full(
                         if outcome.result == SatResult::Sat {
                             per_func.push(Finding {
                                 checker: checker.name().to_string(),
+                                tag: ob.tag.clone(),
                                 func: p.func_name(f).to_string(),
                                 pos: ob.pos,
                                 message: ob.message,
+                                trace: Vec::new(),
                             });
                         }
                     }
@@ -318,14 +339,15 @@ fn analyze_function(
         }
         let effects = effects::collect(p, f, graph, &|c| summary_of(c).effects);
 
-        // Union of every checker's inferred requires: checker order (as
-        // given by the caller), then per-checker clause order (Task 12
-        // design). See the recursive-SCC caveat above the calling loop.
+        // Union of every checker's inferred requires: checkers run in
+        // name-sorted order (analyze_full sorts once at entry — determinism
+        // first), then per-checker clause order (Task 12 design). See the
+        // recursive-SCC caveat above the calling loop.
         let mut requires = Vec::new();
         for checker in checkers {
             let mut discharge =
                 |q: &Query| discharge_query(q, &mut *backend, cache, emit_dir).result;
-            requires.extend(checker.infer_requires(p, f, &mut discharge));
+            requires.extend(checker.infer_requires(p, f, summary_of, &mut discharge));
         }
 
         Summary {
@@ -593,6 +615,7 @@ mod tests {
             &self,
             _p: &Program,
             _f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
             _discharge: &mut dyn FnMut(&Query) -> SatResult,
         ) -> Vec<crate::summary::Clause> {
             Vec::new()
@@ -628,6 +651,7 @@ mod tests {
             &self,
             _p: &Program,
             _f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
             _discharge: &mut dyn FnMut(&Query) -> SatResult,
         ) -> Vec<crate::summary::Clause> {
             Vec::new()
@@ -671,7 +695,7 @@ mod tests {
         )]);
         let checkers: Vec<&dyn Checker> = vec![&PanicOnChecker("t.B")];
         let cfg = EngineConfig::default();
-        let a = analyze_full(&p, &cfg, &checkers, &|| Box::new(AlwaysSat));
+        let a = analyze_full(&p, &cfg, &checkers, &|_role| Box::new(AlwaysSat));
 
         let found_funcs: BTreeSet<&str> = a.findings.iter().map(|f| f.func.as_str()).collect();
         assert!(
@@ -705,8 +729,8 @@ mod tests {
         let p = Program::from_packages(vec![pkg("t", vec![straight("t.F", vec![])])]);
         let checkers: Vec<&dyn Checker> = vec![&FakeChecker];
         let cfg = EngineConfig::default();
-        let a1 = analyze_full(&p, &cfg, &checkers, &|| Box::new(AlwaysSat));
-        let a2 = analyze_full(&p, &cfg, &checkers, &|| Box::new(AlwaysSat));
+        let a1 = analyze_full(&p, &cfg, &checkers, &|_role| Box::new(AlwaysSat));
+        let a2 = analyze_full(&p, &cfg, &checkers, &|_role| Box::new(AlwaysSat));
         assert_eq!(
             a1.findings.len(),
             1,

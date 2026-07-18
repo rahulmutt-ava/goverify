@@ -10,12 +10,12 @@ mod summary;
 #[cfg(test)]
 mod testpkg;
 
-pub use checker::{Checker, Finding, Obligation};
+pub use checker::{Checker, Finding, Obligation, TraceStep};
 pub use effects::{ChanOp, Effects, Loc, LockOp, Root, Spawns, collect};
 pub use encode::{EncodedFunc, cut_back_edges, encode_func, int_repr, seq_datatype, sort_of};
 pub use engine::{
-    Analysis, EngineConfig, Options, analyze, analyze_full, dump_findings, dump_prepass,
-    dump_summaries,
+    Analysis, BackendRole, EngineConfig, Options, analyze, analyze_full, dump_findings,
+    dump_prepass, dump_summaries,
 };
 pub use prepass::{Domains, value_clean};
 pub use summary::{

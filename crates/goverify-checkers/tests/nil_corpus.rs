@@ -22,7 +22,9 @@ fn run(emit: Option<std::path::PathBuf>) -> String {
         emit_smt: emit,
     };
     let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&NilTracer];
-    let a = analyze_full(&p, &cfg, &checkers, &|| Box::new(Z3Native::new(limits())));
+    let a = analyze_full(&p, &cfg, &checkers, &|_role| {
+        Box::new(Z3Native::new(limits()))
+    });
     // Filter to the corpus module: whole-DAG extraction includes stdlib,
     // and stdlib-derived findings would churn with Go toolchain bumps.
     dump_findings(&a, Some("example.com/nil"))

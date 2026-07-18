@@ -27,9 +27,21 @@ pub struct Obligation {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Finding {
     pub checker: String,
+    pub tag: String,
     pub func: String,
     pub pos: Option<Pos>,
     pub message: String,
+    /// The path that leads to the violation (phase-4 spec §10). Filled in
+    /// by Task 10; every `Finding` before then carries an empty trace.
+    pub trace: Vec<TraceStep>,
+}
+
+/// One step of a `Finding`'s trace: which block the path passes through
+/// and, when known, the source position within it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TraceStep {
+    pub block: u32,
+    pub pos: Option<Pos>,
 }
 
 pub trait Checker: Sync {
@@ -40,11 +52,15 @@ pub trait Checker: Sync {
     /// plumbing (the engine owns that, Task 12); a checker must only
     /// emit a requires-clause when the corresponding violation path is
     /// confirmed `Sat` — `Unknown` must never manufacture requires any
-    /// more than it manufactures findings (parent spec §8).
+    /// more than it manufactures findings (parent spec §8). `summary_of`
+    /// lets a checker consult a callee's already-inferred summary while
+    /// deriving `f`'s own requires (requires propagation through call
+    /// chains via the existing SCC fixpoint).
     fn infer_requires(
         &self,
         p: &Program,
         f: FuncId,
+        summary_of: &dyn Fn(FuncId) -> Summary,
         discharge: &mut dyn FnMut(&Query) -> SatResult,
     ) -> Vec<Clause>;
 

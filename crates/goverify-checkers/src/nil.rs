@@ -55,6 +55,7 @@ impl Checker for NilTracer {
         &self,
         p: &Program,
         f: FuncId,
+        _summary_of: &dyn Fn(FuncId) -> Summary,
         discharge: &mut dyn FnMut(&Query) -> SatResult,
     ) -> Vec<Clause> {
         let mut out = Vec::new();
@@ -221,11 +222,17 @@ mod tests {
         move |q| discharge_query(q, &mut solver, None, None).result
     }
 
+    /// `infer_requires` never needs a callee's summary yet (T6 rewrite
+    /// changes that) — these tests just need something of the right shape.
+    fn no_summaries(_f: goverify_ir::FuncId) -> Summary {
+        Summary::default()
+    }
+
     #[test]
     fn unguarded_param_deref_infers_nonnil_requires() {
         let p = deref_program();
         let f = p.lookup_func("t.F").unwrap();
-        let reqs = NilTracer.infer_requires(&p, f, &mut z3_discharge());
+        let reqs = NilTracer.infer_requires(&p, f, &no_summaries, &mut z3_discharge());
         assert_eq!(reqs.len(), 1, "one deref'd pointer param: {reqs:?}");
         assert_eq!(reqs[0].tag, "nil-deref");
     }
@@ -237,7 +244,7 @@ mod tests {
         let mut always_unknown = |_q: &Query| SatResult::Unknown;
         assert!(
             NilTracer
-                .infer_requires(&p, f, &mut always_unknown)
+                .infer_requires(&p, f, &no_summaries, &mut always_unknown)
                 .is_empty(),
             "Unknown must not manufacture requires (parent spec §8)"
         );
@@ -263,7 +270,7 @@ mod tests {
         let f = p.lookup_func("t.F").unwrap();
         assert!(
             NilTracer
-                .infer_requires(&p, f, &mut z3_discharge())
+                .infer_requires(&p, f, &no_summaries, &mut z3_discharge())
                 .is_empty(),
             "non-entry deref must infer nothing in phase 3"
         );
@@ -320,7 +327,8 @@ mod tests {
         let callee_id = p.lookup_func("t.F").unwrap();
         let caller_id = p.lookup_func("t.Caller").unwrap();
         // Give t.F the requires the tracer itself would infer.
-        let requires: Vec<Clause> = NilTracer.infer_requires(&p, callee_id, &mut z3_discharge());
+        let requires: Vec<Clause> =
+            NilTracer.infer_requires(&p, callee_id, &no_summaries, &mut z3_discharge());
         assert!(!requires.is_empty(), "precondition of this test");
         let summary_of = |f: goverify_ir::FuncId| {
             let mut s = Summary::default();

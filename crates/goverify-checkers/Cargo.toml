@@ -3,3 +3,12 @@ name = "goverify-checkers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+goverify-analysis.workspace = true
+goverify-ir.workspace = true
+goverify-solver.workspace = true
+
+[dev-dependencies]
+goverify-extract.workspace = true
+tempfile.workspace = true

@@ -328,6 +328,13 @@ dependencies = [
 [[package]]
 name = "goverify-checkers"
 version = "0.1.0"
+dependencies = [
+ "goverify-analysis",
+ "goverify-extract",
+ "goverify-ir",
+ "goverify-solver",
+ "tempfile",
+]
 
 [[package]]
 name = "goverify-cli"

@@ -43,7 +43,7 @@ pub struct ValueInfo {
     pub kind: ValueKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Pos {
     pub file: String,
     pub line: u32,

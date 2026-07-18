@@ -14,12 +14,12 @@ use std::sync::Mutex;
 
 use rayon::prelude::*;
 
-use goverify_ir::{CallGraph, Callee, FuncId, Op, Program, Sccs};
-use goverify_solver::{SatResult, Solver, StubSolver};
+use goverify_ir::{CallGraph, FuncId, Program, Sccs};
+use goverify_solver::{Solver, StubSolver};
 
 use crate::effects::{self, Effects, Loc, Root};
 use crate::prepass::{self, Domains};
-use crate::summary::{BoundClause, Provenance, Summary, instantiate_requires};
+use crate::summary::{Provenance, Summary};
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -37,31 +37,6 @@ pub struct Analysis {
     pub summaries: BTreeMap<FuncId, Summary>,
     pub prepass: BTreeMap<FuncId, Domains>,
     pub diagnostics: Vec<String>,
-}
-
-/// A reported violation. Phase 4 gives this real content; phase 2 only
-/// needs it to exist so the discharge path is exercised end to end.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Finding {
-    pub tag: String,
-}
-
-/// Discharge instantiated requires-clauses. Bug-finder semantics (parent
-/// spec §8): only Sat reports; Unsat and Unknown (incl. timeout) are
-/// silent. Unbindable clauses (violation: None) are silent by
-/// construction.
-pub fn discharge(obligations: &[BoundClause], solver: &mut dyn Solver) -> Vec<Finding> {
-    obligations
-        .iter()
-        .filter_map(|o| {
-            let v = o.violation.clone()?;
-            solver.push();
-            solver.assert(v);
-            let r = solver.check_sat_assuming(&[]);
-            solver.pop();
-            (r == SatResult::Sat).then(|| Finding { tag: o.tag.clone() })
-        })
-        .collect()
 }
 
 pub fn analyze(p: &Program, opts: &Options) -> Analysis {
@@ -215,37 +190,14 @@ fn analyze_function(
     graph: &CallGraph,
     f: FuncId,
     summary_of: &dyn Fn(FuncId) -> Summary,
-    solver: &mut dyn Solver,
+    _solver: &mut dyn Solver,
     diag_slots: &[Mutex<Option<String>>],
 ) -> Summary {
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let Some(func) = p.func(f) else {
+        if p.func(f).is_none() {
             return Summary::havoc(); // external / bodyless
-        };
-        let effects = effects::collect(p, f, graph, &|c| summary_of(c).effects);
-
-        // Thread the solver through the engine (spec §6): for every static
-        // call site, instantiate the callee's requires and discharge them.
-        // Phase 2 never populates `requires` on any summary, so this
-        // always yields zero findings on real corpora — it exists so a
-        // later phase swaps `StubSolver` for a real one at this call site
-        // without touching the engine's structure.
-        for b in &func.blocks {
-            for ins in &b.instrs {
-                if let Op::Call {
-                    callee: Callee::Static(callee_id),
-                    args,
-                    ..
-                } = &ins.op
-                {
-                    let callee_summary = summary_of(*callee_id);
-                    let arg_terms: Vec<Option<goverify_solver::Term>> =
-                        args.iter().map(|_| None).collect();
-                    let obligations = instantiate_requires(&callee_summary, &arg_terms);
-                    let _findings = discharge(&obligations, solver);
-                }
-            }
         }
+        let effects = effects::collect(p, f, graph, &|c| summary_of(c).effects);
 
         Summary {
             effects,
@@ -456,17 +408,5 @@ mod tests {
         // Sanity: with the default k the same SCC converges Inferred.
         let a3 = analyze(&p, &Options::default());
         assert_eq!(a3.summaries[&even].provenance, Provenance::Inferred);
-    }
-
-    #[test]
-    fn discharge_with_stub_solver_reports_nothing() {
-        let obligations = vec![BoundClause {
-            tag: "nonnil".into(),
-            violation: Some(goverify_solver::Term::bool_lit(true)),
-        }];
-        assert!(
-            discharge(&obligations, &mut StubSolver).is_empty(),
-            "Unknown must never produce a finding"
-        );
     }
 }

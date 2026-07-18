@@ -11,7 +11,7 @@ use goverify_analysis::{
 use goverify_ir::{
     Callee, ConstVal, FuncId, Function, Op, Pos, Program, TypeKind, ValueId, ValueKind,
 };
-use goverify_solver::{Logic, Query, SatResult, Term, ptr_is_nil, ptr_nil};
+use goverify_solver::{Query, SatResult, Term, ptr_is_nil};
 
 pub struct NilChecker;
 
@@ -148,8 +148,12 @@ impl Checker for NilChecker {
         out
     }
 
-    // `obligations` keeps its Task-5-adapted phase-3 body in this task
-    // (const-nil call args only) — Task 7 replaces it wholesale.
+    /// Call-site obligations (real symbolic args, instantiated against
+    /// the callee's requires) plus manifest-local obligations (deref of
+    /// a ground or params-only subject inside `f` itself), both
+    /// discharged under `f`'s own inferred preconditions: this
+    /// mechanizes the spec's who-reports-what rule (a guarded/inherited
+    /// deref is someone else's — or nobody's, if truly guarded — job).
     fn obligations(
         &self,
         p: &Program,
@@ -159,8 +163,47 @@ impl Checker for NilChecker {
         let Some(func) = p.func(f) else {
             return Vec::new();
         };
+        let Ok(enc) = encode_func(p, f) else {
+            return Vec::new();
+        };
+        let pre = own_preconditions(&summary_of(f));
         let mut out = Vec::new();
-        for b in &func.blocks {
+
+        // Local manifest sites: subject term ground (const nil reached
+        // through modeled ops) or params-only (then preconditions decide).
+        // A `Const` value's own encoded term is never free-vars-empty —
+        // `encode_func` ties it down with a separate `v<id> = <lit>`
+        // assert rather than inlining the literal (`declare_value`) — so
+        // groundness is read off the IR's own `ValueKind`, not the term.
+        // Matched narrowly to `ConstVal::Nil` (not any `Const(_)`): a
+        // pointer-typed value tagged `Const` with a mismatched constant
+        // (malformed/fuzzed .gvir) gets no defining assert from
+        // `declare_value`, so treating it as ground would manufacture a
+        // finding off a genuinely free variable.
+        for (bi, _ii, subject, pos) in deref_sites(p, func) {
+            let Some(subj) = enc.value(subject).cloned() else {
+                continue;
+            };
+            let is_const_nil = matches!(func.value(subject).kind, ValueKind::Const(ConstVal::Nil));
+            let expressible = is_const_nil || subj.free_vars().is_empty() || params_only(&subj);
+            if !expressible {
+                continue; // havoc'd heap value: silent (spec §4)
+            }
+            let Ok(is_nil) = ptr_is_nil(subj) else {
+                continue;
+            };
+            let mut extra = pre.clone();
+            extra.push(is_nil);
+            out.push(Obligation {
+                tag: "nil-deref".into(),
+                message: format!("nil dereference in {}", p.func_name(f)),
+                pos,
+                query: enc.reach_query(bi, extra),
+            });
+        }
+
+        // Call sites: instantiated callee requires under own preconditions.
+        for (bi, b) in func.blocks.iter().enumerate() {
             for ins in &b.instrs {
                 let Op::Call {
                     callee: Callee::Static(c),
@@ -170,14 +213,15 @@ impl Checker for NilChecker {
                 else {
                     continue;
                 };
-                let arg_terms: Vec<Option<Term>> = args
-                    .iter()
-                    .map(|&a| {
-                        matches!(func.value(a).kind, ValueKind::Const(ConstVal::Nil)).then(ptr_nil)
-                    })
-                    .collect();
+                let arg_terms: Vec<Option<Term>> =
+                    args.iter().map(|a| enc.value(*a).cloned()).collect();
                 for bc in instantiate_requires(&summary_of(*c), &arg_terms) {
+                    if bc.tag != "nil-deref" {
+                        continue;
+                    }
                     let Some(v) = bc.violation else { continue };
+                    let mut extra = pre.clone();
+                    extra.push(v);
                     out.push(Obligation {
                         tag: bc.tag.clone(),
                         message: format!(
@@ -186,13 +230,23 @@ impl Checker for NilChecker {
                             bc.tag
                         ),
                         pos: ins.pos.clone(),
-                        query: Query::for_asserts(Logic::All, vec![v]),
+                        query: enc.reach_query(bi, extra),
                     });
                 }
             }
         }
         out
     }
+}
+
+/// The function's own requires clauses as query conjuncts: their free
+/// p<i> vars are exactly the encoder's param const names, so they can
+/// be conjoined directly.
+fn own_preconditions(own: &Summary) -> Vec<Term> {
+    own.requires
+        .iter()
+        .map(|c| c.formula.term.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -265,15 +319,21 @@ mod tests {
         }
     }
 
-    fn field_addr_on_param() -> gvir::Instruction {
+    /// A `FieldAddr` dereferencing `operand` (a pointer value), writing
+    /// its result to `dst_reg`.
+    fn field_addr_on(dst_reg: u32, operand: u32) -> gvir::Instruction {
         let mut fa = instr("FieldAddr");
-        fa.register = 2;
-        fa.operands = vec![1];
+        fa.register = dst_reg;
+        fa.operands = vec![operand];
         fa.sem = Some(Sem::Field(gvir::FieldSem {
             index: 0,
             name: "X".into(),
         }));
         fa
+    }
+
+    fn field_addr_on_param() -> gvir::Instruction {
+        field_addr_on(2, 1)
     }
 
     /// t.F with the deref unconditionally in the entry block.
@@ -556,21 +616,236 @@ mod tests {
         let requires: Vec<Clause> =
             NilChecker.infer_requires(&p, callee_id, &no_summaries, &mut z3_discharge());
         assert!(!requires.is_empty(), "precondition of this test");
-        let summary_of = |f: goverify_ir::FuncId| {
+        let summary_with_f_only = |f: goverify_ir::FuncId| {
             let mut s = Summary::default();
             if f == callee_id {
                 s.requires = requires.clone();
             }
             s
         };
+        // Caller also forwards q into F unconditionally (the second call),
+        // so — same as `wrapper` — it inherits F's requires as its own
+        // precondition; the real engine always feeds a function's own
+        // inferred summary back into `obligations` (engine.rs's
+        // `summary_of`), so an accurate unit test must too.
+        let caller_requires =
+            NilChecker.infer_requires(&p, caller_id, &summary_with_f_only, &mut z3_discharge());
+        let summary_of = |f: goverify_ir::FuncId| {
+            let mut s = Summary::default();
+            if f == callee_id {
+                s.requires = requires.clone();
+            } else if f == caller_id {
+                s.requires = caller_requires.clone();
+            }
+            s
+        };
         let obs = NilChecker.obligations(&p, caller_id, &summary_of);
-        assert_eq!(obs.len(), 1, "only the const-nil call obligates: {obs:?}");
-        assert_eq!(obs[0].tag, "nil-deref");
-        let verdict = z3_discharge()(&obs[0].query);
         assert_eq!(
-            verdict,
+            obs.len(),
+            2,
+            "both call sites raise a candidate obligation: {obs:?}"
+        );
+        assert!(obs.iter().all(|o| o.tag == "nil-deref"));
+        let sat: Vec<_> = obs
+            .iter()
+            .filter(|o| z3_discharge()(&o.query) == SatResult::Sat)
+            .collect();
+        assert_eq!(
+            sat.len(),
+            1,
+            "only the const-nil call obligates once discharged; the q-arg \
+             call is covered by Caller's own inherited precondition: {obs:?}"
+        );
+    }
+
+    #[test]
+    fn wrapper_does_not_self_report() {
+        // t.F(p) { deref p }  t.G(q) { t.F(q) } — G's own summary (as
+        // `summary_of` would report it once requires-inference has run)
+        // already carries the propagated ¬nil(p0). obligations() on G
+        // must not raise a Sat finding: own-preconditions ∧ reach ∧
+        // is-nil(q) is UNSAT because own-preconditions already assert
+        // ¬nil(q).
+        let f_func = deref_func(vec![block(
+            0,
+            vec![field_addr_on_param(), instr("Return")],
+            vec![],
+        )]);
+        let g_func = gvir::Function {
+            id: "t.G".into(),
+            params: vec![gvir::Param {
+                id: 1,
+                name: "q".into(),
+                r#type: 2,
+            }],
+            blocks: vec![block(
+                0,
+                vec![call_static("t.F", 0, 0, vec![1]), instr("Return")],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let p = pkg_with_ptr_types(vec![f_func, g_func]);
+        let f_id = p.lookup_func("t.F").unwrap();
+        let g_id = p.lookup_func("t.G").unwrap();
+        let freqs = NilChecker.infer_requires(&p, f_id, &no_summaries, &mut z3_discharge());
+        assert!(!freqs.is_empty(), "precondition of this test");
+        let summary_with_f_only = |fid: goverify_ir::FuncId| {
+            let mut s = Summary::default();
+            if fid == f_id {
+                s.requires = freqs.clone();
+            }
+            s
+        };
+        let greqs = NilChecker.infer_requires(&p, g_id, &summary_with_f_only, &mut z3_discharge());
+        assert!(!greqs.is_empty(), "G must inherit F's requires");
+        let summary_of = |fid: goverify_ir::FuncId| {
+            let mut s = Summary::default();
+            if fid == f_id {
+                s.requires = freqs.clone();
+            } else if fid == g_id {
+                s.requires = greqs.clone();
+            }
+            s
+        };
+        let obs = NilChecker.obligations(&p, g_id, &summary_of);
+        for ob in &obs {
+            assert_ne!(
+                z3_discharge()(&ob.query),
+                SatResult::Sat,
+                "wrapper must not self-report under its own inherited precondition: {ob:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_manifest_nil_deref_obligates() {
+        // t.LocalNil() { deref a manifest const-nil aux value } — not
+        // via a call, no params at all: one obligation, Sat under Z3.
+        let f = gvir::Function {
+            id: "t.LocalNil".into(),
+            aux: vec![nil_aux(1)],
+            blocks: vec![block(0, vec![field_addr_on(2, 1), instr("Return")], vec![])],
+            ..Default::default()
+        };
+        let p = pkg_with_ptr_types(vec![f]);
+        let f_id = p.lookup_func("t.LocalNil").unwrap();
+        let obs = NilChecker.obligations(&p, f_id, &no_summaries);
+        assert_eq!(obs.len(), 1, "one manifest-local nil deref: {obs:?}");
+        assert_eq!(obs[0].tag, "nil-deref");
+        assert_eq!(
+            z3_discharge()(&obs[0].query),
             SatResult::Sat,
-            "nil-into-nonnil violation is satisfiable"
+            "manifest-local nil deref is satisfiable"
+        );
+    }
+
+    #[test]
+    fn havoc_subject_deref_stays_silent() {
+        // t.HV() { v2 := t.K() (unknown callee: v2 havocs); deref v2 } —
+        // free vars ⊄ params and not ground ⇒ no local obligation (FP
+        // storm guard: we cannot say anything about an arbitrary heap
+        // value that came out of an unmodeled call).
+        let f = gvir::Function {
+            id: "t.HV".into(),
+            blocks: vec![block(
+                0,
+                vec![
+                    call_static("t.K", 2, 2, vec![]),
+                    field_addr_on(3, 2),
+                    instr("Return"),
+                ],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let p = pkg_with_ptr_types(vec![f]);
+        let f_id = p.lookup_func("t.HV").unwrap();
+        let obs = NilChecker.obligations(&p, f_id, &no_summaries);
+        assert!(obs.is_empty(), "havoc'd subject must not obligate: {obs:?}");
+    }
+
+    #[test]
+    fn symbolic_arg_instantiation_binds_caller_terms() {
+        // t.H(a *T, c bool) { p := phi(a, nil) based on c; t.F(p) }:
+        // violation is-nil(ite(g, a, nil)) is Sat (c can pick the nil
+        // edge) ⇒ obligation fires even though no literal nil arg
+        // appears at the call site — the symbolic upgrade over phase 3,
+        // which could only see literal nil args.
+        let f_func = deref_func(vec![block(
+            0,
+            vec![field_addr_on_param(), instr("Return")],
+            vec![],
+        )]);
+        let branch = branch_on(2); // cond = c (param id 2)
+        // Value ids must stay within the lowerer's per-function ceiling
+        // (params + aux + instr count, NOT the raw ids' max — see
+        // `value_id_ceiling` in goverify-ir's lower.rs): 2 params + 1 aux
+        // + 6 instrs = 9, so ids run 1..=4 here, densely packed.
+        let phi = gvir::Instruction {
+            kind: "Phi".into(),
+            register: 4,
+            r#type: 2,
+            operands: vec![1, 3], // preds [1,2] -> edges [a, nil]
+            ..Default::default()
+        };
+        let h_func = gvir::Function {
+            id: "t.H".into(),
+            params: vec![
+                gvir::Param {
+                    id: 1,
+                    name: "a".into(),
+                    r#type: 2,
+                },
+                gvir::Param {
+                    id: 2,
+                    name: "c".into(),
+                    r#type: 3,
+                },
+            ],
+            aux: vec![nil_aux(3)],
+            blocks: vec![
+                block(0, vec![branch], vec![1, 2]),
+                gvir::BasicBlock {
+                    index: 1,
+                    instrs: vec![instr("Jump")],
+                    succs: vec![3],
+                    preds: vec![0],
+                },
+                gvir::BasicBlock {
+                    index: 2,
+                    instrs: vec![instr("Jump")],
+                    succs: vec![3],
+                    preds: vec![0],
+                },
+                gvir::BasicBlock {
+                    index: 3,
+                    instrs: vec![phi, call_static("t.F", 0, 0, vec![4]), instr("Return")],
+                    succs: vec![],
+                    preds: vec![1, 2],
+                },
+            ],
+            ..Default::default()
+        };
+        let p = pkg_with_ptr_types(vec![f_func, h_func]);
+        let f_id = p.lookup_func("t.F").unwrap();
+        let h_id = p.lookup_func("t.H").unwrap();
+        let freqs = NilChecker.infer_requires(&p, f_id, &no_summaries, &mut z3_discharge());
+        assert!(!freqs.is_empty(), "precondition of this test");
+        let summary_of = |fid: goverify_ir::FuncId| {
+            let mut s = Summary::default();
+            if fid == f_id {
+                s.requires = freqs.clone();
+            }
+            s
+        };
+        let obs = NilChecker.obligations(&p, h_id, &summary_of);
+        assert_eq!(obs.len(), 1, "the symbolic call site obligates: {obs:?}");
+        assert_eq!(obs[0].tag, "nil-deref");
+        assert_eq!(
+            z3_discharge()(&obs[0].query),
+            SatResult::Sat,
+            "the nil edge of the phi is a reachable violation"
         );
     }
 }

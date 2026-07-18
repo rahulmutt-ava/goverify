@@ -170,18 +170,35 @@ impl TextSolver for Z3Native {
                 self.reset();
                 return UNKNOWN;
             };
+            // A parse failure can surface purely as a non-Ok error code
+            // with `vec` still non-null (a partial/empty result) — this
+            // check must happen (and be checked) before anything else
+            // touches `vec`, since a later successful call can reset the
+            // context's sticky error state.
             if !self.ok() {
                 self.reset();
                 return UNKNOWN;
             }
+            // Z3's memory model: a freshly returned object starts at
+            // refcount 0 and can be GC'd by any later Z3 call unless
+            // inc_ref'd immediately. This backend is long-lived (one
+            // instance per SCC worker / the whole sequential findings
+            // pass), so without inc_ref/dec_ref around the parse
+            // ast_vector's use, every query leaks its ast_vector (and the
+            // asts it holds) until the backend itself is dropped.
+            Z3_ast_vector_inc_ref(ctx, vec);
+            let mut assert_ok = true;
             for i in 0..Z3_ast_vector_size(ctx, vec) {
                 let Some(ast) = Z3_ast_vector_get(ctx, vec, i) else {
-                    self.reset();
-                    return UNKNOWN;
+                    assert_ok = false;
+                    break;
                 };
                 Z3_solver_assert(ctx, solver, ast);
             }
-            if !self.ok() {
+            // Balances the inc_ref above on every path, success or not —
+            // nothing below this point still needs `vec`.
+            Z3_ast_vector_dec_ref(ctx, vec);
+            if !assert_ok || !self.ok() {
                 self.reset();
                 return UNKNOWN;
             }

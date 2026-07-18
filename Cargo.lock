@@ -313,6 +313,7 @@ dependencies = [
  "goverify-extract",
  "goverify-ir",
  "goverify-solver",
+ "proptest",
  "rayon",
 ]
 

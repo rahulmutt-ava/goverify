@@ -1,13 +1,13 @@
-(*example.com/conc.File).Close effects={spawns:Unbounded chan:[Make,Send,Recv,Close,Select] locks:[Lock,Unlock,RLock,RUnlock]} requires=0 ensures=0 provenance=Inferred
-(*example.com/conc.Thing).Rename effects={spawns:Unbounded chan:[Make,Send,Recv,Close,Select] locks:[Lock,Unlock,RLock,RUnlock]} requires=0 ensures=0 provenance=Havoc
-(example.com/conc.Thing).Rename effects={spawns:None chan:[] locks:[]} requires=0 ensures=0 provenance=Inferred
-example.com/conc.CloseAll effects={spawns:Unbounded chan:[Make,Send,Recv,Close,Select] locks:[Lock,Unlock,RLock,RUnlock]} requires=0 ensures=0 provenance=Inferred
-example.com/conc.DeferClose effects={spawns:None chan:[Close] locks:[]} requires=0 ensures=0 provenance=Inferred
-example.com/conc.Fan effects={spawns:Bounded chan:[Make,Close,Select] locks:[]} requires=0 ensures=0 provenance=Inferred
-example.com/conc.Fan$1 effects={spawns:None chan:[Close] locks:[]} requires=0 ensures=0 provenance=Inferred
-example.com/conc.GoClose effects={spawns:Bounded chan:[Close] locks:[]} requires=0 ensures=0 provenance=Inferred
-example.com/conc.InvokeCB effects={spawns:None chan:[] locks:[]} requires=0 ensures=0 provenance=Inferred
-example.com/conc.NamedParamImpl effects={spawns:None chan:[] locks:[]} requires=0 ensures=0 provenance=Inferred
-example.com/conc.RenameAll effects={spawns:Unbounded chan:[Make,Send,Recv,Close,Select] locks:[Lock,Unlock,RLock,RUnlock]} requires=0 ensures=0 provenance=Inferred
-example.com/conc.UseNamedParamImpl effects={spawns:None chan:[] locks:[]} requires=0 ensures=0 provenance=Inferred
-example.com/conc.init effects={spawns:Unbounded chan:[Make,Send,Recv,Close,Select] locks:[Lock,Unlock,RLock,RUnlock]} requires=0 ensures=0 provenance=Inferred
+(*example.com/conc.File).Close effects={spawns:None chan:{} locks:{p0.f0:[Lock,DeferredUnlock]}} requires=0 ensures=0 provenance=Inferred
+(*example.com/conc.Thing).Rename effects={spawns:Unbounded chan:{?:[Make,Send,Recv,Close,Select]} locks:{?:[Lock,Unlock,RLock,RUnlock,DeferredUnlock,DeferredRUnlock]}} requires=0 ensures=0 provenance=Havoc
+(example.com/conc.Thing).Rename effects={spawns:None chan:{} locks:{}} requires=0 ensures=0 provenance=Inferred
+example.com/conc.CloseAll effects={spawns:None chan:{} locks:{?:[Lock,DeferredUnlock]}} requires=0 ensures=0 provenance=Inferred
+example.com/conc.DeferClose effects={spawns:None chan:{p0:[Close]} locks:{}} requires=0 ensures=0 provenance=Inferred
+example.com/conc.Fan effects={spawns:Bounded chan:{p0:[Select] p1:[Select] ?:[Make,Close,Select]} locks:{}} requires=0 ensures=0 provenance=Inferred
+example.com/conc.Fan$1 effects={spawns:None chan:{?:[Close]} locks:{}} requires=0 ensures=0 provenance=Inferred
+example.com/conc.GoClose effects={spawns:Bounded chan:{p0:[Close]} locks:{}} requires=0 ensures=0 provenance=Inferred
+example.com/conc.InvokeCB effects={spawns:None chan:{} locks:{}} requires=0 ensures=0 provenance=Inferred
+example.com/conc.NamedParamImpl effects={spawns:None chan:{} locks:{}} requires=0 ensures=0 provenance=Inferred
+example.com/conc.RenameAll effects={spawns:Unbounded chan:{?:[Make,Send,Recv,Close,Select]} locks:{?:[Lock,Unlock,RLock,RUnlock,DeferredUnlock,DeferredRUnlock]}} requires=0 ensures=0 provenance=Inferred
+example.com/conc.UseNamedParamImpl effects={spawns:None chan:{} locks:{}} requires=0 ensures=0 provenance=Inferred
+example.com/conc.init effects={spawns:Unbounded chan:{?:[Make,Send,Recv,Close,Select]} locks:{?:[Lock,Unlock,RLock,RUnlock,DeferredUnlock,DeferredRUnlock]}} requires=0 ensures=0 provenance=Inferred

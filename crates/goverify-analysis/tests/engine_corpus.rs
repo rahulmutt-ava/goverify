@@ -26,10 +26,11 @@ fn conc_corpus_effects_are_sane() {
     let a = analyze(&p, &Options::default());
     let close = p.lookup_func("(*example.com/conc.File).Close").unwrap();
     let e = &a.summaries[&close].effects;
+    let ops: std::collections::BTreeSet<_> = e.lock_ops.values().flatten().copied().collect();
     assert!(
-        e.lock_ops.contains(&goverify_analysis::LockOp::Lock)
-            && e.lock_ops.contains(&goverify_analysis::LockOp::Unlock),
-        "Close locks and (deferred) unlocks: {e:?}"
+        ops.contains(&goverify_analysis::LockOp::Lock)
+            && ops.contains(&goverify_analysis::LockOp::DeferredUnlock),
+        "Close locks and defer-unlocks: {e:?}"
     );
     let fan = p.lookup_func("example.com/conc.Fan").unwrap();
     assert_ne!(a.summaries[&fan].effects.spawns, Spawns::None);

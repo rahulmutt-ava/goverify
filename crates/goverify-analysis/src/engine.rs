@@ -9,7 +9,7 @@
 //! are deterministic either way because summaries are pure functions of
 //! inputs. Revisit only if phase-5 profiling says so.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use rayon::prelude::*;
@@ -17,7 +17,7 @@ use rayon::prelude::*;
 use goverify_ir::{CallGraph, Callee, FuncId, Op, Program, Sccs};
 use goverify_solver::{SatResult, Solver, StubSolver};
 
-use crate::effects::{self, Effects};
+use crate::effects::{self, Effects, Loc, Root};
 use crate::prepass::{self, Domains};
 use crate::summary::{BoundClause, Provenance, Summary, instantiate_requires};
 
@@ -222,13 +222,7 @@ fn analyze_function(
         let Some(func) = p.func(f) else {
             return Summary::havoc(); // external / bodyless
         };
-        let callee_effects: Vec<Effects> = graph
-            .callees(f)
-            .iter()
-            .map(|&c| summary_of(c).effects)
-            .collect();
-        let refs: Vec<&Effects> = callee_effects.iter().collect();
-        let effects = effects::collect(p, f, &refs);
+        let effects = effects::collect(p, f, graph, &|c| summary_of(c).effects);
 
         // Thread the solver through the engine (spec §6): for every static
         // call site, instantiate the callee's requires and discharge them.
@@ -301,14 +295,35 @@ fn render_lines(lines: Vec<String>) -> String {
     out
 }
 
+fn render_loc(l: &Loc) -> String {
+    let mut s = match &l.root {
+        Root::Param(i) => format!("p{i}"),
+        Root::Global(g) => format!("g:{g}"),
+        Root::Alloc(v) => format!("alloc:{v}"),
+        Root::Unknown => "?".to_string(),
+    };
+    for f in &l.path {
+        s.push_str(&format!(".f{f}"));
+    }
+    s
+}
+
+fn render_loc_map<T: std::fmt::Debug>(m: &BTreeMap<Loc, BTreeSet<T>>) -> String {
+    m.iter()
+        .map(|(loc, ops)| {
+            let ops: Vec<String> = ops.iter().map(|o| format!("{o:?}")).collect();
+            format!("{}:[{}]", render_loc(loc), ops.join(","))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn render_effects(e: &Effects) -> String {
-    let chans: Vec<String> = e.chan_ops.iter().map(|c| format!("{c:?}")).collect();
-    let locks: Vec<String> = e.lock_ops.iter().map(|l| format!("{l:?}")).collect();
     format!(
-        "{{spawns:{:?} chan:[{}] locks:[{}]}}",
+        "{{spawns:{:?} chan:{{{}}} locks:{{{}}}}}",
         e.spawns,
-        chans.join(","),
-        locks.join(",")
+        render_loc_map(&e.chan_ops),
+        render_loc_map(&e.lock_ops)
     )
 }
 
@@ -367,8 +382,15 @@ mod tests {
         )]);
         let a = analyze(&p, &Options::default());
         let top = p.lookup_func("t.Top").unwrap();
+        let ops: BTreeSet<LockOp> = a.summaries[&top]
+            .effects
+            .lock_ops
+            .values()
+            .flatten()
+            .copied()
+            .collect();
         assert!(
-            a.summaries[&top].effects.lock_ops.contains(&LockOp::Lock),
+            ops.contains(&LockOp::Lock),
             "Lock effect must propagate Leaf→Mid→Top"
         );
         assert!(!a.prepass[&top].concurrency_clean);

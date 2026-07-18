@@ -264,13 +264,18 @@ pub fn analyze_full(
                             emit_dir.as_deref(),
                         );
                         if outcome.result == SatResult::Sat {
+                            let trace = outcome
+                                .model
+                                .as_deref()
+                                .and_then(|m| trace_for(p, f, m))
+                                .unwrap_or_default();
                             per_func.push(Finding {
                                 checker: checker.name().to_string(),
                                 tag: ob.tag.clone(),
                                 func: p.func_name(f).to_string(),
                                 pos: ob.pos,
                                 message: ob.message,
-                                trace: Vec::new(),
+                                trace,
                             });
                         }
                     }
@@ -300,6 +305,30 @@ pub fn analyze_full(
         diagnostics,
         findings,
     }
+}
+
+/// Reconstruct the violating path for a Sat finding: re-encode (cheap,
+/// pure, deterministic), read guard values, walk. Any failure = no
+/// trace (finding still reported).
+fn trace_for(p: &Program, f: FuncId, model: &str) -> Option<Vec<crate::checker::TraceStep>> {
+    let func = p.func(f)?;
+    let enc = crate::encode::encode_func(p, f).ok()?;
+    let guards = crate::encode::guard_values(model);
+    let path = crate::encode::violating_path(func, &enc.dag_succs, &guards);
+    if path.is_empty() {
+        return None;
+    }
+    Some(
+        path.into_iter()
+            .map(|b| crate::checker::TraceStep {
+                block: b,
+                pos: func.blocks[b as usize]
+                    .instrs
+                    .iter()
+                    .find_map(|i| i.pos.clone()),
+            })
+            .collect(),
+    )
 }
 
 /// Read a callee's summary: prefer the in-flight SCC-local `current` map
@@ -717,6 +746,52 @@ mod tests {
             a.diagnostics.iter().any(|d| d.contains("t.B")),
             "a diagnostic must mention the panicking function: {:?}",
             a.diagnostics
+        );
+    }
+
+    /// Same scripted always-Sat backend as `AlwaysSat`, except it carries a
+    /// canned model string — the findings pass must read it and attach a
+    /// trace, unlike `AlwaysSat`'s `model: None` (traceless findings).
+    struct AlwaysSatWithModel;
+    impl TextSolver for AlwaysSatWithModel {
+        fn identity(&self) -> String {
+            "always-sat-with-model".into()
+        }
+        fn limits(&self) -> SolverLimits {
+            SolverLimits::default()
+        }
+        fn solve_text(&mut self, _canonical: &str) -> goverify_solver::QueryOutcome {
+            goverify_solver::QueryOutcome {
+                result: SatResult::Sat,
+                model: Some("g0 -> true\n".into()),
+            }
+        }
+    }
+
+    #[test]
+    fn sat_finding_with_model_gets_a_trace_but_model_none_stays_traceless() {
+        let p = Program::from_packages(vec![pkg("t", vec![straight("t.F", vec![])])]);
+        let checkers: Vec<&dyn Checker> = vec![&FakeChecker];
+        let cfg = EngineConfig::default();
+
+        let with_model = analyze_full(&p, &cfg, &checkers, &|_role| Box::new(AlwaysSatWithModel));
+        assert_eq!(with_model.findings.len(), 1);
+        assert_eq!(
+            with_model.findings[0].trace,
+            vec![crate::checker::TraceStep {
+                block: 0,
+                pos: None
+            }],
+            "a Sat model with g0 -> true must produce a [block 0] trace: {:?}",
+            with_model.findings
+        );
+
+        let without_model = analyze_full(&p, &cfg, &checkers, &|_role| Box::new(AlwaysSat));
+        assert_eq!(without_model.findings.len(), 1);
+        assert!(
+            without_model.findings[0].trace.is_empty(),
+            "AlwaysSat (model: None) must keep producing traceless findings: {:?}",
+            without_model.findings
         );
     }
 

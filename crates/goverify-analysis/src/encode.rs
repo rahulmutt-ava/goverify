@@ -712,6 +712,146 @@ fn binop_term(
     }
 }
 
+// ---- Task 10: trace reconstruction from sat models -------------------
+//
+// Everything below reads a Sat model's TEXT for DISPLAY purposes only —
+// verdicts never depend on it (Sat/Unsat/Unknown comes from the solver's
+// own result code, computed before any of this runs). Two backend
+// formats exist: Z3Native's `Z3_model_to_string` renders "name -> value"
+// lines; a CLI/process backend's `(get-model)` response is an s-expr
+// list of `(define-fun name () Sort value)` forms. Both are wrapped so
+// any parse irregularity — malformed text, an unexpected shape — yields
+// an empty (or partial) map rather than a panic or a fabricated entry.
+
+/// Best-effort model reading for DISPLAY ONLY (verdicts never depend on
+/// it): "gN -> true" lines (Z3Native / Z3_model_to_string) and
+/// "(define-fun gN () Bool true)" s-exprs (get-model backends).
+pub fn guard_values(model_text: &str) -> BTreeMap<String, bool> {
+    model_entries(model_text)
+        .into_iter()
+        .filter_map(|(name, value)| match value.as_str() {
+            "true" => Some((name, true)),
+            "false" => Some((name, false)),
+            _ => None, // non-bool: ignored (display plumbing only)
+        })
+        .collect()
+}
+
+/// Param/variable bindings as display strings ("p0" -> "(ptr-nil)").
+/// Sanitization happens at render time (Task 11), not here.
+pub fn model_bindings(model_text: &str) -> BTreeMap<String, String> {
+    model_entries(model_text)
+}
+
+/// Shared model-text parsing: the arrow line format is tried first;
+/// when no arrow line is found at all, fall back to
+/// `goverify_solver::parse_sexpr` over the WHOLE text, walking
+/// `define-fun` triples. Never panics — any parse error yields the
+/// empty map.
+fn model_entries(model_text: &str) -> BTreeMap<String, String> {
+    let arrow = arrow_entries(model_text);
+    if !arrow.is_empty() {
+        return arrow;
+    }
+    define_fun_entries(model_text).unwrap_or_default()
+}
+
+/// "name -> value" lines (Z3Native's `Z3_model_to_string` format).
+/// Blank/malformed lines are skipped, not fatal.
+fn arrow_entries(model_text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in model_text.lines() {
+        let Some((name, value)) = line.split_once("->") else {
+            continue;
+        };
+        let (name, value) = (name.trim(), value.trim());
+        if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        out.insert(name.to_string(), value.to_string());
+    }
+    out
+}
+
+/// `(define-fun name () Sort value)` triples from a `(get-model)`
+/// response, keyed by name with `value`'s own source text as the
+/// display string. `None` on any parse failure (garbage input).
+fn define_fun_entries(model_text: &str) -> Option<BTreeMap<String, String>> {
+    let (top, _) = goverify_solver::parse_sexpr(model_text).ok()?;
+    let mut out = BTreeMap::new();
+    collect_define_funs(&top, &mut out);
+    Some(out)
+}
+
+fn collect_define_funs(e: &goverify_solver::SExpr, out: &mut BTreeMap<String, String>) {
+    use goverify_solver::SExpr;
+    let SExpr::List(items) = e else {
+        return;
+    };
+    if let [
+        SExpr::Atom(head),
+        SExpr::Atom(name),
+        SExpr::List(_args),
+        _sort,
+        body,
+    ] = items.as_slice()
+        && head == "define-fun"
+    {
+        out.insert(name.clone(), sexpr_text(body));
+        return;
+    }
+    for item in items {
+        collect_define_funs(item, out);
+    }
+}
+
+/// Reconstruct a sub-expression's own source text (there's no byte-range
+/// tracking through `parse_sexpr`, so this re-renders from the parsed
+/// tree instead — stable and good enough for a display string).
+fn sexpr_text(e: &goverify_solver::SExpr) -> String {
+    match e {
+        goverify_solver::SExpr::Atom(s) => s.clone(),
+        goverify_solver::SExpr::List(items) => {
+            format!(
+                "({})",
+                items.iter().map(sexpr_text).collect::<Vec<_>>().join(" ")
+            )
+        }
+    }
+}
+
+/// Entry-to-somewhere path: from block 0, repeatedly take the first DAG
+/// successor whose guard is true in the model (unassigned = false);
+/// stops when no successor qualifies. Deterministic; empty on any
+/// irregularity (missing g0, malformed model).
+pub fn violating_path(
+    func: &Function,
+    dag_succs: &[Vec<u32>],
+    guards: &BTreeMap<String, bool>,
+) -> Vec<u32> {
+    if guards.get("g0") != Some(&true) {
+        return Vec::new();
+    }
+    let mut path = vec![0u32];
+    let mut cur = 0usize;
+    // clippy (while_let_loop): the brief's `loop { let-else { break }; ... }`
+    // shape has no code path after the let-else other than falling through
+    // to the body, so it's exactly a `while let` — rewritten for lint
+    // cleanliness, semantics unchanged.
+    while let Some(next) = dag_succs.get(cur).and_then(|ss| {
+        ss.iter()
+            .find(|&&s| guards.get(&format!("g{s}")) == Some(&true))
+    }) {
+        let next = *next as usize;
+        if next >= func.blocks.len() || path.len() > func.blocks.len() {
+            break; // safety: DAG walk can't exceed block count
+        }
+        path.push(next as u32);
+        cur = next;
+    }
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use goverify_ir::Program;
@@ -1483,6 +1623,86 @@ mod tests {
             .reach_query(0, vec![])
             .canonical_text();
         assert!(text.contains("(= v3 (not (= p0 p1)))"), "ptr neq:\n{text}");
+    }
+
+    // ---- Task 10: trace reconstruction from sat models ---------------
+
+    #[test]
+    fn guard_values_parses_z3native_arrow_format() {
+        let m = "g0 -> true\ng1 -> false\np0 -> (ptr-addr #x0000000000000001)\n";
+        let g = guard_values(m);
+        assert_eq!(g.get("g0"), Some(&true));
+        assert_eq!(g.get("g1"), Some(&false));
+        assert_eq!(g.get("p0"), None, "non-bool ignored");
+    }
+
+    #[test]
+    fn guard_values_parses_define_fun_format() {
+        let m = "((define-fun g0 () Bool true)\n (define-fun g2 () Bool false))";
+        let g = guard_values(m);
+        assert_eq!(g.get("g0"), Some(&true));
+        assert_eq!(g.get("g2"), Some(&false));
+    }
+
+    #[test]
+    fn guard_values_tolerates_garbage() {
+        assert!(guard_values("((((").is_empty());
+        assert!(guard_values("").is_empty());
+    }
+
+    #[test]
+    fn violating_path_walks_true_guards() {
+        // diamond 0->{1,2}->3; guards g0,g1,g3 true, g2 false:
+        // path = [0, 1, 3].
+        let f = func(
+            "t.F",
+            vec![
+                block_p(0, vec![instr("Jump")], vec![], vec![1, 2]),
+                block_p(1, vec![instr("Jump")], vec![0], vec![3]),
+                block_p(2, vec![instr("Jump")], vec![0], vec![3]),
+                block_p(3, vec![instr("Return")], vec![1, 2], vec![]),
+            ],
+        );
+        let (p, id) = one_func_program(f);
+        let func_ref = p.func(id).unwrap();
+        let dag = cut_back_edges(func_ref);
+        let guards: BTreeMap<String, bool> = [
+            ("g0".to_string(), true),
+            ("g1".to_string(), true),
+            ("g2".to_string(), false),
+            ("g3".to_string(), true),
+        ]
+        .into_iter()
+        .collect();
+        let path = violating_path(func_ref, &dag, &guards);
+        assert_eq!(path, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn violating_path_stops_at_dont_care() {
+        // g0 true, successors' guards unassigned: path = [0].
+        let f = func(
+            "t.F",
+            vec![
+                block_p(0, vec![instr("Jump")], vec![], vec![1, 2]),
+                block_p(1, vec![instr("Jump")], vec![0], vec![3]),
+                block_p(2, vec![instr("Jump")], vec![0], vec![3]),
+                block_p(3, vec![instr("Return")], vec![1, 2], vec![]),
+            ],
+        );
+        let (p, id) = one_func_program(f);
+        let func_ref = p.func(id).unwrap();
+        let dag = cut_back_edges(func_ref);
+        let guards: BTreeMap<String, bool> = [("g0".to_string(), true)].into_iter().collect();
+        let path = violating_path(func_ref, &dag, &guards);
+        assert_eq!(path, vec![0]);
+    }
+
+    #[test]
+    fn model_bindings_extracts_display_strings() {
+        let m = "p0 -> (ptr-nil)\nv3 -> #x0000000000000005\n";
+        let b = model_bindings(m);
+        assert_eq!(b.get("p0").map(String::as_str), Some("(ptr-nil)"));
     }
 
     #[test]

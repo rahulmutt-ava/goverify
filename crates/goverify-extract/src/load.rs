@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::gvir;
 
-pub const SCHEMA_VERSION: &str = "2";
+pub const SCHEMA_VERSION: &str = "3";
 
 #[derive(Debug)]
 pub enum LoadError {

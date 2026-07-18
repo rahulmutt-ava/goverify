@@ -59,6 +59,10 @@ pub struct Instr {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub instrs: Vec<Instr>,
+    /// Predecessor block indexes in go/ssa `b.Preds` order: `Op::Phi`
+    /// operand i corresponds to `preds[i]`. Raw wire values — consumers
+    /// must bounds-check (same caveat as `succs`).
+    pub preds: Vec<u32>,
     /// Successor block indices as raw wire values — NOT validated against
     /// `Function::blocks.len()`. Any consumer that indexes `blocks` with
     /// these must bounds-check (fuzzed input can carry arbitrary ids); see

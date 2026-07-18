@@ -149,6 +149,7 @@ mod tests {
             index,
             instrs,
             succs,
+            preds: vec![],
         }
     }
 

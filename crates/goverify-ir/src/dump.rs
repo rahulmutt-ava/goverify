@@ -330,6 +330,7 @@ mod tests {
                             },
                         ],
                         succs: vec![],
+                        preds: vec![],
                     }],
                     ..Default::default()
                 },
@@ -342,6 +343,7 @@ mod tests {
                             ..Default::default()
                         }],
                         succs: vec![],
+                        preds: vec![],
                     }],
                     ..Default::default()
                 },

@@ -21,3 +21,25 @@ fn lowers_conc_corpus_with_full_dag() {
         "unexpected havoc explosion: {havoc_diags}"
     );
 }
+
+#[test]
+fn preds_survive_lowering_and_are_in_range() {
+    let p = goverify_ir::testutil::load_corpus("ops");
+    let mut saw_preds = false;
+    for f in p.func_ids() {
+        let Some(func) = p.func(f) else { continue };
+        for b in &func.blocks {
+            if !b.preds.is_empty() {
+                saw_preds = true;
+            }
+            for &pr in &b.preds {
+                assert!(
+                    (pr as usize) < func.blocks.len(),
+                    "{}: pred {pr} out of range",
+                    p.func_name(f)
+                );
+            }
+        }
+    }
+    assert!(saw_preds, "ops corpus branches must yield preds");
+}

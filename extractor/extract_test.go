@@ -44,8 +44,8 @@ func TestExtractHelloMetadata(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing package example.com/hello; got %v", keys(pkgs))
 	}
-	if p.GetSchemaVersion() != "2" {
-		t.Errorf("schema_version = %q, want \"2\"", p.GetSchemaVersion())
+	if p.GetSchemaVersion() != "3" {
+		t.Errorf("schema_version = %q, want \"3\"", p.GetSchemaVersion())
 	}
 	if !strings.HasPrefix(p.GetGoVersion(), "go") {
 		t.Errorf("go_version = %q, want go1.x", p.GetGoVersion())
@@ -230,5 +230,28 @@ func TestDeterministicBytesAcrossRuns(t *testing.T) {
 		if !bytes.Equal(b1, b2) {
 			t.Errorf("nondeterministic .gvir: %s", w1[i])
 		}
+	}
+}
+
+// TestBlockPreds pins that preds are emitted in b.Preds order: phi
+// operand i must correspond to preds[i] (encoder soundness).
+func TestBlockPreds(t *testing.T) {
+	pkgs := extractCorpus(t, "../testdata/corpus/ops", false)
+	p := pkgs["example.com/ops"]
+	found := false
+	for _, f := range p.Functions {
+		for _, b := range f.Blocks {
+			if len(b.Preds) > 0 {
+				found = true
+			}
+			for _, pr := range b.Preds {
+				if int(pr) >= len(f.Blocks) {
+					t.Fatalf("%s block %d: pred %d out of range", f.Id, b.Index, pr)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("ops corpus has branches; some block must have preds")
 	}
 }

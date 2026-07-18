@@ -119,6 +119,9 @@ message BasicBlock {
   uint32 index = 1;
   repeated Instruction instrs = 2;  // program order
   repeated uint32 succs = 3;        // successor block indexes
+  repeated uint32 preds = 4;        // predecessor block indexes, in
+                                    // go/ssa b.Preds order — Phi operand
+                                    // i corresponds to preds[i]
 }
 
 // Structured payloads for kinds where operands + type are insufficient

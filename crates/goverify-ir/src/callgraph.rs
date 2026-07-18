@@ -474,6 +474,7 @@ mod tests {
                         },
                     ],
                     succs: vec![],
+                    preds: vec![],
                 }],
                 ..Default::default()
             }],

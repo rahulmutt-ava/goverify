@@ -63,6 +63,7 @@ pub fn block(index: u32, instrs: Vec<gvir::Instruction>, succs: Vec<u32>) -> gvi
         index,
         instrs,
         succs,
+        preds: vec![],
     }
 }
 

@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	schemaVersion    = "2"
+	schemaVersion    = "3"
 	extractorVersion = "0.1.0"
 )
 
@@ -258,6 +258,9 @@ func (e *emitter) emitFunction(fn *ssa.Function) *gvirpb.Function {
 		bb := &gvirpb.BasicBlock{Index: uint32(b.Index)}
 		for _, s := range b.Succs {
 			bb.Succs = append(bb.Succs, uint32(s.Index))
+		}
+		for _, pred := range b.Preds {
+			bb.Preds = append(bb.Preds, uint32(pred.Index))
 		}
 		for _, ins := range b.Instrs {
 			pi := &gvirpb.Instruction{

@@ -916,6 +916,7 @@ type BasicBlock struct {
 	Index         uint32                 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
 	Instrs        []*Instruction         `protobuf:"bytes,2,rep,name=instrs,proto3" json:"instrs,omitempty"`       // program order
 	Succs         []uint32               `protobuf:"varint,3,rep,packed,name=succs,proto3" json:"succs,omitempty"` // successor block indexes
+	Preds         []uint32               `protobuf:"varint,4,rep,packed,name=preds,proto3" json:"preds,omitempty"` // predecessor block indexes, in
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -967,6 +968,13 @@ func (x *BasicBlock) GetInstrs() []*Instruction {
 func (x *BasicBlock) GetSuccs() []uint32 {
 	if x != nil {
 		return x.Succs
+	}
+	return nil
+}
+
+func (x *BasicBlock) GetPreds() []uint32 {
+	if x != nil {
+		return x.Preds
 	}
 	return nil
 }
@@ -1989,12 +1997,13 @@ const file_proto_gvir_v1_gvir_proto_rawDesc = "" +
 	"\x04kind\x18\x02 \x01(\tR\x04kind\x12\x12\n" +
 	"\x04repr\x18\x03 \x01(\tR\x04repr\x12\x12\n" +
 	"\x04type\x18\x04 \x01(\rR\x04type\x12)\n" +
-	"\x05const\x18\x05 \x01(\v2\x13.gvir.v1.ConstValueR\x05const\"f\n" +
+	"\x05const\x18\x05 \x01(\v2\x13.gvir.v1.ConstValueR\x05const\"|\n" +
 	"\n" +
 	"BasicBlock\x12\x14\n" +
 	"\x05index\x18\x01 \x01(\rR\x05index\x12,\n" +
 	"\x06instrs\x18\x02 \x03(\v2\x14.gvir.v1.InstructionR\x06instrs\x12\x14\n" +
-	"\x05succs\x18\x03 \x03(\rR\x05succs\"\xca\x04\n" +
+	"\x05succs\x18\x03 \x03(\rR\x05succs\x12\x14\n" +
+	"\x05preds\x18\x04 \x03(\rR\x05preds\"\xca\x04\n" +
 	"\vInstruction\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x1a\n" +
 	"\bregister\x18\x02 \x01(\rR\bregister\x12\x12\n" +

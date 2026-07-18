@@ -222,6 +222,7 @@ fn arb_function(
                 index: 0,
                 instrs,
                 succs: vec![],
+                preds: vec![],
             }],
             ..Default::default()
         })
@@ -287,7 +288,12 @@ proptest! {
             functions: vec![gvir::Function {
                 id: "p.F".into(),
                 aux,
-                blocks: vec![gvir::BasicBlock { index: 0, instrs, succs: vec![] }],
+                blocks: vec![gvir::BasicBlock {
+                    index: 0,
+                    instrs,
+                    succs: vec![],
+                    preds: vec![],
+                }],
                 ..Default::default()
             }],
             ..Default::default()

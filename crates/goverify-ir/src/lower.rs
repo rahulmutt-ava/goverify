@@ -109,6 +109,7 @@ impl Program {
             .blocks
             .iter()
             .map(|b| Block {
+                preds: b.preds.clone(),
                 succs: b.succs.clone(),
                 instrs: b
                     .instrs
@@ -650,6 +651,7 @@ mod tests {
                     index: 0,
                     instrs,
                     succs: vec![],
+                    preds: vec![],
                 }],
                 ..Default::default()
             }],
@@ -774,6 +776,7 @@ mod tests {
                         },
                     ],
                     succs: vec![],
+                    preds: vec![],
                 }],
                 ..Default::default()
             }],
@@ -840,6 +843,7 @@ mod tests {
                         },
                     ],
                     succs: vec![],
+                    preds: vec![],
                 }],
                 ..Default::default()
             }],
@@ -889,6 +893,7 @@ mod tests {
                         ..Default::default()
                     }],
                     succs: vec![],
+                    preds: vec![],
                 }],
                 ..Default::default()
             }],

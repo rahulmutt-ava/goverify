@@ -189,6 +189,11 @@ impl Solver for TermSolver {
             self.decls.truncate(d);
             self.asserts.truncate(a);
         }
+        // The popped frame's assertions no longer hold, so any model
+        // solved under them is stale — `model()` must not return it for
+        // a caller that calls `pop()` without an intervening
+        // `check_sat_assuming`.
+        self.last_model = None;
     }
 }
 
@@ -237,6 +242,43 @@ mod tests {
             s.check_sat_assuming(&[]),
             SatResult::Sat,
             "popped assert must be gone"
+        );
+    }
+
+    #[test]
+    fn term_solver_pop_clears_stale_model() {
+        // Scripted backend always answers Sat (with no model text), but
+        // `check_sat_assuming` still records `last_model` from whatever
+        // `TextSolver::solve_text` returns — here we drive that through
+        // `Solver::model()` directly via a backend that reports a model.
+        struct AlwaysSatWithModel;
+        impl TextSolver for AlwaysSatWithModel {
+            fn identity(&self) -> String {
+                "always-sat-with-model".into()
+            }
+            fn limits(&self) -> SolverLimits {
+                SolverLimits::default()
+            }
+            fn solve_text(&mut self, _c: &str) -> QueryOutcome {
+                QueryOutcome {
+                    result: SatResult::Sat,
+                    model: Some("(model)".into()),
+                }
+            }
+        }
+        let mut s = TermSolver::new(Box::new(AlwaysSatWithModel), Logic::QfBv);
+        s.push();
+        s.assert(Term::bool_lit(true));
+        assert_eq!(s.check_sat_assuming(&[]), SatResult::Sat);
+        assert!(
+            s.model().is_some(),
+            "a Sat check with a model must expose it"
+        );
+        s.pop();
+        assert!(
+            s.model().is_none(),
+            "model() right after pop() (no intervening check) must not \
+             return a model for assertions that no longer hold"
         );
     }
 }

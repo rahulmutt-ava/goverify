@@ -84,10 +84,13 @@ trait (`goverify-analysis::checker`):
   as findings. `summary_of` lets a checker read a callee's
   already-inferred requires while deriving its own, so requires
   propagate through call chains for free as the fixpoint settles.
-- `obligations` raises candidate precondition violations at call
-  sites, each checked against the callee's own inferred requires (an
-  obligation is only ever discharged under the precondition the
-  callee actually has, never a different one).
+- `obligations` raises two kinds of candidate precondition violation,
+  both discharged under the enclosing function's own preconditions:
+  call-site obligations, instantiated from the callee's own inferred
+  requires (never a different precondition than the callee actually
+  has), and manifest-local obligations for a violation the function
+  commits directly in its own body (a literal out-of-bounds index, a
+  const-nil deref) with no callee involved.
 - A candidate becomes a `Finding` only when its query comes back `Sat`
   during the sequential findings pass; Unsat/Unknown stay silent
   (bug-finder invariant: false positives are the enemy).

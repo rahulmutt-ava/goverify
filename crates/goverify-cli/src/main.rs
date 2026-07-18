@@ -225,7 +225,6 @@ fn run_findings(fa: FindingsArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     let cfg = goverify_analysis::EngineConfig {
         opts: goverify_analysis::Options::default(),
-        limits,
         cache_dir: fa.cache_dir.clone(),
         emit_smt: fa.emit_smt.clone(),
     };

@@ -1,6 +1,9 @@
 //! Portable text backend (parent spec §8): pipes canonical SMT-LIB2 to
 //! any solver binary. Used by --solver-cmd and the differential harness.
 //! Every failure — spawn, timeout, garbage output — is Unknown.
+//! `SolverLimits::mem_mb` is NOT enforced by this backend (no portable
+//! flag exists across solver binaries); it still participates in the
+//! query-cache key via `limits()`. Only `Z3Native` enforces the cap.
 
 use std::io::Write;
 use std::path::Path;

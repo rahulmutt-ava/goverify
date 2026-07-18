@@ -20,7 +20,7 @@ use rayon::prelude::*;
 
 use goverify_cache::QueryCache;
 use goverify_ir::{CallGraph, FuncId, Program, Sccs};
-use goverify_solver::{Query, SatResult, SolverLimits, StubSolver, TextSolver, discharge_query};
+use goverify_solver::{Query, SatResult, StubSolver, TextSolver, discharge_query};
 
 use crate::checker::{Checker, Finding};
 use crate::effects::{self, Effects, Loc, Root};
@@ -38,14 +38,14 @@ impl Default for Options {
     }
 }
 
-/// Everything `analyze_full` needs beyond the fixpoint options: solver
-/// limits (informational — the backend a `mk_backend` closure constructs
-/// already bakes its own limits in), an optional on-disk query cache, and
-/// an optional directory to dump every canonical SMT-LIB2 query to.
+/// Everything `analyze_full` needs beyond the fixpoint options: an
+/// optional on-disk query cache, and an optional directory to dump every
+/// canonical SMT-LIB2 query to. Solver limits live with the backend the
+/// `mk_backend` closure constructs — they are part of the backend's
+/// identity (query-cache key), not engine state.
 #[derive(Debug, Clone, Default)]
 pub struct EngineConfig {
     pub opts: Options,
-    pub limits: SolverLimits,
     pub cache_dir: Option<PathBuf>,
     pub emit_smt: Option<PathBuf>,
 }
@@ -465,6 +465,7 @@ mod tests {
     use crate::effects::{Effects, LockOp};
     use crate::summary::Provenance;
     use crate::testpkg::{block, call, func, instr, pkg};
+    use goverify_solver::SolverLimits;
 
     fn straight(
         id: &str,

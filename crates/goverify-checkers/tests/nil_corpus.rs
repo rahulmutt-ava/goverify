@@ -18,7 +18,6 @@ fn run(emit: Option<std::path::PathBuf>) -> String {
     let p = goverify_ir::testutil::load_corpus("nil");
     let cfg = EngineConfig {
         opts: Options::default(),
-        limits: limits(),
         cache_dir: None,
         emit_smt: emit,
     };

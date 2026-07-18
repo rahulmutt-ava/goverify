@@ -6,6 +6,11 @@
 //! fixpoint (see docs/superpowers/specs/2026-07-16-goverify-design.md
 //! §15).
 
+mod bounds;
 mod nil;
+mod shared;
+#[cfg(test)]
+mod testfix;
 
+pub use bounds::BoundsChecker;
 pub use nil::NilChecker;

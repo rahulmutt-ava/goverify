@@ -12,7 +12,9 @@ mod testpkg;
 
 pub use checker::{Checker, Finding, Obligation, TraceStep};
 pub use effects::{ChanOp, Effects, Loc, LockOp, Root, Spawns, collect};
-pub use encode::{EncodedFunc, cut_back_edges, encode_func, int_repr, seq_datatype, sort_of};
+pub use encode::{
+    EncodedFunc, array_len, cut_back_edges, encode_func, int_repr, seq_datatype, sort_of,
+};
 pub use engine::{
     Analysis, BackendRole, EngineConfig, Options, analyze, analyze_full, dump_findings,
     dump_prepass, dump_summaries,

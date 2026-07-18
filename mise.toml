@@ -44,7 +44,7 @@ run = [
   "cargo test -p goverify-extract --test extract_integration",
   "cargo test -p goverify-ir --test lower_golden --test lower_corpus --test callgraph_corpus",
   "cargo test -p goverify-analysis --test engine_corpus",
-  "cargo test -p goverify-checkers --test nil_corpus",
+  "cargo test -p goverify-checkers --test nil_corpus --test bounds_corpus",
   "cargo test -p goverify-cli --test debug_integration",
 ]
 

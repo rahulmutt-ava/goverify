@@ -5,13 +5,13 @@
 //! over this function's params. Obligations (call-site + manifest-local)
 //! are raised in `obligations` under the function's own preconditions.
 
-use goverify_analysis::{
-    Checker, Clause, Formula, Obligation, Summary, encode_func, instantiate_requires,
-};
-use goverify_ir::{
-    Callee, ConstVal, FuncId, Function, Op, Pos, Program, TypeKind, ValueId, ValueKind,
-};
+use goverify_analysis::{Checker, Clause, Formula, Obligation, Summary, encode_func};
+use goverify_ir::{ConstVal, FuncId, Function, Op, Pos, Program, TypeKind, ValueId, ValueKind};
 use goverify_solver::{Query, SatResult, Term, ptr_is_nil};
+
+use crate::shared::{
+    call_site_obligations, own_preconditions, params_only, propagate_requires, push_clause,
+};
 
 pub struct NilChecker;
 
@@ -40,24 +40,6 @@ pub(crate) fn deref_sites(
         }
     }
     out
-}
-
-/// True iff every free var of `t` is a p<i> param name: the only vars a
-/// requires-clause (evaluated at the callee's own entry, or bound at a
-/// call site) may depend on.
-pub(crate) fn params_only(t: &Term) -> bool {
-    t.free_vars().keys().all(|n| {
-        n.strip_prefix('p')
-            .is_some_and(|rest| rest.parse::<u32>().is_ok())
-    })
-}
-
-/// Push a clause unless an equal one is present (fixpoint-friendly dedup;
-/// `infer_requires` reruns on every round of a recursive SCC's fixpoint).
-fn push_clause(out: &mut Vec<Clause>, c: Clause) {
-    if !out.contains(&c) {
-        out.push(c);
-    }
 }
 
 impl Checker for NilChecker {
@@ -107,44 +89,7 @@ impl Checker for NilChecker {
         }
         // Propagated: violable callee requires expressible over this
         // function's own params, bottom-up through the SCC fixpoint.
-        for (bi, ins) in func
-            .blocks
-            .iter()
-            .enumerate()
-            .flat_map(|(bi, b)| b.instrs.iter().map(move |i| (bi, i)))
-        {
-            let Op::Call {
-                callee: Callee::Static(c),
-                args,
-                ..
-            } = &ins.op
-            else {
-                continue;
-            };
-            let arg_terms: Vec<Option<Term>> =
-                args.iter().map(|a| enc.value(*a).cloned()).collect();
-            for bc in instantiate_requires(&summary_of(*c), &arg_terms) {
-                if bc.tag != "nil-deref" {
-                    continue; // this checker only owns its own tag
-                }
-                let (Some(bound), Some(violation)) = (bc.bound, bc.violation) else {
-                    continue;
-                };
-                if !params_only(&bound) {
-                    continue;
-                }
-                if discharge(&enc.reach_query(bi, vec![violation])) != SatResult::Sat {
-                    continue;
-                }
-                push_clause(
-                    &mut out,
-                    Clause {
-                        tag: "nil-deref".into(),
-                        formula: Formula { term: bound },
-                    },
-                );
-            }
-        }
+        propagate_requires(p, func, &enc, "nil-deref", summary_of, discharge, &mut out);
         out
     }
 
@@ -203,50 +148,16 @@ impl Checker for NilChecker {
         }
 
         // Call sites: instantiated callee requires under own preconditions.
-        for (bi, b) in func.blocks.iter().enumerate() {
-            for ins in &b.instrs {
-                let Op::Call {
-                    callee: Callee::Static(c),
-                    args,
-                    ..
-                } = &ins.op
-                else {
-                    continue;
-                };
-                let arg_terms: Vec<Option<Term>> =
-                    args.iter().map(|a| enc.value(*a).cloned()).collect();
-                for bc in instantiate_requires(&summary_of(*c), &arg_terms) {
-                    if bc.tag != "nil-deref" {
-                        continue;
-                    }
-                    let Some(v) = bc.violation else { continue };
-                    let mut extra = pre.clone();
-                    extra.push(v);
-                    out.push(Obligation {
-                        tag: bc.tag.clone(),
-                        message: format!(
-                            "nil passed to {} (violates its {} requirement)",
-                            p.func_name(*c),
-                            bc.tag
-                        ),
-                        pos: ins.pos.clone(),
-                        query: enc.reach_query(bi, extra),
-                    });
-                }
-            }
-        }
+        out.extend(call_site_obligations(
+            p,
+            func,
+            &enc,
+            "nil-deref",
+            &pre,
+            summary_of,
+        ));
         out
     }
-}
-
-/// The function's own requires clauses as query conjuncts: their free
-/// p<i> vars are exactly the encoder's param const names, so they can
-/// be conjoined directly.
-fn own_preconditions(own: &Summary) -> Vec<Term> {
-    own.requires
-        .iter()
-        .map(|c| c.formula.term.clone())
-        .collect()
 }
 
 #[cfg(test)]
@@ -254,156 +165,12 @@ mod tests {
     use goverify_analysis::{Checker, Clause, Summary};
     use goverify_extract::gvir;
     use goverify_extract::gvir::instruction::Sem;
-    use goverify_ir::Program;
-    use goverify_solver::{Query, SatResult, SolverLimits, Z3Native, discharge_query};
 
     use super::*;
-
-    // -- local gvir builders (mirrors goverify-analysis's testpkg) --------
-
-    fn instr(kind: &str) -> gvir::Instruction {
-        gvir::Instruction {
-            kind: kind.into(),
-            ..Default::default()
-        }
-    }
-
-    fn block(index: u32, instrs: Vec<gvir::Instruction>, succs: Vec<u32>) -> gvir::BasicBlock {
-        gvir::BasicBlock {
-            index,
-            instrs,
-            succs,
-            preds: vec![],
-        }
-    }
-
-    fn ty(id: u32, repr: &str, kind: gvir::TypeKind, name: &str, elem: u32) -> gvir::Type {
-        gvir::Type {
-            id,
-            repr: repr.into(),
-            kind: kind as i32,
-            name: name.into(),
-            elem,
-            ..Default::default()
-        }
-    }
-
-    /// Package "t" with the struct-pointer type pair (1 = T, 2 = *T), a
-    /// bool type (3, for Branch conditions built from a comparison), and
-    /// the given functions.
-    fn pkg_with_ptr_types(functions: Vec<gvir::Function>) -> Program {
-        let package = gvir::Package {
-            import_path: "t".into(),
-            functions,
-            types: vec![
-                ty(1, "T", gvir::TypeKind::Struct, "", 0),
-                ty(2, "*T", gvir::TypeKind::Pointer, "", 1),
-                ty(3, "bool", gvir::TypeKind::Basic, "bool", 0),
-            ],
-            ..Default::default()
-        };
-        Program::from_packages(vec![package])
-    }
-
-    /// t.F(p *T): FieldAddr p.X in the block layout given.
-    fn deref_func(blocks: Vec<gvir::BasicBlock>) -> gvir::Function {
-        gvir::Function {
-            id: "t.F".into(),
-            params: vec![gvir::Param {
-                id: 1,
-                name: "p".into(),
-                r#type: 2,
-            }],
-            blocks,
-            ..Default::default()
-        }
-    }
-
-    /// A `FieldAddr` dereferencing `operand` (a pointer value), writing
-    /// its result to `dst_reg`.
-    fn field_addr_on(dst_reg: u32, operand: u32) -> gvir::Instruction {
-        let mut fa = instr("FieldAddr");
-        fa.register = dst_reg;
-        fa.operands = vec![operand];
-        fa.sem = Some(Sem::Field(gvir::FieldSem {
-            index: 0,
-            name: "X".into(),
-        }));
-        fa
-    }
-
-    fn field_addr_on_param() -> gvir::Instruction {
-        field_addr_on(2, 1)
-    }
-
-    /// t.F with the deref unconditionally in the entry block.
-    fn deref_program() -> Program {
-        pkg_with_ptr_types(vec![deref_func(vec![block(
-            0,
-            vec![field_addr_on_param(), instr("Return")],
-            vec![],
-        )])])
-    }
-
-    fn branch_on(operand: u32) -> gvir::Instruction {
-        let mut b = instr("If");
-        b.operands = vec![operand];
-        b
-    }
-
-    /// v<dst> = (lhs == rhs) as bool: mirrors lower.rs's BinOp arm.
-    fn eq_instr(dst: u32, lhs: u32, rhs: u32) -> gvir::Instruction {
-        gvir::Instruction {
-            kind: "BinOp".into(),
-            register: dst,
-            r#type: 3, // bool
-            operands: vec![lhs, rhs],
-            sem: Some(Sem::Binop(gvir::BinOpSem { op: "==".into() })),
-            ..Default::default()
-        }
-    }
-
-    /// A nil *T aux constant at the given id.
-    fn nil_aux(id: u32) -> gvir::AuxValue {
-        gvir::AuxValue {
-            id,
-            kind: "Const".into(),
-            repr: "nil".into(),
-            r#type: 2,
-            r#const: Some(gvir::ConstValue {
-                value: Some(gvir::const_value::Value::Nil(true)),
-            }),
-        }
-    }
-
-    /// A static call instruction: operands = [callee-slot(unused), args…]
-    /// (mirrors lower.rs's non-invoke call convention). `dst_reg` 0 means
-    /// no destination (statement call).
-    fn call_static(callee: &str, dst_reg: u32, dst_ty: u32, args: Vec<u32>) -> gvir::Instruction {
-        let mut c = instr("Call");
-        c.register = dst_reg;
-        c.r#type = dst_ty;
-        c.operands = std::iter::once(0).chain(args).collect();
-        c.sem = Some(Sem::Call(gvir::CallSem {
-            static_callee: callee.into(),
-            ..Default::default()
-        }));
-        c
-    }
-
-    fn z3_discharge() -> impl FnMut(&Query) -> SatResult {
-        let mut solver = Z3Native::new(SolverLimits {
-            timeout_ms: 5_000,
-            mem_mb: 1024,
-        });
-        move |q| discharge_query(q, &mut solver, None, None).result
-    }
-
-    /// A `summary_of` that never has anything to say (used by tests that
-    /// don't exercise requires propagation).
-    fn no_summaries(_f: goverify_ir::FuncId) -> Summary {
-        Summary::default()
-    }
+    use crate::testfix::{
+        block, branch_on, call_static, deref_func, deref_program, eq_instr, field_addr_on,
+        field_addr_on_param, instr, nil_aux, no_summaries, pkg_with_ptr_types, z3_discharge,
+    };
 
     #[test]
     fn unguarded_param_deref_infers_nonnil_requires() {

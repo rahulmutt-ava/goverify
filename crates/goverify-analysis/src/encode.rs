@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use goverify_ir::{
-    BinOpKind, ConstVal, FuncId, Function, MakeKind, Op, Program, TypeId, TypeKind, TypeTable,
-    UnOpKind, ValueId, ValueKind,
+    BinOpKind, Callee, ConstVal, FuncId, Function, MakeKind, Op, Program, TypeId, TypeKind,
+    TypeTable, UnOpKind, ValueId, ValueKind,
 };
 use goverify_solver::{
     BvBinOp, BvCmpOp, CtorDecl, DatatypeDecl, Logic, Query, Sort, Term, ptr_datatype, ptr_nil,
@@ -57,6 +57,38 @@ pub fn int_repr(types: &TypeTable, t: TypeId) -> Option<(u32, bool)> {
             "uint8" | "byte" => Some((8, false)),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+/// The static length backing `ty`, when `ty` is itself an array OR a
+/// pointer to one (through any number of `Named` wrappers on either
+/// side, mirroring `int_repr`/`sort_of`'s own resolution — a `type Arr
+/// [3]int` or a `*Arr` must resolve exactly like `[3]int`/`*[3]int`):
+/// go/ssa commonly addresses arrays through their pointer — a plain
+/// `var a [N]T` is still typed `*[N]T` at every `IndexAddr`/`Slice` site
+/// that reads it, and `make([]T, n)` with a compile-time-constant `n`
+/// lowers to `Alloc` (a fresh `*[n]T`) plus a whole-array `Slice`, never
+/// `MakeSlice` (Task 8 corpus finding). Peels exactly one pointer level
+/// — `None` for anything else (a genuine Seq value's length lives in
+/// its own `seq-len`/`seq-cap` term instead).
+pub fn array_len(types: &TypeTable, ty: TypeId) -> Option<u64> {
+    match types.kind(ty) {
+        TypeKind::Named { underlying, .. } => array_len(types, *underlying),
+        TypeKind::Array { len, .. } => Some(*len),
+        TypeKind::Pointer { elem } => array_len_direct(types, *elem),
+        _ => None,
+    }
+}
+
+/// `array_len`'s pointer-elem resolution: `elem` must itself resolve
+/// (through `Named`) to an array — NOT recursively through another
+/// pointer (`**[N]T` doesn't back an addressable `[N]T` the way `*[N]T`
+/// does).
+fn array_len_direct(types: &TypeTable, ty: TypeId) -> Option<u64> {
+    match types.kind(ty) {
+        TypeKind::Named { underlying, .. } => array_len_direct(types, *underlying),
+        TypeKind::Array { len, .. } => Some(*len),
         _ => None,
     }
 }
@@ -229,7 +261,19 @@ fn declare_value(p: &Program, func: &Function, v: ValueId, enc: &mut EncodedFunc
     let name = value_name(func, v);
     let t = Term::var(&name, sort.clone());
     enc.consts.push((name, sort.clone()));
-    if sort == seq_datatype().sort() {
+    // The invariant is only sound to bolt on for a value the encoder
+    // DOESN'T otherwise pin down by equation (params — Go's calling
+    // convention guarantees a well-formed header — and unmodeled/havoc'd
+    // values, where assuming the best case is exactly the point). A
+    // `Make{Slice}`/`Slice`-derived dst gets a full defining equation
+    // instead (`op_def`, below): asserting the invariant ON TOP of that
+    // is redundant when the equation is well-formed and, worse, directly
+    // contradictory on an out-of-bounds `Slice` (the exact case bounds
+    // checking needs to keep Sat) — a raw `high - low` can arithmetically
+    // exceed `cap - low`, and forcing `len <= cap` there makes the WHOLE
+    // function's assertion set inconsistent, silently swallowing every
+    // finding in it (Task 8 corpus finding).
+    if sort == seq_datatype().sort() && !is_seq_derived(func, v) {
         seq_invariant(&t, enc);
     }
     if let ValueKind::Const(c) = &info.kind
@@ -239,6 +283,24 @@ fn declare_value(p: &Program, func: &Function, v: ValueId, enc: &mut EncodedFunc
         enc.asserts.push(eq);
     }
     enc.values.insert(v, t);
+}
+
+/// True iff `v` is the dst of a `Make{Slice}`/`Slice` op somewhere in
+/// `func` — i.e. `op_def` will give it a full defining equation rather
+/// than leaving it as a free header. Linear in `func`'s instruction
+/// count; functions are bounded by `ASSERT_CAP` so this stays cheap.
+fn is_seq_derived(func: &Function, v: ValueId) -> bool {
+    func.blocks.iter().flat_map(|b| &b.instrs).any(|ins| {
+        matches!(
+            &ins.op,
+            Op::Make {
+                dst,
+                kind: MakeKind::Slice,
+                ..
+            } | Op::Slice { dst, .. }
+            if *dst == v
+        )
+    })
 }
 
 /// 0 <= seq-len(t) <= seq-cap(t) (unsigned): every Seq value the
@@ -533,6 +595,71 @@ fn op_def(p: &Program, func: &Function, block: usize, op: &Op, enc: &EncodedFunc
             let cap = args.get(1).and_then(t).unwrap_or_else(|| len.clone());
             let ctor = Term::dt_ctor(&seq_datatype(), "seq-val", vec![len, cap]).ok()?;
             Term::eq(d, ctor).ok()
+        }
+        // `s[low:high(:max)]`: new len = high-low, new cap = (max or the
+        // base's own cap) - low (Go spec §"Slice expressions") — Task 8
+        // addition: real `make([]T, n)` with a constant `n` lowers to
+        // `Alloc` + a whole-array `Slice` (never `MakeSlice`), so leaving
+        // Slice unmodeled havocs the len/cap of essentially every slice a
+        // corpus actually produces, defeating bounds-checking entirely.
+        Op::Slice {
+            dst,
+            base,
+            low,
+            high,
+            max,
+        } => {
+            let d = t(dst)?;
+            let (base_len, base_cap) = match array_len(p.types(), func.value(*base).ty) {
+                Some(n) => {
+                    let lit = Term::bv_lit(64, n as u128);
+                    (lit.clone(), lit)
+                }
+                None => {
+                    let b = enc.values.get(base)?.clone();
+                    if b.sort() != &seq_datatype().sort() {
+                        return None;
+                    }
+                    (
+                        Term::dt_get(&seq_datatype(), "seq-val", "seq-len", b.clone()).ok()?,
+                        Term::dt_get(&seq_datatype(), "seq-val", "seq-cap", b).ok()?,
+                    )
+                }
+            };
+            let low_t = match low {
+                Some(l) => t(l)?,
+                None => Term::bv_lit(64, 0),
+            };
+            let high_t = match high {
+                Some(h) => t(h)?,
+                None => base_len,
+            };
+            let cap_src = match max {
+                Some(m) => t(m)?,
+                None => base_cap,
+            };
+            let new_len = Term::bv_bin(BvBinOp::Sub, high_t, low_t.clone()).ok()?;
+            let new_cap = Term::bv_bin(BvBinOp::Sub, cap_src, low_t).ok()?;
+            let ctor = Term::dt_ctor(&seq_datatype(), "seq-val", vec![new_len, new_cap]).ok()?;
+            Term::eq(d, ctor).ok()
+        }
+        // The `len` builtin ties its dst to the base's own seq-len
+        // accessor rather than havoc'ing (Task 8): without this, a
+        // `len(s)`-guarded index/slice can never be proven safe, since
+        // the guard's condition would be about a value wholly
+        // disconnected from `s`'s real length.
+        Op::Call {
+            dst: Some(d),
+            callee: Callee::Builtin(name),
+            args,
+        } if name == "len" => {
+            let dt = t(d)?;
+            let arg = args.first().and_then(|a| enc.values.get(a).cloned())?;
+            if arg.sort() != &seq_datatype().sort() {
+                return None;
+            }
+            let len = Term::dt_get(&seq_datatype(), "seq-val", "seq-len", arg).ok()?;
+            Term::eq(dt, len).ok()
         }
         _ => None, // Load/Store/Call/Convert/... havoc (declared, unconstrained)
     }
@@ -1164,6 +1291,77 @@ mod tests {
         assert!(
             text.contains("(= v3 (seq-val p0 p1))"),
             "makeslice len/cap:\n{text}"
+        );
+    }
+
+    #[test]
+    fn len_builtin_defines_seq_len_accessor() {
+        use goverify_extract::gvir;
+        // v2 = len(s), s: []int param — Task 8's addition: the "len"
+        // builtin call ties its dst to the base's own seq-len accessor
+        // instead of havoc'ing, so a `len(s)`-guarded bounds check can
+        // actually be proven safe downstream (goverify-checkers'
+        // BoundsChecker consumes this).
+        let lencall = gvir::Instruction {
+            kind: "Call".into(),
+            register: 2,
+            r#type: 1,            // int
+            operands: vec![0, 1], // [callee slot (unused), s]
+            sem: Some(gvir::instruction::Sem::Call(gvir::CallSem {
+                builtin: "len".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let f = gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 6)], // s: []int
+            blocks: vec![block_p(0, vec![lencall, ret(vec![2])], vec![], vec![])],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let text = encode_func(&p, id)
+            .unwrap()
+            .reach_query(0, vec![])
+            .canonical_text();
+        assert!(
+            text.contains("(= v2 (seq-len p0))"),
+            "len builtin ties to seq-len:\n{text}"
+        );
+    }
+
+    #[test]
+    fn len_builtin_on_non_seq_arg_havocs() {
+        use goverify_extract::gvir;
+        // len() on a non-Seq-sorted arg (e.g. an unmodelable/mismatched
+        // type) must degrade to havoc, never error or panic.
+        let lencall = gvir::Instruction {
+            kind: "Call".into(),
+            register: 2,
+            r#type: 1, // int
+            operands: vec![0, 1],
+            sem: Some(gvir::instruction::Sem::Call(gvir::CallSem {
+                builtin: "len".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let f = gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 1)], // int, not a Seq
+            blocks: vec![block_p(0, vec![lencall, ret(vec![2])], vec![], vec![])],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let enc = encode_func(&p, id).expect("must not error on a mismatched len() arg");
+        let text = enc.reach_query(0, vec![]).canonical_text();
+        assert!(
+            text.contains("(declare-const v2 (_ BitVec 64))"),
+            "len() dst still declared:\n{text}"
+        );
+        assert!(
+            !text.contains("(= v2"),
+            "non-Seq arg: len() dst has no defining equality (havoc'd):\n{text}"
         );
     }
 

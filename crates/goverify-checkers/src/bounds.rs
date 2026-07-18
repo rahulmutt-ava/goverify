@@ -9,7 +9,7 @@ use goverify_analysis::{
     Checker, Clause, EncodedFunc, Formula, Obligation, Summary, array_len, encode_func,
     seq_datatype,
 };
-use goverify_ir::{FuncId, Function, Op, Pos, Program, ValueId, ValueKind};
+use goverify_ir::{FuncId, Function, MakeKind, Op, Pos, Program, ValueId, ValueKind};
 use goverify_solver::{BvCmpOp, Query, SatResult, Term};
 
 use crate::shared::{
@@ -171,30 +171,95 @@ fn bounds_sites(p: &Program, func: &Function, enc: &EncodedFunc) -> Vec<Site> {
     out
 }
 
+/// A bare function parameter or manifest constant: `encode_func` ties
+/// both down (a defining const-eq assert, or the calling convention's
+/// own `p<i>` naming) even though the *term itself* is never
+/// syntactically free-vars-empty — same lesson as nil.rs's
+/// `is_const_nil`, generalized past "nil" to any constant.
+fn is_ground_or_param(func: &Function, v: ValueId) -> bool {
+    matches!(func.value(v).kind, ValueKind::Param | ValueKind::Const(_))
+}
+
 /// True iff `v`'s value is safe to use in a *local* manifest obligation
 /// even though its own encoded term isn't syntactically free-vars-empty:
 /// a function parameter, a manifest constant, or the destination of a
-/// `Make`/`Slice` op — same lesson as nil.rs's `is_const_nil`:
-/// `encode_func` ties every one of these down via a defining equality
-/// (`declare_value`'s const-eq, or `op_def`'s `Make`/`Slice` arms) rather
-/// than inlining it, so the *term's* `free_vars()` can never see it —
-/// the IR's own `ValueKind`/defining-op must be consulted instead. The
-/// `Slice` case matters in practice: real `make([]T, n)` with a
-/// constant `n` lowers to `Alloc` + a whole-array `Slice` (never
-/// `MakeSlice`), so a slice's dst is usually a `Slice` result, not a
-/// `Make` one. Deliberately shallow (one hop, matching the depth
-/// `len_of`/`cap_of` actually introduce from idx/low/high/max down to
-/// the base's own Seq value): anything further back through an
-/// unmodeled chain stays unrecognized here and is silently skipped,
-/// which only ever understates findings, never fabricates one.
-fn expressible(func: &Function, v: ValueId) -> bool {
-    if matches!(func.value(v).kind, ValueKind::Param | ValueKind::Const(_)) {
+/// `Make`/`Slice` op **whose own length/cap-determining inputs are
+/// themselves ground consts or params-only** (review finding, Task 8
+/// fast-follow — the unqualified "any Make/Slice dst" version admitted
+/// a site like `f(m, n int) []int { s := make([]int, m, n); return
+/// s[1:] }` as a *local* obligation on `f`, when `m`/`n` being
+/// unconstrained params means this is exactly what `infer_requires`
+/// should have surfaced as `f`'s own requires instead — bypassing the
+/// self-consistency check `own_preconditions` gives every OTHER site,
+/// see nil.rs's `wrapper_does_not_self_report`).
+///
+/// `Make`'s determining inputs are its `len`/`cap` args directly (a
+/// missing 2-arg-`make` cap lowers to the `ValueId(0)` sentinel, which
+/// isn't a real value to check — see lower.rs's `v(1)`/`vopt`
+/// convention). `Slice`'s are `low`/`high`/`max` (each checked
+/// directly — Go's slice-expression operands are never anything but a
+/// scalar int) plus `base`, RECURSIVELY: a `base` whose type resolves
+/// via `array_len` (an array, or, as go/ssa commonly emits for a
+/// compile-time-constant `make()`, a *pointer* to one) never has its
+/// own term read by `len_of`/`cap_of` at all — the array's length is a
+/// static type fact, independent of whatever value the pointer holds —
+/// so its groundness is moot; otherwise `base` must itself satisfy this
+/// same test (e.g. `BadSlice`'s corpus case: reslicing a `make()`'d
+/// slice is a `Slice`-of-a-`Slice`, base = the first `Slice`'s dst).
+/// Depth-capped against a malformed/cyclic `.gvir` recursing forever —
+/// degrades to "not expressible" past the cap, never overflows the
+/// stack (degrade, never die).
+const EXPRESSIBLE_MAX_DEPTH: u32 = 16;
+
+fn expressible(p: &Program, func: &Function, v: ValueId) -> bool {
+    expressible_at(p, func, v, EXPRESSIBLE_MAX_DEPTH)
+}
+
+fn expressible_at(p: &Program, func: &Function, v: ValueId, depth: u32) -> bool {
+    if is_ground_or_param(func, v) {
         return true;
     }
-    func.blocks.iter().flat_map(|b| &b.instrs).any(|ins| {
-        matches!(&ins.op, Op::Make { dst, .. } if *dst == v)
-            || matches!(&ins.op, Op::Slice { dst, .. } if *dst == v)
-    })
+    let Some(depth) = depth.checked_sub(1) else {
+        return false;
+    };
+    for b in &func.blocks {
+        for ins in &b.instrs {
+            match &ins.op {
+                Op::Make {
+                    dst,
+                    kind: MakeKind::Slice,
+                    args,
+                } if *dst == v => {
+                    return args
+                        .iter()
+                        .all(|&a| a == ValueId(0) || is_ground_or_param(func, a));
+                }
+                Op::Slice {
+                    dst,
+                    base,
+                    low,
+                    high,
+                    max,
+                } if *dst == v => {
+                    let base_ok = array_len(p.types(), func.value(*base).ty).is_some()
+                        || expressible_at(p, func, *base, depth);
+                    if !base_ok {
+                        return false;
+                    }
+                    for opt in [low, high, max] {
+                        if let Some(a) = opt
+                            && !is_ground_or_param(func, *a)
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 impl Checker for BoundsChecker {
@@ -265,7 +330,7 @@ impl Checker for BoundsChecker {
         // pulled from an unmodeled call (havoc) stays silent (FP storm
         // guard: we cannot say anything about an arbitrary heap value).
         for site in bounds_sites(p, func, &enc) {
-            if !site.values.iter().all(|&v| expressible(func, v)) {
+            if !site.values.iter().all(|&v| expressible(p, func, v)) {
                 continue;
             }
             let mut extra = pre.clone();
@@ -292,7 +357,7 @@ mod tests {
 
     use super::*;
     use crate::testfix::{
-        binop_instr, block, branch_on, call_builtin, index_addr_instr, instr, int_aux,
+        binop_instr, block, branch_on, call_builtin, call_static, index_addr_instr, instr, int_aux,
         make_slice_instr, no_summaries, pkg_with_seq_types, slice_instr, z3_discharge,
     };
 
@@ -499,6 +564,41 @@ mod tests {
             z3_discharge()(&obs[0].query),
             SatResult::Sat,
             "s[1:5] over a cap-4 slice is satisfiable"
+        );
+    }
+
+    #[test]
+    fn symbolic_make_reslice_stays_silent_locally() {
+        // Review finding (Task 8 fast-follow): t.F() { m := t.K()
+        // (unknown callee: m havocs); s := make([]int, m, m); _ = s[1:] }
+        // — make's own len/cap args are neither a manifest constant nor
+        // a parameter (an arbitrary havoc'd value), so `expressible`
+        // must NOT treat the resulting slice as fit for a *local*
+        // obligation: unlike `manifest_out_of_bounds_obligates`'s
+        // ground-literal make, we truly cannot say anything about an
+        // arbitrary heap value's length here (same FP-storm guard as
+        // nil.rs's `havoc_subject_deref_stays_silent`).
+        let f = goverify_extract::gvir::Function {
+            id: "t.F".into(),
+            aux: vec![int_aux(4, 1, 1)], // low = 1
+            blocks: vec![block(
+                0,
+                vec![
+                    call_static("t.K", 1, 1, vec![]), // m := t.K(): int, havoc'd
+                    make_slice_instr(2, 3, 1, 1),     // s := make([]int, m, m)
+                    slice_instr(3, 3, 2, 4, 0, 0),    // _ = s[1:]
+                    instr("Return"),
+                ],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let p = pkg_with_seq_types(vec![f]);
+        let fid = p.lookup_func("t.F").unwrap();
+        let obs = BoundsChecker.obligations(&p, fid, &no_summaries);
+        assert!(
+            obs.is_empty(),
+            "havoc'd make() args must not obligate locally: {obs:?}"
         );
     }
 }

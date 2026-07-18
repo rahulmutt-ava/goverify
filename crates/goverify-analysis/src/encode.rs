@@ -261,19 +261,25 @@ fn declare_value(p: &Program, func: &Function, v: ValueId, enc: &mut EncodedFunc
     let name = value_name(func, v);
     let t = Term::var(&name, sort.clone());
     enc.consts.push((name, sort.clone()));
-    // The invariant is only sound to bolt on for a value the encoder
-    // DOESN'T otherwise pin down by equation (params — Go's calling
-    // convention guarantees a well-formed header — and unmodeled/havoc'd
-    // values, where assuming the best case is exactly the point). A
-    // `Make{Slice}`/`Slice`-derived dst gets a full defining equation
-    // instead (`op_def`, below): asserting the invariant ON TOP of that
-    // is redundant when the equation is well-formed and, worse, directly
-    // contradictory on an out-of-bounds `Slice` (the exact case bounds
-    // checking needs to keep Sat) — a raw `high - low` can arithmetically
-    // exceed `cap - low`, and forcing `len <= cap` there makes the WHOLE
-    // function's assertion set inconsistent, silently swallowing every
-    // finding in it (Task 8 corpus finding).
-    if sort == seq_datatype().sort() && !is_seq_derived(func, v) {
+    // The invariant is skipped ONLY for an `Op::Slice` dst, not a
+    // `Make{Slice}` one — the two cases are NOT symmetric (review
+    // finding, Task 8 fast-follow):
+    //
+    // - `Make{Slice}`'s len/cap come directly from `make`'s own args,
+    //   and `len<=cap` there is exactly `make`'s own runtime
+    //   precondition: Go's `make([]T, m, n)` panics whenever m>n, so NO
+    //   reachable execution continues past it with m>n — asserting the
+    //   invariant on a `Make{Slice}` dst renders that (correctly) as
+    //   Unsat and masks nothing real.
+    // - `Op::Slice`'s new len/cap are a raw `high-low`/`cap-low`
+    //   arithmetic derivation that CAN legitimately disagree with the
+    //   invariant on an out-of-bounds slice — that disagreement is
+    //   exactly the bug bounds-checking needs to keep Sat, not an
+    //   impossible execution to render Unsat. Forcing the invariant
+    //   there makes the WHOLE function's assertion set inconsistent,
+    //   silently swallowing every finding in it (the original Task 8
+    //   corpus finding, on a `Slice` dst specifically — not `Make`).
+    if sort == seq_datatype().sort() && !is_slice_derived(func, v) {
         seq_invariant(&t, enc);
     }
     if let ValueKind::Const(c) = &info.kind
@@ -285,22 +291,15 @@ fn declare_value(p: &Program, func: &Function, v: ValueId, enc: &mut EncodedFunc
     enc.values.insert(v, t);
 }
 
-/// True iff `v` is the dst of a `Make{Slice}`/`Slice` op somewhere in
-/// `func` — i.e. `op_def` will give it a full defining equation rather
-/// than leaving it as a free header. Linear in `func`'s instruction
-/// count; functions are bounded by `ASSERT_CAP` so this stays cheap.
-fn is_seq_derived(func: &Function, v: ValueId) -> bool {
-    func.blocks.iter().flat_map(|b| &b.instrs).any(|ins| {
-        matches!(
-            &ins.op,
-            Op::Make {
-                dst,
-                kind: MakeKind::Slice,
-                ..
-            } | Op::Slice { dst, .. }
-            if *dst == v
-        )
-    })
+/// True iff `v` is the dst of an `Op::Slice` (NOT `Make{Slice}` — see
+/// the invariant-skip comment at its call site, `declare_value`)
+/// somewhere in `func`. Linear in `func`'s instruction count; functions
+/// are bounded by `ASSERT_CAP` so this stays cheap.
+fn is_slice_derived(func: &Function, v: ValueId) -> bool {
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.instrs)
+        .any(|ins| matches!(&ins.op, Op::Slice { dst, .. } if *dst == v))
 }
 
 /// 0 <= seq-len(t) <= seq-cap(t) (unsigned): every Seq value the
@@ -1362,6 +1361,64 @@ mod tests {
         assert!(
             !text.contains("(= v2"),
             "non-Seq arg: len() dst has no defining equality (havoc'd):\n{text}"
+        );
+    }
+
+    #[test]
+    fn make_slice_dst_keeps_seq_invariant_but_slice_dst_does_not() {
+        use goverify_extract::gvir;
+        // Review finding (Task 8 fast-follow): the two Seq-producing ops
+        // are NOT symmetric. `Make{Slice}`'s len<=cap invariant is
+        // `make`'s own runtime precondition (Go panics on m>n; no
+        // reachable execution has m>n past it) and must stay asserted.
+        // `Op::Slice`'s new len/cap are a raw `high-low`/`cap-low`
+        // derivation that can legitimately disagree with len<=cap on an
+        // out-of-bounds slice (that disagreement IS the bug), so it must
+        // NOT be asserted there.
+        let mk = gvir::Instruction {
+            kind: "MakeSlice".into(),
+            register: 3,
+            r#type: 6, // []int
+            operands: vec![1, 2],
+            ..Default::default()
+        };
+        let f = gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 1), param(2, 1)],
+            blocks: vec![block_p(0, vec![mk, ret(vec![3])], vec![], vec![])],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let text = encode_func(&p, id)
+            .unwrap()
+            .reach_query(0, vec![])
+            .canonical_text();
+        assert!(
+            text.contains("(bvule (seq-len v3) (seq-cap v3))"),
+            "Make{{Slice}} dst DOES carry the seq invariant:\n{text}"
+        );
+
+        let sl = gvir::Instruction {
+            kind: "Slice".into(),
+            register: 3,
+            r#type: 6,         // []int
+            operands: vec![1], // base = p0 ([]int param), low/high/max absent
+            ..Default::default()
+        };
+        let f2 = gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 6)], // []int
+            blocks: vec![block_p(0, vec![sl, ret(vec![3])], vec![], vec![])],
+            ..Default::default()
+        };
+        let (p2, id2) = program_with(f2);
+        let text2 = encode_func(&p2, id2)
+            .unwrap()
+            .reach_query(0, vec![])
+            .canonical_text();
+        assert!(
+            !text2.contains("(bvule (seq-len v3) (seq-cap v3))"),
+            "Slice dst does NOT carry the seq invariant:\n{text2}"
         );
     }
 

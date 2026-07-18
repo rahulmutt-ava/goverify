@@ -27,9 +27,17 @@ Explicit v1 stance from the
   cache directory must be writable only by the user; the temp-dir
   fallback weakens this (a predictable path under a world-writable
   parent) and is deliberately last-resort.
-- **`--solver-cmd` executes a user-supplied binary** (arrives phase 3)
-  — by design; CI configs must treat it like any other executable
-  input.
+- **`--solver-cmd` executes a user-supplied binary** — by design; CI
+  configs must treat it like any other executable input.
+- **Cached model text is stored but not yet rendered.** Solver model
+  output (satisfying assignments from `Z3Native` or `SmtLib2Process`) is
+  stored in the query cache (`CachedOutcome::Sat { model }`, keyed by
+  canonical SMT text ⊕ solver identity); no rendering path exists yet —
+  `Finding` carries no model field and nothing calls `Solver::model()`
+  today. When phase 4 begins rendering models in findings/trace output,
+  the cache trust boundary from the shared-cache clause (above) applies
+  to that text: model text from a shared cache is trusted as if from
+  the original solver.
 - **Untrusted-bytes surfaces** — `.gvir`, `.gvspec`, annotation
   expressions, solver output — are parsed by fuzz-hardened decoders
   (`fuzz/`) that must reject malformed input without panicking.

@@ -52,6 +52,17 @@ Other `debug` subcommands (`callgraph`, `sccs`, `prepass`, `summary`)
 take the same arguments; `--func` filters by substring match on the
 function's SSA id.
 
+### Findings (phase-3 tracer)
+
+```sh
+goverify debug findings            # analyze CWD, print nil-tracer findings
+goverify debug findings --emit-smt /tmp/smt   # dump canonical SMT-LIB2 artifacts
+goverify debug findings --solver-cmd z3       # portable backend instead of built-in Z3
+```
+
+The first `cargo build` compiles a statically-linked Z3 (~20 minutes,
+one-time, cached afterwards).
+
 ## Development
 
 Named tasks (run `mise tasks` for the full list): `build`, `test`,

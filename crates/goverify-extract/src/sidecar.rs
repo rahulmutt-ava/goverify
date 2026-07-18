@@ -18,6 +18,7 @@ pub struct Sidecar {
 pub enum SidecarError {
     Io(io::Error),
     GoBuild(String),
+    GoProbe(String),
     Extractor(String),
 }
 
@@ -27,6 +28,9 @@ impl fmt::Display for SidecarError {
             SidecarError::Io(e) => write!(f, "sidecar io: {e}"),
             SidecarError::GoBuild(stderr) => {
                 write!(f, "building extractor (is `go` installed?): {stderr}")
+            }
+            SidecarError::GoProbe(msg) => {
+                write!(f, "probing go version (is `go` installed?): {msg}")
             }
             SidecarError::Extractor(stderr) => write!(f, "extractor failed: {stderr}"),
         }
@@ -116,18 +120,23 @@ impl Sidecar {
 /// `go1.25.1`), trimmed of surrounding whitespace. Called at most once
 /// per `Sidecar::build`. A failure to spawn `go` surfaces as
 /// `SidecarError::Io` via `?`; a non-zero exit or empty output is
-/// reported as `SidecarError::GoBuild`, the same error class used when
-/// `go` is missing or broken elsewhere in this file.
+/// reported as `SidecarError::GoProbe`.
 fn go_version() -> Result<String, SidecarError> {
     let output = Command::new("go").args(["env", "GOVERSION"]).output()?;
-    if !output.status.success() {
-        return Err(SidecarError::GoBuild(
-            String::from_utf8_lossy(&output.stderr).into_owned(),
+    version_from_output(output.status.success(), &output.stdout, &output.stderr)
+}
+
+/// Pure half of `go_version`: interprets the probe's outcome. Split out
+/// so the error branches are unit-testable without faking a `go` binary.
+fn version_from_output(ok: bool, stdout: &[u8], stderr: &[u8]) -> Result<String, SidecarError> {
+    if !ok {
+        return Err(SidecarError::GoProbe(
+            String::from_utf8_lossy(stderr).into_owned(),
         ));
     }
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let version = String::from_utf8_lossy(stdout).trim().to_string();
     if version.is_empty() {
-        return Err(SidecarError::GoBuild(
+        return Err(SidecarError::GoProbe(
             "`go env GOVERSION` printed no output".to_string(),
         ));
     }
@@ -137,7 +146,7 @@ fn go_version() -> Result<String, SidecarError> {
 /// The sidecar binary's cache key: blake3 over the Go toolchain version
 /// (domain-separated from the file entries below by a distinct tag and
 /// its own length prefix, so it can never collide with file content or
-/// path bytes) followed by (relative path, length, bytes) of every
+/// path bytes) followed by (length-prefixed relative path, length, bytes) of every
 /// non-hidden file in `dir`, in sorted path order.
 ///
 /// Takes `go_version` as a parameter rather than resolving it internally
@@ -151,6 +160,7 @@ fn cache_key(dir: &Path, go_version: &str) -> Result<String, SidecarError> {
     hasher.update(&(go_version.len() as u64).to_le_bytes());
     hasher.update(go_version.as_bytes());
     for rel in &files {
+        hasher.update(&(rel.len() as u64).to_le_bytes());
         hasher.update(rel.as_bytes());
         let bytes = fs::read(dir.join(rel))?;
         hasher.update(&(bytes.len() as u64).to_le_bytes());
@@ -216,19 +226,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_is_stable_across_calls_with_same_go_version() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.go"), "package a\n").unwrap();
-
-        let h1 = cache_key(dir.path(), GO_VERSION).unwrap();
-        let h2 = cache_key(dir.path(), GO_VERSION).unwrap();
-        assert_eq!(
-            h1, h2,
-            "same directory and same Go version must produce identical keys"
-        );
-    }
-
-    #[test]
     fn cache_key_changes_with_go_version() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.go"), "package a\n").unwrap();
@@ -238,6 +235,50 @@ mod tests {
         assert_ne!(
             h1, h2,
             "same directory with a different Go version must produce a different key"
+        );
+    }
+
+    #[test]
+    fn cache_key_path_boundaries_are_unambiguous() {
+        // Without length-prefixed paths, ("ab.go" content "c...") and
+        // ("a.go" renamed) shapes could concatenate identically. Pin
+        // that moving one byte between path and content changes the key.
+        let d1 = tempfile::tempdir().unwrap();
+        std::fs::write(d1.path().join("ab.go"), "x").unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        std::fs::write(d2.path().join("a.go"), "bx").unwrap();
+        assert_ne!(
+            cache_key(d1.path(), GO_VERSION).unwrap(),
+            cache_key(d2.path(), GO_VERSION).unwrap(),
+            "path/content boundary must be domain-separated"
+        );
+    }
+
+    #[test]
+    fn go_version_probe_failure_is_goprobe_with_stderr() {
+        let err = version_from_output(false, b"", b"boom").unwrap_err();
+        match err {
+            SidecarError::GoProbe(msg) => assert_eq!(msg, "boom"),
+            other => panic!("want GoProbe, got {other:?}"),
+        }
+        // Display must say "probing", not "building" (deferred triage item).
+        let text = version_from_output(false, b"", b"boom")
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("probing go version"), "got: {text}");
+    }
+
+    #[test]
+    fn go_version_empty_output_is_goprobe() {
+        let err = version_from_output(true, b"  \n", b"").unwrap_err();
+        assert!(matches!(err, SidecarError::GoProbe(_)));
+    }
+
+    #[test]
+    fn go_version_trims_output() {
+        assert_eq!(
+            version_from_output(true, b"go1.26.5\n", b"").unwrap(),
+            "go1.26.5"
         );
     }
 }

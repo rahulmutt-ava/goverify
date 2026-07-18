@@ -12,11 +12,11 @@ jobs:
   # Nightly tier (spec §12): fuzz campaign; new-CVE sweep on old code.
   fuzz:
     runs-on: ubuntu-latest
-    # Three 900s fuzz runs are 45 min, plus a cold `smt_reader` build: it
-    # pulls goverify-solver -> unconditional vendored z3-sys, i.e. the same
-    # ~20 min CMake Z3 build the differential job budgets for below.
-    # 45 + 20 + setup headroom = 75.
-    timeout-minutes: 75
+    # Four 900s fuzz runs are 60 min, plus a cold `smt_reader`/`ir_encode`
+    # build: both pull goverify-solver -> unconditional vendored z3-sys,
+    # i.e. the same ~20 min CMake Z3 build the differential job budgets
+    # for below. 60 + 20 + setup headroom = 90.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
@@ -26,6 +26,7 @@ jobs:
           workspaces: fuzz -> target
       - run: cargo +nightly fuzz run gvir_decode -- -max_total_time=900
       - run: cargo +nightly fuzz run ir_lower -- -max_total_time=900
+      - run: cargo +nightly fuzz run ir_encode -- -max_total_time=900
       - run: cargo +nightly fuzz run smt_reader -- -max_total_time=900
   audit:
     runs-on: ubuntu-latest

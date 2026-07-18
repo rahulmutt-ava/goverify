@@ -74,5 +74,6 @@ run = [
   "cargo +nightly fuzz run gvir_decode -- -max_total_time=60",
   "cargo +nightly fuzz run ir_lower -- -max_total_time=60",
   "cargo +nightly fuzz run smt_reader -- -max_total_time=60",
+  "cargo +nightly fuzz run ir_encode -- -max_total_time=60",
 ]
 dir = "{{cwd}}"

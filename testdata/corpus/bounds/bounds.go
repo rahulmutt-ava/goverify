@@ -36,3 +36,32 @@ func BadSlice() []int {
 	s := make([]int, 2, 4)
 	return s[1:5] // want: bounds
 }
+
+// div requires b != 0.
+func div(a, b int) int { return a / b }
+
+// BadDiv divides by a constant zero path.
+func BadDiv(a int) int {
+	b := 0
+	return a / b // want: div-zero
+}
+
+// GoodDiv guards.
+func GoodDiv(a, b int) int {
+	if b == 0 {
+		return 0
+	}
+	return a / b
+}
+
+// BadNarrow truncates 300 into an int8.
+func BadNarrow() int8 {
+	x := 300
+	return int8(x) // want: overflow
+}
+
+// GoodNarrow stays in range.
+func GoodNarrow() int8 {
+	x := 100
+	return int8(x)
+}

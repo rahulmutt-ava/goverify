@@ -91,6 +91,29 @@ pub(crate) fn pkg_with_seq_types(functions: Vec<gvir::Function>) -> Program {
     Program::from_packages(vec![package])
 }
 
+/// Package "t" with every integer width/signedness `bounds.rs`'s
+/// div-zero/overflow fixtures need, plus bool for branch conditions:
+/// 1 = int (64 signed), 2 = int8 (8 signed), 3 = int32 (32 signed),
+/// 4 = uint16 (16 unsigned), 5 = uint32 (32 unsigned), 6 = uint64 (64
+/// unsigned), 7 = bool.
+pub(crate) fn pkg_with_int_types(functions: Vec<gvir::Function>) -> Program {
+    let package = gvir::Package {
+        import_path: "t".into(),
+        functions,
+        types: vec![
+            ty(1, "int", gvir::TypeKind::Basic, "int", 0),
+            ty(2, "int8", gvir::TypeKind::Basic, "int8", 0),
+            ty(3, "int32", gvir::TypeKind::Basic, "int32", 0),
+            ty(4, "uint16", gvir::TypeKind::Basic, "uint16", 0),
+            ty(5, "uint32", gvir::TypeKind::Basic, "uint32", 0),
+            ty(6, "uint64", gvir::TypeKind::Basic, "uint64", 0),
+            ty(7, "bool", gvir::TypeKind::Basic, "bool", 0),
+        ],
+        ..Default::default()
+    };
+    Program::from_packages(vec![package])
+}
+
 /// t.F(p *T): FieldAddr p.X in the block layout given.
 pub(crate) fn deref_func(blocks: Vec<gvir::BasicBlock>) -> gvir::Function {
     gvir::Function {
@@ -275,6 +298,19 @@ pub(crate) fn make_slice_instr(
         register: dst_reg,
         r#type: dst_ty,
         operands: vec![len, cap_operand],
+        ..Default::default()
+    }
+}
+
+/// `v<dst_reg> = <dst_ty>(src)`: mirrors lower.rs's `Convert` arm (a
+/// single `v(0)` operand, no `Sem` needed — same shape as
+/// `index_addr_instr`/`slice_instr`).
+pub(crate) fn convert_instr(dst_reg: u32, dst_ty: u32, src: u32) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "Convert".into(),
+        register: dst_reg,
+        r#type: dst_ty,
+        operands: vec![src],
         ..Default::default()
     }
 }

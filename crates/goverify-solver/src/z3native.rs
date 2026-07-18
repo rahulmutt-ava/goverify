@@ -10,8 +10,13 @@ use z3_sys::*;
 use crate::{QueryOutcome, SatResult, SolverLimits, TextSolver};
 
 pub struct Z3Native {
-    ctx: Z3_context,
-    solver: Z3_solver,
+    // `None` means "poisoned": a prior `reset()` couldn't rebuild a fresh
+    // Z3 context/solver. `solve_text` checks this first and degrades to
+    // `Unknown` immediately rather than touching a missing context — see
+    // `reset()`. Only `new()` is allowed to treat construction failure as
+    // fatal (there is no query in flight yet to mark `Unknown`).
+    ctx: Option<Z3_context>,
+    solver: Option<Z3_solver>,
     limits: SolverLimits,
     identity: String,
 }
@@ -23,46 +28,50 @@ unsafe impl Send for Z3Native {}
 /// Z3_get_error_code after each fallible call.
 extern "C" fn quiet_error_handler(_ctx: Z3_context, _e: ErrorCode) {}
 
-fn make_ctx_solver(limits: SolverLimits) -> (Z3_context, Z3_solver) {
-    // z3-sys >= 0.9 wraps every Z3-allocated pointer in `Option<NonNull<_>>`
-    // (null means "Z3 internal error"). These four calls only run at
-    // construction/reset time, on hardcoded inputs Z3 cannot reject — unlike
-    // `solve_text`'s per-query path, there is no degraded value to fall back
-    // to here, so a `None` is treated the same as any other unrecoverable
-    // allocator failure (expect, not a query-time error path).
+/// Builds a fresh context/solver pair, or `None` if Z3 itself failed to
+/// allocate one (out-of-memory or similar internal failure — z3-sys >= 0.9
+/// wraps every Z3-allocated pointer in `Option<NonNull<_>>`, `None` meaning
+/// "Z3 internal error"). Fallible, not `.expect()`-ing, because this also
+/// runs from `reset()`, which is reachable from every `solve_text` error
+/// path — panicking here would breach the "per-query path never panics"
+/// invariant. `new()` is the only caller allowed to treat a `None` as fatal.
+fn make_ctx_solver(limits: SolverLimits) -> Option<(Z3_context, Z3_solver)> {
     unsafe {
-        let cfg = Z3_mk_config().expect("Z3_mk_config");
-        let ctx = Z3_mk_context(cfg).expect("Z3_mk_context");
+        let cfg = Z3_mk_config()?;
+        let ctx = Z3_mk_context(cfg);
         Z3_del_config(cfg);
+        let ctx = ctx?;
         Z3_set_error_handler(ctx, Some(quiet_error_handler));
-        let solver = Z3_mk_solver(ctx).expect("Z3_mk_solver");
+        let solver = Z3_mk_solver(ctx)?;
         Z3_solver_inc_ref(ctx, solver);
-        let params = Z3_mk_params(ctx).expect("Z3_mk_params");
+        let params = Z3_mk_params(ctx)?;
         Z3_params_inc_ref(ctx, params);
-        let timeout = CString::new("timeout").expect("static");
-        let timeout_sym =
-            Z3_mk_string_symbol(ctx, timeout.as_ptr()).expect("Z3_mk_string_symbol(timeout)");
+        let timeout = CString::new("timeout").ok()?;
+        let timeout_sym = Z3_mk_string_symbol(ctx, timeout.as_ptr())?;
         Z3_params_set_uint(ctx, params, timeout_sym, limits.timeout_ms);
-        let max_memory = CString::new("max_memory").expect("static");
-        let max_memory_sym =
-            Z3_mk_string_symbol(ctx, max_memory.as_ptr()).expect("Z3_mk_string_symbol(max_memory)");
+        let max_memory = CString::new("max_memory").ok()?;
+        let max_memory_sym = Z3_mk_string_symbol(ctx, max_memory.as_ptr())?;
         Z3_params_set_uint(ctx, params, max_memory_sym, limits.mem_mb);
         Z3_solver_set_params(ctx, solver, params);
         Z3_params_dec_ref(ctx, params);
-        (ctx, solver)
+        Some((ctx, solver))
     }
 }
 
 impl Z3Native {
     pub fn new(limits: SolverLimits) -> Z3Native {
-        let (ctx, solver) = make_ctx_solver(limits);
+        // Construction time is the one place a `None` here is treated as
+        // fatal: there is no in-flight query to degrade to `Unknown`, and
+        // no prior working context to fall back to either.
+        let (ctx, solver) = make_ctx_solver(limits)
+            .expect("Z3Native::new: Z3 failed to allocate an initial context/solver");
         let identity = unsafe {
             let v = Z3_get_full_version();
             format!("z3native:{}", CStr::from_ptr(v).to_string_lossy())
         };
         Z3Native {
-            ctx,
-            solver,
+            ctx: Some(ctx),
+            solver: Some(solver),
             limits,
             identity,
         }
@@ -70,26 +79,39 @@ impl Z3Native {
 
     /// Tear down and rebuild after any Z3 error: a poisoned context must
     /// not leak into the next query (parent §11 worker-restart semantics).
+    /// If the rebuild itself fails, `self.ctx`/`self.solver` are left as
+    /// `None` — poisoned — rather than panicking; every subsequent
+    /// `solve_text` call sees that and returns `Unknown` immediately
+    /// without touching Z3 again.
     fn reset(&mut self) {
-        unsafe {
-            Z3_solver_dec_ref(self.ctx, self.solver);
-            Z3_del_context(self.ctx);
+        if let (Some(ctx), Some(solver)) = (self.ctx.take(), self.solver.take()) {
+            unsafe {
+                Z3_solver_dec_ref(ctx, solver);
+                Z3_del_context(ctx);
+            }
         }
-        let (ctx, solver) = make_ctx_solver(self.limits);
-        self.ctx = ctx;
-        self.solver = solver;
+        if let Some((ctx, solver)) = make_ctx_solver(self.limits) {
+            self.ctx = Some(ctx);
+            self.solver = Some(solver);
+        }
+        // else: stay poisoned (both fields already `None` from `.take()`).
     }
 
     fn ok(&self) -> bool {
-        unsafe { Z3_get_error_code(self.ctx) == ErrorCode::Ok }
+        match self.ctx {
+            Some(ctx) => unsafe { Z3_get_error_code(ctx) == ErrorCode::Ok },
+            None => false,
+        }
     }
 }
 
 impl Drop for Z3Native {
     fn drop(&mut self) {
-        unsafe {
-            Z3_solver_dec_ref(self.ctx, self.solver);
-            Z3_del_context(self.ctx);
+        if let (Some(ctx), Some(solver)) = (self.ctx, self.solver) {
+            unsafe {
+                Z3_solver_dec_ref(ctx, solver);
+                Z3_del_context(ctx);
+            }
         }
     }
 }
@@ -109,6 +131,12 @@ impl TextSolver for Z3Native {
     }
 
     fn solve_text(&mut self, canonical: &str) -> QueryOutcome {
+        // A poisoned solver (a prior `reset()` couldn't rebuild a Z3
+        // context) must never touch Z3 again — degrade to `Unknown`
+        // immediately rather than unwrapping a missing context.
+        let (Some(ctx), Some(solver)) = (self.ctx, self.solver) else {
+            return UNKNOWN;
+        };
         // The canonical artifact always ends "(check-sat)\n"; Z3's parser
         // only handles declarations/assertions — check-sat is ours.
         let Some(body) = canonical.strip_suffix("(check-sat)\n") else {
@@ -125,12 +153,12 @@ impl TextSolver for Z3Native {
             return UNKNOWN;
         };
         unsafe {
-            Z3_solver_push(self.ctx, self.solver);
+            Z3_solver_push(ctx, solver);
             // z3-sys >= 0.9: a parse failure surfaces as `None` here *and*
             // as a non-Ok error code; check both rather than assuming either
             // implies the other.
             let Some(vec) = Z3_parse_smtlib2_string(
-                self.ctx,
+                ctx,
                 cbody.as_ptr(),
                 0,
                 ptr::null(),
@@ -146,30 +174,30 @@ impl TextSolver for Z3Native {
                 self.reset();
                 return UNKNOWN;
             }
-            for i in 0..Z3_ast_vector_size(self.ctx, vec) {
-                let Some(ast) = Z3_ast_vector_get(self.ctx, vec, i) else {
+            for i in 0..Z3_ast_vector_size(ctx, vec) {
+                let Some(ast) = Z3_ast_vector_get(ctx, vec, i) else {
                     self.reset();
                     return UNKNOWN;
                 };
-                Z3_solver_assert(self.ctx, self.solver, ast);
+                Z3_solver_assert(ctx, solver, ast);
             }
             if !self.ok() {
                 self.reset();
                 return UNKNOWN;
             }
-            let r = Z3_solver_check(self.ctx, self.solver);
+            let r = Z3_solver_check(ctx, solver);
             let outcome = match r {
                 Z3_L_TRUE => {
-                    let text = match Z3_solver_get_model(self.ctx, self.solver) {
+                    let text = match Z3_solver_get_model(ctx, solver) {
                         Some(model) if self.ok() => {
-                            Z3_model_inc_ref(self.ctx, model);
-                            let s_ptr = Z3_model_to_string(self.ctx, model);
+                            Z3_model_inc_ref(ctx, model);
+                            let s_ptr = Z3_model_to_string(ctx, model);
                             let s = if s_ptr.is_null() {
                                 None
                             } else {
                                 Some(CStr::from_ptr(s_ptr).to_string_lossy().into_owned())
                             };
-                            Z3_model_dec_ref(self.ctx, model);
+                            Z3_model_dec_ref(ctx, model);
                             s
                         }
                         _ => None,
@@ -189,7 +217,7 @@ impl TextSolver for Z3Native {
                 self.reset();
                 return UNKNOWN;
             }
-            Z3_solver_pop(self.ctx, self.solver, 1);
+            Z3_solver_pop(ctx, solver, 1);
             outcome
         }
     }
@@ -268,6 +296,27 @@ mod tests {
         let id = solver().identity();
         assert!(id.starts_with("z3native:"), "{id}");
         assert!(id.len() > "z3native:".len(), "{id}");
+    }
+
+    #[test]
+    fn poisoned_solver_returns_unknown_without_panicking() {
+        // Directly construct the poisoned state `reset()` degrades to when
+        // Z3 itself fails to rebuild a context (rather than trying to force
+        // a real Z3 allocation failure, which isn't practically triggerable
+        // from a test): both fields `None`. `solve_text` must see this and
+        // return `Unknown` immediately, never panic, and never touch Z3.
+        let mut s = solver();
+        s.ctx = None;
+        s.solver = None;
+        let out =
+            s.solve_text("(set-logic QF_BV)\n(declare-const b Bool)\n(assert b)\n(check-sat)\n");
+        assert_eq!(
+            out.result,
+            SatResult::Unknown,
+            "poisoned solver must degrade to Unknown, not panic"
+        );
+        // Dropping a poisoned `Z3Native` must not double-free or panic either.
+        drop(s);
     }
 
     #[test]

@@ -12,10 +12,10 @@ gitleaks = "8.30.1"
 # 4.x dropped compatibility with cmake_minimum_required < 3.5.
 cmake = "3.31.12"
 # Pinned z3 CLI for the SmtLib2Process differential backend (Task 7).
-# GitHub release tags are "z3-<ver>" (not bare "<ver>"); 4.12.1 (the
-# brief's preferred pin, matching z3-sys 0.8's historical bundled Z3)
-# resolves cleanly via the ubi backend at this tag spelling.
-"ubi:Z3Prover/z3" = { version = "z3-4.12.1", exe = "z3" }
+# GitHub release tags are "z3-<ver>" (not bare "<ver>"). Matches the
+# bundled Z3 (z3-src 416.0.2) so the differential isolates the process
+# plumbing rather than comparing solver versions.
+"ubi:Z3Prover/z3" = { version = "z3-4.16.0", exe = "z3" }
 
 [tasks.build]
 description = "build all workspace crates"

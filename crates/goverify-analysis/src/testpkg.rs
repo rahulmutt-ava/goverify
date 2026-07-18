@@ -67,6 +67,24 @@ pub fn block(index: u32, instrs: Vec<gvir::Instruction>, succs: Vec<u32>) -> gvi
     }
 }
 
+/// Same shape as `block`, plus explicit `preds` (needed by guard-encoding
+/// tests, which read `Block.preds` directly — `block`'s hand-built
+/// fixtures otherwise leave `preds` empty since `Program::from_packages`
+/// only fills it from the wire).
+pub fn block_p(
+    index: u32,
+    instrs: Vec<gvir::Instruction>,
+    preds: Vec<u32>,
+    succs: Vec<u32>,
+) -> gvir::BasicBlock {
+    gvir::BasicBlock {
+        index,
+        instrs,
+        succs,
+        preds,
+    }
+}
+
 pub fn func(id: &str, blocks: Vec<gvir::BasicBlock>) -> gvir::Function {
     gvir::Function {
         id: id.into(),

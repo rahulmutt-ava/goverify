@@ -3,6 +3,7 @@
 
 mod checker;
 mod effects;
+mod encode;
 mod engine;
 mod prepass;
 mod summary;
@@ -11,6 +12,7 @@ mod testpkg;
 
 pub use checker::{Checker, Finding, Obligation};
 pub use effects::{ChanOp, Effects, Loc, LockOp, Root, Spawns, collect};
+pub use encode::{EncodedFunc, encode_func};
 pub use engine::{
     Analysis, EngineConfig, Options, analyze, analyze_full, dump_findings, dump_prepass,
     dump_summaries,

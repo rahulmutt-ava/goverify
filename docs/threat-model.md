@@ -29,15 +29,20 @@ Explicit v1 stance from the
   parent) and is deliberately last-resort.
 - **`--solver-cmd` executes a user-supplied binary** — by design; CI
   configs must treat it like any other executable input.
-- **Cached model text is stored but not yet rendered.** Solver model
-  output (satisfying assignments from `Z3Native` or `SmtLib2Process`) is
-  stored in the query cache (`CachedOutcome::Sat { model }`, keyed by
-  canonical SMT text ⊕ solver identity); no rendering path exists yet —
-  `Finding` carries no model field and nothing calls `Solver::model()`
-  today. When phase 4 begins rendering models in findings/trace output,
-  the cache trust boundary from the shared-cache clause (above) applies
-  to that text: model text from a shared cache is trusted as if from
-  the original solver.
+- **Model text is now rendered — as untrusted display input, never
+  parsed for verdicts.** `goverify check` (Task 11) prints `Finding.model`
+  (param bindings lifted from the Sat model's own text, `checker.rs`)
+  and the source-echo snippet in its terminal output. Both pass through
+  `render::sanitize` (`crates/goverify-cli/src/render.rs`) first: every
+  C0 control char (`< 0x20`) and DEL (`0x7f`) is stripped, so a
+  crafted/corrupt model or source line can't inject ANSI escapes or
+  otherwise smuggle terminal control sequences into the user's shell.
+  Verdicts (Sat/Unsat/Unknown) come from the solver's own result code
+  computed before any model text is read — sanitization is a display-only
+  concern, not a correctness one. The cache trust boundary from the
+  shared-cache clause (above) still applies to model text sourced from a
+  shared cache: it is trusted as if from the original solver, sanitized
+  the same as any other run's model text.
 - **Untrusted-bytes surfaces** — `.gvir`, `.gvspec`, annotation
   expressions, solver output — are parsed by fuzz-hardened decoders
   (`fuzz/`) that must reject malformed input without panicking.

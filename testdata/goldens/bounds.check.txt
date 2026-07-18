@@ -1,0 +1,25 @@
+bounds.go:25:12: bounds: call to example.com/bounds.get violates its bounds requirement [example.com/bounds.BadCall]
+   25 | return get(s, 7) // want: bounds
+      |            ^
+    path: bounds.go:24
+
+bounds.go:46:11: div-zero: division by zero in example.com/bounds.BadDiv [example.com/bounds.BadDiv]
+   46 | return a / b // want: div-zero
+      |           ^
+    path: bounds.go:46
+    with: p0 = #x0000000000000000
+
+bounds.go:19:10: bounds: index/slice out of bounds in example.com/bounds.BadIndex [example.com/bounds.BadIndex]
+   19 | return s[5] // want: bounds
+      |          ^
+    path: bounds.go:18
+
+bounds.go:60:13: overflow: integer overflow in example.com/bounds.BadNarrow [example.com/bounds.BadNarrow]
+   60 | return int8(x) // want: overflow
+      |             ^
+    path: bounds.go:60
+
+bounds.go:37:10: bounds: index/slice out of bounds in example.com/bounds.BadSlice [example.com/bounds.BadSlice]
+   37 | return s[1:5] // want: bounds
+      |          ^
+    path: bounds.go:36

@@ -34,6 +34,12 @@ pub struct Finding {
     /// The path that leads to the violation (phase-4 spec §10). Filled in
     /// by Task 10; every `Finding` before then carries an empty trace.
     pub trace: Vec<TraceStep>,
+    /// Sat-model param bindings ("p0" -> "(ptr-nil)"), display-only
+    /// (phase-4 spec §10, Task 11): filled in next to `trace` from the
+    /// same Sat model, filtered to `p<i>` names, sorted. Never consulted
+    /// for verdicts — the renderer treats it as untrusted display input
+    /// (sanitized at render time).
+    pub model: Vec<(String, String)>,
 }
 
 /// One step of a `Finding`'s trace: which block the path passes through

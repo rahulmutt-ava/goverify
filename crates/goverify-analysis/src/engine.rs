@@ -269,6 +269,16 @@ pub fn analyze_full(
                                 .as_deref()
                                 .and_then(|m| trace_for(p, f, m))
                                 .unwrap_or_default();
+                            let model = outcome
+                                .model
+                                .as_deref()
+                                .map(|m| {
+                                    crate::encode::model_bindings(m)
+                                        .into_iter()
+                                        .filter(|(name, _)| is_param_binding(name))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
                             per_func.push(Finding {
                                 checker: checker.name().to_string(),
                                 tag: ob.tag.clone(),
@@ -276,6 +286,7 @@ pub fn analyze_full(
                                 pos: ob.pos,
                                 message: ob.message,
                                 trace,
+                                model,
                             });
                         }
                     }
@@ -305,6 +316,15 @@ pub fn analyze_full(
         diagnostics,
         findings,
     }
+}
+
+/// True iff `name` is a `p<i>` encoder param name (same test as
+/// `shared::params_only`, over a model-binding key rather than a
+/// `Term`'s free vars): `Finding.model` only ever surfaces param
+/// bindings, never internal `g<i>`/`v<i>` encoder temporaries.
+fn is_param_binding(name: &str) -> bool {
+    name.strip_prefix('p')
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Reconstruct the violating path for a Sat finding: re-encode (cheap,
@@ -766,6 +786,42 @@ mod tests {
                 model: Some("g0 -> true\n".into()),
             }
         }
+    }
+
+    /// Same shape as `AlwaysSatWithModel`, plus a param binding and a
+    /// non-param `v<i>` encoder temporary in the model text — exercises
+    /// Task 11's `Finding.model` population (filtered to `p<i>` names).
+    struct AlwaysSatWithParamModel;
+    impl TextSolver for AlwaysSatWithParamModel {
+        fn identity(&self) -> String {
+            "always-sat-with-param-model".into()
+        }
+        fn limits(&self) -> SolverLimits {
+            SolverLimits::default()
+        }
+        fn solve_text(&mut self, _canonical: &str) -> goverify_solver::QueryOutcome {
+            goverify_solver::QueryOutcome {
+                result: SatResult::Sat,
+                model: Some("g0 -> true\np0 -> (ptr-nil)\nv3 -> 7\n".into()),
+            }
+        }
+    }
+
+    #[test]
+    fn finding_model_keeps_only_param_bindings() {
+        let p = Program::from_packages(vec![pkg("t", vec![straight("t.F", vec![])])]);
+        let checkers: Vec<&dyn Checker> = vec![&FakeChecker];
+        let cfg = EngineConfig::default();
+        let a = analyze_full(&p, &cfg, &checkers, &|_role| {
+            Box::new(AlwaysSatWithParamModel)
+        });
+        assert_eq!(a.findings.len(), 1);
+        assert_eq!(
+            a.findings[0].model,
+            vec![("p0".to_string(), "(ptr-nil)".to_string())],
+            "g0/v3 are encoder plumbing, not param bindings: {:?}",
+            a.findings
+        );
     }
 
     #[test]

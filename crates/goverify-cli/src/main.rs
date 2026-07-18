@@ -11,6 +11,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use goverify_extract::Sidecar;
 
+mod render;
+
 #[derive(Parser)]
 #[command(
     name = "goverify",
@@ -38,6 +40,34 @@ enum Cmd {
         #[command(subcommand)]
         what: DebugWhat,
     },
+    /// Analyze packages and report findings (spec §10).
+    Check(CheckArgs),
+}
+
+#[derive(clap::Args)]
+struct CheckArgs {
+    /// Directory of pre-extracted .gvir files (omit to extract).
+    #[arg(long)]
+    gvir_dir: Option<PathBuf>,
+    /// Go package patterns for extraction (ignored with --gvir-dir).
+    #[arg(default_value = "./...")]
+    patterns: Vec<String>,
+    /// Dump every canonical SMT-LIB2 query to this directory.
+    #[arg(long)]
+    emit_smt: Option<PathBuf>,
+    /// Solve via an external SMT-LIB2 binary instead of built-in Z3.
+    #[arg(long)]
+    solver_cmd: Option<String>,
+    /// Per-query timeout for requires-inference queries (ms).
+    #[arg(long, default_value_t = 100)]
+    solver_timeout_ms: u32,
+    /// Per-query timeout for obligation (findings) queries (ms) —
+    /// function-sized formulas get more room (spec §8).
+    #[arg(long, default_value_t = 250)]
+    obligation_timeout_ms: u32,
+    /// Query-cache directory (omit to run uncached).
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -90,9 +120,9 @@ struct FindingsArgs {
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        // Exit codes (spec §10): 0 clean, 1 findings (phase 4+),
-        // 2 analyzer error.
+        Ok(code) => code,
+        // Exit codes (spec §10): 0 clean, 1 findings (check only), 2
+        // usage/analyzer error.
         Err(e) => {
             eprintln!("goverify: {e}");
             ExitCode::from(2)
@@ -100,7 +130,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     match Cli::parse().cmd {
         Cmd::Extract { out, patterns } => {
             let sidecar = Sidecar::build(&extractor_dir()?, &sidecar_build_dir())?;
@@ -114,9 +144,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 files.len(),
                 out.display()
             );
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
-        Cmd::Debug { what } => run_debug(what),
+        Cmd::Debug { what } => run_debug(what).map(|()| ExitCode::SUCCESS),
+        Cmd::Check(ca) => run_check(ca),
     }
 }
 
@@ -246,6 +277,63 @@ fn run_findings(fa: FindingsArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     print!("{}", goverify_analysis::dump_findings(&a, None));
     Ok(())
+}
+
+/// `check` (spec §10, this task): the user-facing analyzer entry point.
+/// Two solver-timeout tiers — tight for the per-SCC requires-inference
+/// backend, generous for the sequential findings pass that gates
+/// user-visible output (`BackendRole` doc comment, engine.rs) — unlike
+/// `debug findings`, which keeps one timeout for both roles.
+fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let dargs = DebugArgs {
+        gvir_dir: ca.gvir_dir.clone(),
+        func: None,
+        patterns: ca.patterns.clone(),
+    };
+    let program = load_program(&dargs)?;
+    for d in program.diagnostics() {
+        eprintln!("goverify: {d}");
+    }
+    let infer = goverify_solver::SolverLimits {
+        timeout_ms: ca.solver_timeout_ms,
+        ..Default::default()
+    };
+    let oblig = goverify_solver::SolverLimits {
+        timeout_ms: ca.obligation_timeout_ms,
+        ..Default::default()
+    };
+    let cmd = ca.solver_cmd.clone();
+    let mk: Box<
+        dyn Fn(goverify_analysis::BackendRole) -> Box<dyn goverify_solver::TextSolver> + Sync,
+    > = Box::new(move |role| {
+        let lim = match role {
+            goverify_analysis::BackendRole::Infer => infer,
+            goverify_analysis::BackendRole::Findings => oblig,
+        };
+        match &cmd {
+            Some(c) => Box::new(goverify_solver::SmtLib2Process::new(c, lim)),
+            None => Box::new(goverify_solver::Z3Native::new(lim)),
+        }
+    });
+    let cfg = goverify_analysis::EngineConfig {
+        opts: goverify_analysis::Options::default(),
+        cache_dir: ca.cache_dir.clone(),
+        emit_smt: ca.emit_smt.clone(),
+    };
+    let checkers: Vec<&dyn goverify_analysis::Checker> = vec![
+        &goverify_checkers::NilChecker,
+        &goverify_checkers::BoundsChecker,
+    ];
+    let a = goverify_analysis::analyze_full(&program, &cfg, &checkers, &*mk);
+    for d in &a.diagnostics {
+        eprintln!("goverify: {d}");
+    }
+    print!("{}", render::render_findings(&a.findings, Path::new(".")));
+    Ok(if a.findings.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
 }
 
 /// Locate the vendored extractor sources: explicit override first,

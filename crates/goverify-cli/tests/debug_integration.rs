@@ -43,6 +43,30 @@ fn extract_nil(out: &Path) {
     );
 }
 
+fn extract_bounds(out: &Path) {
+    let st = goverify(
+        &["extract", "--out", out.to_str().unwrap(), "./..."],
+        &repo_root().join("testdata/corpus/bounds"),
+    );
+    assert!(
+        st.status.success(),
+        "extract failed: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+}
+
+fn extract_hello(out: &Path) {
+    let st = goverify(
+        &["extract", "--out", out.to_str().unwrap(), "./..."],
+        &repo_root().join("testdata/corpus/hello"),
+    );
+    assert!(
+        st.status.success(),
+        "extract failed: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+}
+
 #[test]
 fn debug_ir_prints_lowered_function() {
     let dir = tempfile::tempdir().unwrap();
@@ -160,4 +184,90 @@ fn debug_prepass_and_summary_render() {
         );
         assert!(!out.stdout.is_empty(), "debug {what} printed nothing");
     }
+}
+
+#[test]
+fn check_reports_findings_with_exit_1_and_matches_golden() {
+    // Run from the corpus dir so `render_findings`'s `source_root` (CWD,
+    // "."`) resolves the spans it prints back into nil.go. Generous
+    // timeouts on both tiers: avoid a slow-CI Sat->Unknown flake (same
+    // reasoning as nil_corpus.rs's own Z3 backend / debug_findings above).
+    let dir = tempfile::tempdir().unwrap();
+    extract_nil(dir.path());
+    let out = goverify(
+        &[
+            "check",
+            "--gvir-dir",
+            dir.path().to_str().unwrap(),
+            "--solver-timeout-ms",
+            "5000",
+            "--obligation-timeout-ms",
+            "5000",
+        ],
+        &repo_root().join("testdata/corpus/nil"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "findings must exit 1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    goverify_ir::testutil::check_golden("nil.check.txt", &text);
+}
+
+#[test]
+fn check_clean_module_exits_0() {
+    // hello corpus (no findings): exit 0, empty stdout.
+    let dir = tempfile::tempdir().unwrap();
+    extract_hello(dir.path());
+    let out = goverify(
+        &[
+            "check",
+            "--gvir-dir",
+            dir.path().to_str().unwrap(),
+            "--solver-timeout-ms",
+            "5000",
+            "--obligation-timeout-ms",
+            "5000",
+        ],
+        &repo_root().join("testdata/corpus/hello"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean module must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "clean module must print nothing: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn check_bounds_corpus_matches_golden() {
+    let dir = tempfile::tempdir().unwrap();
+    extract_bounds(dir.path());
+    let out = goverify(
+        &[
+            "check",
+            "--gvir-dir",
+            dir.path().to_str().unwrap(),
+            "--solver-timeout-ms",
+            "5000",
+            "--obligation-timeout-ms",
+            "5000",
+        ],
+        &repo_root().join("testdata/corpus/bounds"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "bounds corpus has findings, must exit 1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    goverify_ir::testutil::check_golden("bounds.check.txt", &text);
 }

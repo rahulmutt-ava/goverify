@@ -77,3 +77,7 @@ run = [
   "cargo +nightly fuzz run ir_encode -- -max_total_time=60",
 ]
 dir = "{{cwd}}"
+
+[tasks.shakeout]
+description = "phase-4 shakeout: goverify check over pinned bbolt (manual; clones on first run)"
+run = "scripts/shakeout.sh"

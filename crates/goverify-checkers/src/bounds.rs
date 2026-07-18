@@ -273,10 +273,15 @@ fn convert_violation(ws: u32, ss: bool, wd: u32, sd: bool, x: Term) -> Option<Te
             Term::bv_cmp(BvCmpOp::Ult, lit_sext(ws, max_d_unsigned), x).ok()
         }
         (true, false) => {
-            // signed -> unsigned: x < 0 ∨ (narrowing ? MAX_d <s x : nothing more).
+            // signed -> unsigned: x < 0 ∨ (narrowing ? MAX_d <s x : nothing
+            // more). MAX_d here is the DESTINATION's representable max —
+            // since dst is unsigned, that's 2^wd - 1 (max_d_unsigned), NOT
+            // the signed max 2^(wd-1) - 1: `uint8(200)` from an `int32` is
+            // value-preserving (200 <= 255), so bounding at 127 would flag
+            // every x in [128, 255] as a false positive (review finding).
             let neg = Term::bv_cmp(BvCmpOp::Slt, x.clone(), Term::bv_lit(ws, 0)).ok()?;
             if wd < ws {
-                let hi = Term::bv_cmp(BvCmpOp::Slt, lit_sext(ws, max_d_signed), x).ok()?;
+                let hi = Term::bv_cmp(BvCmpOp::Slt, lit_sext(ws, max_d_unsigned), x).ok()?;
                 Term::or(vec![neg, hi]).ok()
             } else {
                 Some(neg)
@@ -1026,6 +1031,103 @@ mod tests {
         assert!(
             !text.contains("bvult"),
             "same-width signed->unsigned has no second disjunct: {text}"
+        );
+    }
+
+    #[test]
+    fn signed_narrowing_to_unsigned_uses_unsigned_bound() {
+        // Review finding (Task 9 fast-follow): int32(x) -> uint8's high
+        // bound is the DESTINATION's UNSIGNED max (255 = 2^8 - 1), never
+        // the signed max (127 = 2^7 - 1) — `uint8(200)` is value-preserving
+        // in Go (200 <= 255), so bounding at 127 would flag every x in
+        // [128, 255] as a false positive.
+        let f = goverify_extract::gvir::Function {
+            id: "t.F".into(),
+            params: vec![goverify_extract::gvir::Param {
+                id: 1,
+                name: "x".into(),
+                r#type: 3, // int32
+            }],
+            blocks: vec![block(
+                0,
+                vec![convert_instr(2, 8, 1), instr("Return")], // uint8(x)
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let p = pkg_with_int_types(vec![f]);
+        let fid = p.lookup_func("t.F").unwrap();
+        let reqs = BoundsChecker.infer_requires(&p, fid, &no_summaries, &mut z3_discharge());
+        let overflow: Vec<_> = reqs.iter().filter(|c| c.tag == "overflow").collect();
+        assert_eq!(overflow.len(), 1, "one overflow requires: {reqs:?}");
+        let text = Query::for_asserts(Logic::QfBv, vec![overflow[0].formula.term.clone()])
+            .canonical_text();
+        assert!(
+            text.contains("(_ bv255 32)"),
+            "destination's unsigned max (255) at src width 32: {text}"
+        );
+        assert!(
+            !text.contains("(_ bv127 32)"),
+            "must not regress to the signed max as the upper bound: {text}"
+        );
+    }
+
+    #[test]
+    fn signed_narrowing_to_unsigned_discharges_only_truly_out_of_range() {
+        // uint8(x) for a manifest int32 x: 200 fits uint8's UNSIGNED
+        // range (0..=255), so its candidate obligation must discharge
+        // Unsat (the checker always raises a candidate for an
+        // expressible local site — Sat/Unsat discharge is the engine's
+        // job, exercised here directly via `z3_discharge`); 300
+        // genuinely overflows and must discharge Sat — the obligation-
+        // level companion to the requires-level bound check above,
+        // pinning the fix at the discharge boundary too (200 straddles
+        // the wrong signed-max bound of 127 but not the correct
+        // unsigned-max bound of 255).
+        let in_range = goverify_extract::gvir::Function {
+            id: "t.InRange".into(),
+            aux: vec![int_aux(1, 3, 200)], // int32 const 200
+            blocks: vec![block(
+                0,
+                vec![convert_instr(2, 8, 1), instr("Return")],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let out_of_range = goverify_extract::gvir::Function {
+            id: "t.OutOfRange".into(),
+            aux: vec![int_aux(1, 3, 300)], // int32 const 300
+            blocks: vec![block(
+                0,
+                vec![convert_instr(2, 8, 1), instr("Return")],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let p = pkg_with_int_types(vec![in_range, out_of_range]);
+
+        let in_fid = p.lookup_func("t.InRange").unwrap();
+        let in_obs = BoundsChecker.obligations(&p, in_fid, &no_summaries);
+        let in_overflow: Vec<_> = in_obs.iter().filter(|o| o.tag == "overflow").collect();
+        assert_eq!(
+            in_overflow.len(),
+            1,
+            "one overflow obligation candidate: {in_obs:?}"
+        );
+        assert_ne!(
+            z3_discharge()(&in_overflow[0].query),
+            SatResult::Sat,
+            "200 fits uint8's unsigned range, must not discharge Sat: {in_overflow:?}"
+        );
+
+        let out_fid = p.lookup_func("t.OutOfRange").unwrap();
+        let out_obs = BoundsChecker.obligations(&p, out_fid, &no_summaries);
+        let out_overflow: Vec<_> = out_obs.iter().filter(|o| o.tag == "overflow").collect();
+        assert_eq!(out_overflow.len(), 1, "300 overflows uint8: {out_obs:?}");
+        assert_eq!(
+            z3_discharge()(&out_overflow[0].query),
+            SatResult::Sat,
+            "300 truly overflows uint8: {out_overflow:?}"
         );
     }
 }

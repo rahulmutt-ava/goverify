@@ -95,7 +95,7 @@ pub(crate) fn pkg_with_seq_types(functions: Vec<gvir::Function>) -> Program {
 /// div-zero/overflow fixtures need, plus bool for branch conditions:
 /// 1 = int (64 signed), 2 = int8 (8 signed), 3 = int32 (32 signed),
 /// 4 = uint16 (16 unsigned), 5 = uint32 (32 unsigned), 6 = uint64 (64
-/// unsigned), 7 = bool.
+/// unsigned), 7 = bool, 8 = uint8 (8 unsigned).
 pub(crate) fn pkg_with_int_types(functions: Vec<gvir::Function>) -> Program {
     let package = gvir::Package {
         import_path: "t".into(),
@@ -108,6 +108,7 @@ pub(crate) fn pkg_with_int_types(functions: Vec<gvir::Function>) -> Program {
             ty(5, "uint32", gvir::TypeKind::Basic, "uint32", 0),
             ty(6, "uint64", gvir::TypeKind::Basic, "uint64", 0),
             ty(7, "bool", gvir::TypeKind::Basic, "bool", 0),
+            ty(8, "uint8", gvir::TypeKind::Basic, "uint8", 0),
         ],
         ..Default::default()
     };

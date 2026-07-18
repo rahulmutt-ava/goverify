@@ -2,7 +2,7 @@
 //! IR → engine → Z3 → finding, plus artifact determinism.
 
 use goverify_analysis::{EngineConfig, Options, analyze_full, dump_findings};
-use goverify_checkers::NilTracer;
+use goverify_checkers::NilChecker;
 use goverify_solver::{SolverLimits, Z3Native};
 
 fn limits() -> SolverLimits {
@@ -21,7 +21,7 @@ fn run(emit: Option<std::path::PathBuf>) -> String {
         cache_dir: None,
         emit_smt: emit,
     };
-    let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&NilTracer];
+    let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&NilChecker];
     let a = analyze_full(&p, &cfg, &checkers, &|_role| {
         Box::new(Z3Native::new(limits()))
     });
@@ -31,16 +31,29 @@ fn run(emit: Option<std::path::PathBuf>) -> String {
 }
 
 #[test]
-fn nil_corpus_findings_match_golden() {
-    let text = run(None);
-    assert_eq!(text.lines().count(), 1, "exactly one finding:\n{text}");
-    assert!(
-        text.contains("nil.go"),
-        "position points into nil.go:\n{text}"
-    );
-    assert!(text.contains("Bad"), "finding is in Bad:\n{text}");
-    assert!(!text.contains("Good"), "no finding in Good:\n{text}");
-    goverify_ir::testutil::check_golden("nil.findings.txt", &text);
+fn nil_corpus_findings_match_want_comments() {
+    let p = goverify_ir::testutil::load_corpus("nil");
+    let cfg = EngineConfig {
+        opts: Options::default(),
+        cache_dir: None,
+        emit_smt: None,
+    };
+    let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&NilChecker];
+    let a = analyze_full(&p, &cfg, &checkers, &|_role| {
+        Box::new(Z3Native::new(limits()))
+    });
+    let got: std::collections::BTreeSet<(String, u32, String)> = a
+        .findings
+        .iter()
+        .filter(|f| f.func.contains("example.com/nil"))
+        .filter_map(|f| {
+            let pos = f.pos.as_ref()?;
+            Some((pos.file.clone(), pos.line, f.tag.clone()))
+        })
+        .collect();
+    let want: std::collections::BTreeSet<(String, u32, String)> =
+        goverify_ir::testutil::wants("nil").into_iter().collect();
+    assert_eq!(got, want, "findings vs want comments");
 }
 
 #[test]

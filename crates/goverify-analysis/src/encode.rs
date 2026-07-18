@@ -19,9 +19,18 @@ use goverify_solver::{
 /// Slices/strings as length-carrying opaque values: contents havoc,
 /// bounds reasoning uses len/cap only. Invariant 0 <= len <= cap is
 /// asserted for every Seq-sorted value the encoder introduces.
+///
+/// Named `GoSeq`, NOT `Seq`: under `(set-logic ALL)` Z3 pre-registers a
+/// builtin sort literally named `Seq` (its native sequence theory), so
+/// `(declare-datatypes ((Seq 0)) ...)` fails to parse ("sort already
+/// defined Seq") — every `discharge_query` call then sees a non-Ok error
+/// code, resets the context, and reports `Unknown`, silently swallowing
+/// every finding that touches a slice/string-typed value. Caught here
+/// because Task 6 is the first caller to actually discharge an
+/// `encode_func`-produced query through Z3Native.
 pub fn seq_datatype() -> DatatypeDecl {
     DatatypeDecl {
-        name: "Seq".into(),
+        name: "GoSeq".into(),
         ctors: vec![CtorDecl {
             name: "seq-val".into(),
             fields: vec![

@@ -239,7 +239,7 @@ fn run_findings(fa: FindingsArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         None => Box::new(move |_role| Box::new(goverify_solver::Z3Native::new(limits))),
     };
-    let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&goverify_checkers::NilTracer];
+    let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&goverify_checkers::NilChecker];
     let a = goverify_analysis::analyze_full(&program, &cfg, &checkers, &*mk);
     for d in &a.diagnostics {
         eprintln!("goverify: {d}");

@@ -1,52 +1,66 @@
-//! NilTracer (phase-3 spec §8): the nil checker's embryo. Deliberately
-//! minimal — entry-block unconditional derefs + constant-nil call args —
-//! it exists to prove extractor→IR→engine→cache→Z3→finding end to end.
-//! Phase 4 replaces the heuristics with real path-sensitive analysis
-//! behind the same Checker trait.
+//! NilChecker (phase-4 spec §4): path-sensitive nil-safety on the gated
+//! SSA encoding. Requires-inference covers every deref site whose nil
+//! path is reachable (Sat-gated); requires propagate bottom-up through
+//! call sites when the instantiated callee clause stays expressible
+//! over this function's params. Obligations (call-site + manifest-local)
+//! are raised in `obligations` under the function's own preconditions.
 
 use goverify_analysis::{
-    Checker, Clause, Formula, IfaceVar, Obligation, Summary, iface_var_name, instantiate_requires,
+    Checker, Clause, Formula, Obligation, Summary, encode_func, instantiate_requires,
 };
-use goverify_ir::{Callee, ConstVal, FuncId, Op, Program, TypeKind, ValueKind};
-use goverify_solver::{Logic, Query, SatResult, Term, ptr_nil, ptr_sort};
+use goverify_ir::{
+    Callee, ConstVal, FuncId, Function, Op, Pos, Program, TypeKind, ValueId, ValueKind,
+};
+use goverify_solver::{Logic, Query, SatResult, Term, ptr_is_nil, ptr_nil};
 
-pub struct NilTracer;
+pub struct NilChecker;
 
-/// Pointer-typed param derefs in the ENTRY block only: unconditional by
-/// construction, no path condition needed.
-fn entry_block_deref_params(p: &Program, f: FuncId) -> Vec<u32> {
-    let Some(func) = p.func(f) else {
-        return Vec::new();
-    };
-    let Some(entry) = func.blocks.first() else {
-        return Vec::new();
-    };
+/// All (block index, instr index, address ValueId, pos) deref sites:
+/// every `Load`/`Store`/`FieldAddr`/`Field` whose subject is
+/// pointer-typed. Reused by Task 7/8's checkers.
+pub(crate) fn deref_sites(
+    p: &Program,
+    func: &Function,
+) -> Vec<(usize, usize, ValueId, Option<Pos>)> {
     let mut out = Vec::new();
-    for ins in &entry.instrs {
-        let subject = match &ins.op {
-            Op::Load { addr, .. } | Op::Store { addr, .. } => *addr,
-            Op::FieldAddr { base, .. } | Op::Field { base, .. } => *base,
-            _ => continue,
-        };
-        let info = func.value(subject);
-        if !matches!(info.kind, ValueKind::Param) {
-            continue;
-        }
-        if !matches!(p.types().kind(info.ty), TypeKind::Pointer { .. }) {
-            continue;
-        }
-        if let Some(idx) = func.params.iter().position(|&pv| pv == subject) {
-            let idx = idx as u32;
-            if !out.contains(&idx) {
-                out.push(idx);
+    for (bi, b) in func.blocks.iter().enumerate() {
+        for (ii, ins) in b.instrs.iter().enumerate() {
+            let subject = match &ins.op {
+                Op::Load { addr, .. } | Op::Store { addr, .. } => *addr,
+                Op::FieldAddr { base, .. } | Op::Field { base, .. } => *base,
+                _ => continue,
+            };
+            if !matches!(
+                p.types().kind(func.value(subject).ty),
+                TypeKind::Pointer { .. }
+            ) {
+                continue;
             }
+            out.push((bi, ii, subject, ins.pos.clone()));
         }
     }
-    out.sort_unstable();
     out
 }
 
-impl Checker for NilTracer {
+/// True iff every free var of `t` is a p<i> param name: the only vars a
+/// requires-clause (evaluated at the callee's own entry, or bound at a
+/// call site) may depend on.
+pub(crate) fn params_only(t: &Term) -> bool {
+    t.free_vars().keys().all(|n| {
+        n.strip_prefix('p')
+            .is_some_and(|rest| rest.parse::<u32>().is_ok())
+    })
+}
+
+/// Push a clause unless an equal one is present (fixpoint-friendly dedup;
+/// `infer_requires` reruns on every round of a recursive SCC's fixpoint).
+fn push_clause(out: &mut Vec<Clause>, c: Clause) {
+    if !out.contains(&c) {
+        out.push(c);
+    }
+}
+
+impl Checker for NilChecker {
     fn name(&self) -> &'static str {
         "nil"
     }
@@ -55,32 +69,87 @@ impl Checker for NilTracer {
         &self,
         p: &Program,
         f: FuncId,
-        _summary_of: &dyn Fn(FuncId) -> Summary,
+        summary_of: &dyn Fn(FuncId) -> Summary,
         discharge: &mut dyn FnMut(&Query) -> SatResult,
     ) -> Vec<Clause> {
+        let Some(func) = p.func(f) else {
+            return Vec::new();
+        };
+        let Ok(enc) = encode_func(p, f) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
-        for idx in entry_block_deref_params(p, f) {
-            let name = iface_var_name(&IfaceVar::Param(idx));
-            let pvar = Term::var(&name, ptr_sort());
-            let Ok(is_nil) = goverify_solver::ptr_is_nil(pvar.clone()) else {
+        // Own deref sites: every subject whose nil path is reachable
+        // (Sat-gated) and expressible over this function's own params.
+        for (bi, _ii, subject, _pos) in deref_sites(p, func) {
+            let Some(subj) = enc.value(subject).cloned() else {
                 continue;
             };
-            // Sat = the nil path exists => the deref needs a precondition.
-            // Anything else (incl. Unknown) => stay silent (parent §8).
-            if discharge(&Query::for_asserts(Logic::All, vec![is_nil.clone()])) != SatResult::Sat {
+            let Ok(is_nil) = ptr_is_nil(subj) else {
                 continue;
+            };
+            if !params_only(&is_nil) {
+                continue; // not expressible as a precondition over params
+            }
+            if discharge(&enc.reach_query(bi, vec![is_nil.clone()])) != SatResult::Sat {
+                continue; // guarded (unsat) or unknown: stay silent
             }
             let Ok(nonnil) = Term::not(is_nil) else {
                 continue;
             };
-            out.push(Clause {
-                tag: "nil-deref".into(),
-                formula: Formula { term: nonnil },
-            });
+            push_clause(
+                &mut out,
+                Clause {
+                    tag: "nil-deref".into(),
+                    formula: Formula { term: nonnil },
+                },
+            );
+        }
+        // Propagated: violable callee requires expressible over this
+        // function's own params, bottom-up through the SCC fixpoint.
+        for (bi, ins) in func
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(bi, b)| b.instrs.iter().map(move |i| (bi, i)))
+        {
+            let Op::Call {
+                callee: Callee::Static(c),
+                args,
+                ..
+            } = &ins.op
+            else {
+                continue;
+            };
+            let arg_terms: Vec<Option<Term>> =
+                args.iter().map(|a| enc.value(*a).cloned()).collect();
+            for bc in instantiate_requires(&summary_of(*c), &arg_terms) {
+                if bc.tag != "nil-deref" {
+                    continue; // this checker only owns its own tag
+                }
+                let (Some(bound), Some(violation)) = (bc.bound, bc.violation) else {
+                    continue;
+                };
+                if !params_only(&bound) {
+                    continue;
+                }
+                if discharge(&enc.reach_query(bi, vec![violation])) != SatResult::Sat {
+                    continue;
+                }
+                push_clause(
+                    &mut out,
+                    Clause {
+                        tag: "nil-deref".into(),
+                        formula: Formula { term: bound },
+                    },
+                );
+            }
         }
         out
     }
 
+    // `obligations` keeps its Task-5-adapted phase-3 body in this task
+    // (const-nil call args only) — Task 7 replaces it wholesale.
     fn obligations(
         &self,
         p: &Program,
@@ -165,8 +234,9 @@ mod tests {
         }
     }
 
-    /// Package "t" with the struct-pointer type pair (1 = T, 2 = *T)
-    /// and the given functions.
+    /// Package "t" with the struct-pointer type pair (1 = T, 2 = *T), a
+    /// bool type (3, for Branch conditions built from a comparison), and
+    /// the given functions.
     fn pkg_with_ptr_types(functions: Vec<gvir::Function>) -> Program {
         let package = gvir::Package {
             import_path: "t".into(),
@@ -174,6 +244,7 @@ mod tests {
             types: vec![
                 ty(1, "T", gvir::TypeKind::Struct, "", 0),
                 ty(2, "*T", gvir::TypeKind::Pointer, "", 1),
+                ty(3, "bool", gvir::TypeKind::Basic, "bool", 0),
             ],
             ..Default::default()
         };
@@ -214,6 +285,52 @@ mod tests {
         )])])
     }
 
+    fn branch_on(operand: u32) -> gvir::Instruction {
+        let mut b = instr("If");
+        b.operands = vec![operand];
+        b
+    }
+
+    /// v<dst> = (lhs == rhs) as bool: mirrors lower.rs's BinOp arm.
+    fn eq_instr(dst: u32, lhs: u32, rhs: u32) -> gvir::Instruction {
+        gvir::Instruction {
+            kind: "BinOp".into(),
+            register: dst,
+            r#type: 3, // bool
+            operands: vec![lhs, rhs],
+            sem: Some(Sem::Binop(gvir::BinOpSem { op: "==".into() })),
+            ..Default::default()
+        }
+    }
+
+    /// A nil *T aux constant at the given id.
+    fn nil_aux(id: u32) -> gvir::AuxValue {
+        gvir::AuxValue {
+            id,
+            kind: "Const".into(),
+            repr: "nil".into(),
+            r#type: 2,
+            r#const: Some(gvir::ConstValue {
+                value: Some(gvir::const_value::Value::Nil(true)),
+            }),
+        }
+    }
+
+    /// A static call instruction: operands = [callee-slot(unused), args…]
+    /// (mirrors lower.rs's non-invoke call convention). `dst_reg` 0 means
+    /// no destination (statement call).
+    fn call_static(callee: &str, dst_reg: u32, dst_ty: u32, args: Vec<u32>) -> gvir::Instruction {
+        let mut c = instr("Call");
+        c.register = dst_reg;
+        c.r#type = dst_ty;
+        c.operands = std::iter::once(0).chain(args).collect();
+        c.sem = Some(Sem::Call(gvir::CallSem {
+            static_callee: callee.into(),
+            ..Default::default()
+        }));
+        c
+    }
+
     fn z3_discharge() -> impl FnMut(&Query) -> SatResult {
         let mut solver = Z3Native::new(SolverLimits {
             timeout_ms: 5_000,
@@ -222,19 +339,154 @@ mod tests {
         move |q| discharge_query(q, &mut solver, None, None).result
     }
 
-    /// `infer_requires` never needs a callee's summary yet (T6 rewrite
-    /// changes that) — these tests just need something of the right shape.
+    /// A `summary_of` that never has anything to say (used by tests that
+    /// don't exercise requires propagation).
     fn no_summaries(_f: goverify_ir::FuncId) -> Summary {
         Summary::default()
     }
 
     #[test]
     fn unguarded_param_deref_infers_nonnil_requires() {
-        let p = deref_program();
+        // Deref moved to block 1, unconditionally jumped to from block 0:
+        // no branch, so no path condition needed — still infers.
+        let p = pkg_with_ptr_types(vec![deref_func(vec![
+            block(0, vec![instr("Jump")], vec![1]),
+            block(1, vec![field_addr_on_param(), instr("Return")], vec![]),
+        ])]);
         let f = p.lookup_func("t.F").unwrap();
-        let reqs = NilTracer.infer_requires(&p, f, &no_summaries, &mut z3_discharge());
+        let reqs = NilChecker.infer_requires(&p, f, &no_summaries, &mut z3_discharge());
         assert_eq!(reqs.len(), 1, "one deref'd pointer param: {reqs:?}");
         assert_eq!(reqs[0].tag, "nil-deref");
+    }
+
+    #[test]
+    fn guarded_deref_infers_nothing() {
+        // if p == nil { return }; deref in the else block. reach(deref)
+        // implies p != nil, so reach ∧ nil is UNSAT: no clause. This is
+        // the entry-block-panic FP class fix — the phase-3 heuristic
+        // could not see this; now the guard is a path condition.
+        let mut f = deref_func(vec![
+            block(0, vec![eq_instr(3, 1, 4), branch_on(3)], vec![1, 2]),
+            block(1, vec![instr("Return")], vec![]),
+            block(2, vec![field_addr_on_param(), instr("Return")], vec![]),
+        ]);
+        f.aux = vec![nil_aux(4)];
+        let p = pkg_with_ptr_types(vec![f]);
+        let f = p.lookup_func("t.F").unwrap();
+        let reqs = NilChecker.infer_requires(&p, f, &no_summaries, &mut z3_discharge());
+        assert!(
+            reqs.is_empty(),
+            "guarded deref must infer nothing: {reqs:?}"
+        );
+    }
+
+    #[test]
+    fn conditionally_reachable_deref_still_infers() {
+        // if c { deref(p) } — reach ∧ nil is SAT (c free): clause emitted.
+        // (Conditional-deref requires are deliberate — spec §4.)
+        let mut f = deref_func(vec![
+            block(0, vec![branch_on(3)], vec![1, 2]),
+            block(1, vec![field_addr_on_param(), instr("Return")], vec![]),
+            block(2, vec![instr("Return")], vec![]),
+        ]);
+        f.params.push(gvir::Param {
+            id: 3,
+            name: "c".into(),
+            r#type: 3, // bool
+        });
+        let p = pkg_with_ptr_types(vec![f]);
+        let func = p.lookup_func("t.F").unwrap();
+        let reqs = NilChecker.infer_requires(&p, func, &no_summaries, &mut z3_discharge());
+        assert_eq!(
+            reqs.len(),
+            1,
+            "conditional deref still needs a requires: {reqs:?}"
+        );
+        assert_eq!(reqs[0].tag, "nil-deref");
+    }
+
+    #[test]
+    fn requires_propagate_through_call_sites() {
+        // t.F(p) { deref p }  t.G(q) { t.F(q) } — G must inherit
+        // requires ¬nil(q) via instantiate_requires + summary_of.
+        let f_func = deref_func(vec![block(
+            0,
+            vec![field_addr_on_param(), instr("Return")],
+            vec![],
+        )]);
+        let g_func = gvir::Function {
+            id: "t.G".into(),
+            params: vec![gvir::Param {
+                id: 1,
+                name: "q".into(),
+                r#type: 2,
+            }],
+            blocks: vec![block(
+                0,
+                vec![call_static("t.F", 0, 0, vec![1]), instr("Return")],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let p = pkg_with_ptr_types(vec![f_func, g_func]);
+        let f_id = p.lookup_func("t.F").unwrap();
+        let g_id = p.lookup_func("t.G").unwrap();
+        let freqs = NilChecker.infer_requires(&p, f_id, &no_summaries, &mut z3_discharge());
+        assert!(!freqs.is_empty(), "precondition of this test");
+        let summary_of = |fid: goverify_ir::FuncId| {
+            let mut s = Summary::default();
+            if fid == f_id {
+                s.requires = freqs.clone();
+            }
+            s
+        };
+        let greqs = NilChecker.infer_requires(&p, g_id, &summary_of, &mut z3_discharge());
+        assert_eq!(greqs.len(), 1, "G inherits F's requires: {greqs:?}");
+        assert_eq!(greqs[0].tag, "nil-deref");
+        let fv = greqs[0].formula.term.free_vars();
+        let free: Vec<&String> = fv.keys().collect();
+        assert_eq!(free, vec!["p0"], "propagated formula is over G's own p0");
+    }
+
+    #[test]
+    fn propagation_stops_at_unexpressible_args() {
+        // t.H() { t.F(load-result) } — arg term is a havoc'd v<id>:
+        // free vars ⊄ params ⇒ no clause on H.
+        let f_func = deref_func(vec![block(
+            0,
+            vec![field_addr_on_param(), instr("Return")],
+            vec![],
+        )]);
+        let h_func = gvir::Function {
+            id: "t.H".into(),
+            blocks: vec![block(
+                0,
+                vec![
+                    call_static("t.K", 2, 2, vec![]),
+                    call_static("t.F", 0, 0, vec![2]),
+                    instr("Return"),
+                ],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let p = pkg_with_ptr_types(vec![f_func, h_func]);
+        let f_id = p.lookup_func("t.F").unwrap();
+        let h_id = p.lookup_func("t.H").unwrap();
+        let freqs = NilChecker.infer_requires(&p, f_id, &no_summaries, &mut z3_discharge());
+        assert!(!freqs.is_empty(), "precondition of this test");
+        let summary_of = |fid: goverify_ir::FuncId| {
+            let mut s = Summary::default();
+            if fid == f_id {
+                s.requires = freqs.clone();
+            }
+            s
+        };
+        let hreqs = NilChecker.infer_requires(&p, h_id, &summary_of, &mut z3_discharge());
+        assert!(
+            hreqs.is_empty(),
+            "havoc'd call arg is not expressible over H's params: {hreqs:?}"
+        );
     }
 
     #[test]
@@ -243,36 +495,10 @@ mod tests {
         let f = p.lookup_func("t.F").unwrap();
         let mut always_unknown = |_q: &Query| SatResult::Unknown;
         assert!(
-            NilTracer
+            NilChecker
                 .infer_requires(&p, f, &no_summaries, &mut always_unknown)
                 .is_empty(),
             "Unknown must not manufacture requires (parent spec §8)"
-        );
-    }
-
-    #[test]
-    fn guarded_deref_in_later_block_infers_nothing() {
-        // Entry block only branches; the deref lives in block 1 — the
-        // entry-block-only tracer must stay silent.
-        let p = pkg_with_ptr_types(vec![deref_func(vec![
-            block(
-                0,
-                vec![{
-                    let mut b = instr("If");
-                    b.operands = vec![1];
-                    b
-                }],
-                vec![1, 2],
-            ),
-            block(1, vec![field_addr_on_param(), instr("Return")], vec![]),
-            block(2, vec![instr("Return")], vec![]),
-        ])]);
-        let f = p.lookup_func("t.F").unwrap();
-        assert!(
-            NilTracer
-                .infer_requires(&p, f, &no_summaries, &mut z3_discharge())
-                .is_empty(),
-            "non-entry deref must infer nothing in phase 3"
         );
     }
 
@@ -326,9 +552,9 @@ mod tests {
         ]);
         let callee_id = p.lookup_func("t.F").unwrap();
         let caller_id = p.lookup_func("t.Caller").unwrap();
-        // Give t.F the requires the tracer itself would infer.
+        // Give t.F the requires the checker itself would infer.
         let requires: Vec<Clause> =
-            NilTracer.infer_requires(&p, callee_id, &no_summaries, &mut z3_discharge());
+            NilChecker.infer_requires(&p, callee_id, &no_summaries, &mut z3_discharge());
         assert!(!requires.is_empty(), "precondition of this test");
         let summary_of = |f: goverify_ir::FuncId| {
             let mut s = Summary::default();
@@ -337,7 +563,7 @@ mod tests {
             }
             s
         };
-        let obs = NilTracer.obligations(&p, caller_id, &summary_of);
+        let obs = NilChecker.obligations(&p, caller_id, &summary_of);
         assert_eq!(obs.len(), 1, "only the const-nil call obligates: {obs:?}");
         assert_eq!(obs[0].tag, "nil-deref");
         let verdict = z3_discharge()(&obs[0].query);

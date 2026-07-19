@@ -745,3 +745,38 @@ only — upstreaming to etcd-io/bbolt is a separate user decision (design
   classes above stand in as forward-looking red/green corpus targets
   for whichever future task fixes them.
 - **dispatch-precision observations**: recorded above — none observed.
+
+### Corpus pins
+
+Task 5 (`testdata/corpus/knownfp/knownfp.go`,
+`crates/goverify-checkers/tests/knownfp_corpus.rs`) pins CURRENT
+(wrong) analyzer behavior for confirmed FP mechanisms, superseding the
+original per-class pin plan: with 438 confirmed-FP findings across
+~437 classes, one pin per class is not viable. Instead, one minimal
+pin per FP *mechanism group* (the encoding-mechanism buckets above, the
+dominant invariant mechanisms, and the requires-lifting canonical
+shapes), each citing 1-3 exemplar class ids. 9 pins reproduced; 3
+mechanisms did not minimally reproduce outside bbolt's own context and
+are recorded below instead.
+
+**Pinned (9):**
+
+| pin function(s) | mechanism group | exemplar classes |
+|---|---|---|
+| `BuildSurgeryOptions` / `baseOptions.Validate` | FP/encoding — address-of stack-local / composite-literal / slice-element / value-typed field (group 2) | C009b, C002b |
+| `ReadElem` / `elemAt` | FP/encoding — unsafe-pointer / pointer-arithmetic derived value (group 3; manifests as a `bounds` finding in this checker snapshot rather than `nil-deref`) | C001, C057, C033 |
+| `Tail` | FP/encoding — other/misc: reslice already guarded by a same-function length check (group 6) | C062 |
+| `UseBucket` / `newBucket` / `bucket.Depth` | FP/invariant — field set at every construction site before exposure | C002a, C017b |
+| `UseHandle` / `newHandle` / `handleID` | FP/invariant — err==nil ⇒ result!=nil paired-return contract of a callee, checked locally | C025, C004a |
+| `Compact` / `beginTx` / `commitFn` / `commitTx` | FP/requires-lifting — err==nil ⇒ result!=nil postcondition not lifted across a call boundary, re-derived across a second guarded reassignment (report's own canonical example) | C009c |
+| `Use` / `maybeSession` / `closeSession` | FP/requires-lifting — caller's prior (inline) dereference not carried into a callee's own nil-receiver check | C031a, C053b |
+| `First` / `tail` | FP/requires-lifting — caller's length guard not lifted across the call boundary into the callee's index | C403, C218a |
+| `BranchElemOffset` / `elemOffset` | FP/requires-lifting — bound-derived obligation (a `uint16` domain) kept local instead of lifted to the caller | C101 |
+
+**Not minimally reproducible (3), recorded instead of pinned:**
+
+| mechanism | exemplar classes | why dropped |
+|---|---|---|
+| FP/encoding group 1 — same-function dominating check not carried forward | C015a, C007a, C012 | Every minimal repro tried (a receiver from a branching constructor, a bare field/pointer-chain `!= nil` comparison checked twice around an intervening call, both flat map-field and two-hop pointer-field forms) produced no finding at either check. This checker snapshot does not appear to attach a nil-deref obligation to a bare `!= nil` comparison read in isolation — only to reads that flow into a further call, index, or arithmetic operation — so the mechanism doesn't reproduce standalone. |
+| FP/encoding group 4 — stdlib constructor documented never-nil | C003 | Reproducing it needs a genuine external-package constructor (the point is that the analyzer treats an opaque dependency's return as generically nilable). Pulling in a real stdlib package ("flag") to test this dragged its entire transitive closure into the corpus's whole-DAG analysis and empirically blew the single-test run past 30 minutes — unacceptable for a blocking-tier corpus test — so this was reverted before it could even be assessed for correctness. |
+| FP/encoding group 5 — nil-map range is legal | C038 | Same underlying reason as group 1 above: ranging over a map field used only for a nil-safe operation (`range`, which never dereferences a nil map) didn't register as an obligation site in either a bare-map-field or two-hop pointer-field form. |

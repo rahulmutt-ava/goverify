@@ -1,6 +1,3 @@
-// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
-// See the file LICENSE for licensing terms.
-
 //! Human terminal rendering of `Finding`s (phase-4 spec §5, `check`
 //! subcommand, Task 11): span + caret snippet, violation path, model
 //! bindings, fired-clause message. Source-derived text (the snippet echo,

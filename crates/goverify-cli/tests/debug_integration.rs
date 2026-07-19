@@ -217,6 +217,70 @@ fn check_reports_findings_with_exit_1_and_matches_golden() {
 }
 
 #[test]
+fn check_scopes_findings_to_the_module() {
+    // The nil corpus has known findings under `example.com/nil`. Running
+    // `check` with a `--scope` that matches NO package must filter every
+    // one of them out: empty stdout and exit 0, even though the whole-
+    // closure analysis still produced findings internally. This exercises
+    // the scoping filter end-to-end through the CLI (rendering AND exit
+    // code key off the scoped set), deterministically and without relying
+    // on a stdlib dependency to leak findings.
+    let dir = tempfile::tempdir().unwrap();
+    extract_nil(dir.path());
+    let out = goverify(
+        &[
+            "check",
+            "--gvir-dir",
+            dir.path().to_str().unwrap(),
+            "--scope",
+            "example.com/not-this-module",
+            "--solver-timeout-ms",
+            "5000",
+            "--obligation-timeout-ms",
+            "5000",
+        ],
+        &repo_root().join("testdata/corpus/nil"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an out-of-scope filter leaves no findings, so exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "out-of-scope filter must render nothing: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Sanity: scoping to the module itself keeps exactly the in-module
+    // findings, and every rendered line references an `example.com/nil`
+    // function — no dependency/stdlib finding leaks in.
+    let scoped = goverify(
+        &[
+            "check",
+            "--gvir-dir",
+            dir.path().to_str().unwrap(),
+            "--scope",
+            "example.com/nil",
+            "--solver-timeout-ms",
+            "5000",
+            "--obligation-timeout-ms",
+            "5000",
+        ],
+        &repo_root().join("testdata/corpus/nil"),
+    );
+    assert_eq!(scoped.status.code(), Some(1), "in-module findings exit 1");
+    let text = String::from_utf8(scoped.stdout).unwrap();
+    for line in text.lines().filter(|l| l.contains('[')) {
+        assert!(
+            line.contains("[example.com/nil"),
+            "every finding must be in-module, got: {line}"
+        );
+    }
+}
+
+#[test]
 fn check_clean_module_exits_0() {
     // hello corpus (no findings): exit 0, empty stdout.
     let dir = tempfile::tempdir().unwrap();

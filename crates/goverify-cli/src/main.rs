@@ -68,6 +68,13 @@ struct CheckArgs {
     /// Query-cache directory (omit to run uncached).
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+    /// Import-path prefix the report is scoped to (defaults to the
+    /// module path from the nearest `go.mod`). Extraction walks the whole
+    /// import closure — stdlib and deps included — so inference stays
+    /// whole-program, but only findings in packages under this prefix are
+    /// rendered and gate the exit code.
+    #[arg(long)]
+    scope: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -328,12 +335,89 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     for d in &a.diagnostics {
         eprintln!("goverify: {d}");
     }
-    print!("{}", render::render_findings(&a.findings, Path::new(".")));
-    Ok(if a.findings.is_empty() {
+    // Scope findings to the analyzed module: extraction walks the whole
+    // import closure (stdlib + deps), so `a.findings` covers far more than
+    // the user asked to check. Inference/summaries above already used the
+    // whole closure; only what we render and count is scoped. Exit code 1
+    // keys off the SCOPED set.
+    let scope = ca.scope.clone().or_else(|| module_path(Path::new(".")));
+    let scoped: Vec<goverify_analysis::Finding> = match &scope {
+        Some(s) => scope_findings(&a.findings, s),
+        None => {
+            eprintln!(
+                "goverify: no module scope (no go.mod found and no --scope); \
+                 reporting findings across the whole import closure"
+            );
+            a.findings.clone()
+        }
+    };
+    print!("{}", render::render_findings(&scoped, Path::new(".")));
+    Ok(if scoped.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
     })
+}
+
+/// Keep only findings whose function lives in the module rooted at
+/// `scope` (an import-path prefix). Deterministic — preserves the input
+/// order, which `analyze_full` already fixed.
+fn scope_findings(
+    findings: &[goverify_analysis::Finding],
+    scope: &str,
+) -> Vec<goverify_analysis::Finding> {
+    findings
+        .iter()
+        .filter(|f| in_module(&f.func, scope))
+        .cloned()
+        .collect()
+}
+
+/// True iff `func` (an ssa id, `<import-path>.<symbol>`) belongs to a
+/// package under module `module`: the package import path is `module`
+/// itself (so the id reads `module.<symbol>`) or is rooted under
+/// `module/` (`module/pkg.<symbol>`). The boundary byte (`.` or `/`)
+/// keeps `example.com/nil` from matching a sibling `example.com/nilextra`.
+fn in_module(func: &str, module: &str) -> bool {
+    match func.strip_prefix(module) {
+        Some(rest) => matches!(rest.as_bytes().first(), Some(b'.') | Some(b'/')),
+        None => false,
+    }
+}
+
+/// The module path from the nearest `go.mod` at or above `start`
+/// (mirroring how `go` resolves the module for a directory). `None` when
+/// no `go.mod` is found — e.g. `--gvir-dir` runs outside any module,
+/// where the caller degrades to an unscoped report (or an explicit
+/// `--scope`).
+fn module_path(start: &Path) -> Option<String> {
+    let mut dir = start.canonicalize().ok()?;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(dir.join("go.mod"))
+            && let Some(m) = parse_module_directive(&text)
+        {
+            return Some(m);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// The `module <path>` directive from go.mod text (first match wins).
+/// Requires whitespace after the `module` keyword so `modulefoo` never
+/// matches; tolerates surrounding quotes on the path.
+fn parse_module_directive(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("module")
+            && rest.starts_with(char::is_whitespace)
+            && let Some(path) = rest.split_whitespace().next()
+        {
+            return Some(path.trim_matches('"').to_string());
+        }
+    }
+    None
 }
 
 /// Locate the vendored extractor sources: explicit override first,
@@ -367,4 +451,67 @@ fn sidecar_build_dir() -> PathBuf {
         .mode(0o700)
         .create(&dir);
     dir.join("extractor-bin")
+}
+
+#[cfg(test)]
+mod tests {
+    use goverify_analysis::Finding;
+
+    use super::*;
+
+    fn finding(func: &str) -> Finding {
+        Finding {
+            checker: "nil".to_string(),
+            tag: "nil-deref".to_string(),
+            func: func.to_string(),
+            pos: None,
+            message: "m".to_string(),
+            trace: Vec::new(),
+            model: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn in_module_matches_module_and_submodules_only() {
+        // Same package as the module root.
+        assert!(in_module("example.com/nil.Bad", "example.com/nil"));
+        // A package rooted under the module.
+        assert!(in_module("example.com/nil/sub.F", "example.com/nil"));
+        // A dependency / stdlib package: outside.
+        assert!(!in_module("strings.ToUpper", "example.com/nil"));
+        // Boundary trap: a sibling module sharing the prefix must NOT match.
+        assert!(!in_module("example.com/nilextra.F", "example.com/nil"));
+        // Exact prefix with no boundary byte must NOT match.
+        assert!(!in_module("example.com/nil", "example.com/nil"));
+    }
+
+    #[test]
+    fn scope_findings_drops_out_of_module_entries() {
+        let findings = vec![
+            finding("example.com/nil.Bad"),
+            finding("strings.ToUpper"),
+            finding("example.com/nil/sub.Helper"),
+            finding("runtime.mapaccess1"),
+        ];
+        let scoped = scope_findings(&findings, "example.com/nil");
+        let names: Vec<&str> = scoped.iter().map(|f| f.func.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["example.com/nil.Bad", "example.com/nil/sub.Helper"],
+            "only in-module findings survive scoping, in input order"
+        );
+    }
+
+    #[test]
+    fn parse_module_directive_reads_the_module_path() {
+        let text = "// a comment\nmodule example.com/nil\n\ngo 1.25.10\n";
+        assert_eq!(
+            parse_module_directive(text).as_deref(),
+            Some("example.com/nil")
+        );
+        // No `module` directive at all.
+        assert_eq!(parse_module_directive("go 1.25\n"), None);
+        // `module`-prefixed non-directive must not match.
+        assert_eq!(parse_module_directive("modulefoo bar\n"), None);
+    }
 }

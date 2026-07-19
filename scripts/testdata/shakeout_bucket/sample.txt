@@ -14,3 +14,7 @@ freelist.go:130:12: div-zero: divisor may be zero [go.etcd.io/bbolt.mod]
     with: p1 = 0
 
 -:-:-: overflow: narrowing conversion may overflow [go.etcd.io/bbolt.trunc]
+
+freelist.go:145:9: bounds: destination slice may be too small [go.etcd.io/bbolt.freelist.write]
+  145 |  buf := append(buf, "magic", 4096)
+      |         ^

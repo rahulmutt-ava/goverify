@@ -2,3 +2,4 @@ bucket.go:912:15	nil-deref	(*go.etcd.io/bbolt.Bucket).Delete	nil passed to freel
 node.go:88:10	bounds	go.etcd.io/bbolt.node.item	index may exceed slice length	 return n.inodes[index]	0		bounds|I I.I[I]
 freelist.go:130:12	div-zero	go.etcd.io/bbolt.mod	divisor may be zero	 x := a / b	0	p1 = 0	div-zero|I := I / I
 -:-:-	overflow	go.etcd.io/bbolt.trunc	narrowing conversion may overflow		0		overflow|msg:I I I I
+freelist.go:145:9	bounds	go.etcd.io/bbolt.freelist.write	destination slice may be too small	 buf := append(buf, "magic", 4096)	0		bounds|I := I(I, S, N)

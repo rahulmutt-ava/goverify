@@ -18,10 +18,22 @@ function fail(why) {
 
 function normalize(s,   t) {
   t = s
-  gsub(/"[^"]*"/, "S", t)
-  gsub(/`[^`]*`/, "S", t)
-  gsub(/[0-9][0-9]*/, "N", t)
+  # Pass order matters: S/N/I are all letters, so an earlier pass's
+  # placeholder is fair game for a later pass's pattern unless we guard
+  # against it. String literals are replaced first, but with a control
+  # byte (\002) rather than the letter "S" so the identifier pass below
+  # cannot re-swallow them; rendered text (crates/goverify-cli/src/render.rs)
+  # is sanitized upstream to contain no control bytes, so \002 cannot
+  # collide with real source content. The identifier pass runs next
+  # (swallowing digits embedded in identifiers, e.g. txid2 -> I), then
+  # the number pass on what remains (safe here: only digit runs outside
+  # identifiers survive, and no later pass matches digits), and only at
+  # the end do we map the sentinel to the literal "S".
+  gsub(/"[^"]*"/, "\002", t)
+  gsub(/`[^`]*`/, "\002", t)
   gsub(/[A-Za-z_][A-Za-z0-9_]*/, "I", t)
+  gsub(/[0-9][0-9]*/, "N", t)
+  gsub(/\002/, "S", t)
   gsub(/[ \t][ \t]*/, " ", t)
   sub(/^ /, "", t)
   sub(/ $/, "", t)

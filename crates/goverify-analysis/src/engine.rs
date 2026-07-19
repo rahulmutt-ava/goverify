@@ -1005,7 +1005,11 @@ mod tests {
         let cfg = EngineConfig::default();
         let a = analyze_full(&p, &cfg, &checkers, &|_role| Box::new(AlwaysSat));
 
-        let big_diags: Vec<&String> = a.diagnostics.iter().filter(|d| d.contains("t.Big")).collect();
+        let big_diags: Vec<&String> = a
+            .diagnostics
+            .iter()
+            .filter(|d| d.contains("t.Big"))
+            .collect();
         assert_eq!(
             big_diags.len(),
             1,

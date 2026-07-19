@@ -206,7 +206,10 @@ m.go:2:11: nil-deref: nil passed to t.F (violates its nil-deref requirement) [t.
     2 |  return p.X
       |           ^
 ";
-        assert_eq!(got, want, "leading tab must render as one space so the caret lands on X");
+        assert_eq!(
+            got, want,
+            "leading tab must render as one space so the caret lands on X"
+        );
     }
 
     #[test]

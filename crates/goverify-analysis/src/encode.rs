@@ -375,11 +375,7 @@ fn seq_lit(len: u64, cap: u64) -> Option<Term> {
 /// edges survive the back-edge cut (the DFS never traverses them), so
 /// their mutually-supporting equations would otherwise stay satisfiable
 /// with the guards true and let `reach_query` mint a false positive.
-fn encode_guards(
-    func: &Function,
-    reachable: &[bool],
-    enc: &mut EncodedFunc,
-) -> Result<(), String> {
+fn encode_guards(func: &Function, reachable: &[bool], enc: &mut EncodedFunc) -> Result<(), String> {
     let n = func.blocks.len();
     // Incoming edge guards per block, over the cut DAG only.
     let mut incoming: Vec<Vec<Term>> = vec![Vec::new(); n];
@@ -396,11 +392,16 @@ fn encode_guards(
     }
     for (b, edges) in incoming.into_iter().enumerate() {
         let gb = enc.guards[b].clone();
+        let reachable_b = reachable.get(b).copied().unwrap_or(false);
         let rhs = if b == 0 {
             Term::bool_lit(true)
-        } else if !reachable.get(b).copied().unwrap_or(false) {
-            Term::bool_lit(false) // unreachable from entry: force false
-        } else if edges.is_empty() {
+        } else if !reachable_b || edges.is_empty() {
+            // Either the block is unreachable from the entry, or every
+            // in-edge was cut in the DAG — it can't be reached, so
+            // g_b = false. The reachability arm is what closes the
+            // crafted-.gvir hole: an unreachable CYCLE keeps its edges (so
+            // `edges` is non-empty) yet its guard equations are mutually
+            // satisfiable as true unless forced false here.
             Term::bool_lit(false)
         } else if edges.len() == 1 {
             edges.into_iter().next().expect("len == 1")
@@ -1090,12 +1091,8 @@ mod tests {
             timeout_ms: 5_000,
             ..Default::default()
         });
-        let outcome = goverify_solver::discharge_query(
-            &enc.reach_query(1, vec![]),
-            &mut solver,
-            None,
-            None,
-        );
+        let outcome =
+            goverify_solver::discharge_query(&enc.reach_query(1, vec![]), &mut solver, None, None);
         assert_eq!(
             outcome.result,
             goverify_solver::SatResult::Unsat,

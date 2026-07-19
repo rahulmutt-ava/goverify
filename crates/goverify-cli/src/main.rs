@@ -373,13 +373,24 @@ fn scope_findings(
         .collect()
 }
 
-/// True iff `func` (an ssa id, `<import-path>.<symbol>`) belongs to a
-/// package under module `module`: the package import path is `module`
-/// itself (so the id reads `module.<symbol>`) or is rooted under
-/// `module/` (`module/pkg.<symbol>`). The boundary byte (`.` or `/`)
-/// keeps `example.com/nil` from matching a sibling `example.com/nilextra`.
+/// True iff `func` (an ssa id) belongs to a package under module
+/// `module`. A plain function id reads `<import-path>.<symbol>`, but
+/// go/ssa emits METHOD ids (via `fn.String()`) as `(pkg.T).M` for a value
+/// receiver and `(*pkg.T).M` for a pointer receiver — plus method
+/// closures like `(*pkg.T).M$1` — so the module prefix is preceded by a
+/// literal `(` and an optional `*`. Strip those first, then require the
+/// import path to be `module` itself (id `module.<symbol>` / `(module.T).M`)
+/// or rooted under `module/` (`module/pkg.<symbol>`). The boundary byte
+/// (`.` or `/`) keeps `example.com/nil` from matching a sibling
+/// `example.com/nilextra` — for a method the rest is `.T).M`, so the `.`
+/// boundary still holds.
 fn in_module(func: &str, module: &str) -> bool {
-    match func.strip_prefix(module) {
+    // Peel an optional receiver wrapper: `(` then an optional `*`.
+    let bare = func
+        .strip_prefix('(')
+        .map(|r| r.strip_prefix('*').unwrap_or(r))
+        .unwrap_or(func);
+    match bare.strip_prefix(module) {
         Some(rest) => matches!(rest.as_bytes().first(), Some(b'.') | Some(b'/')),
         None => false,
     }
@@ -483,6 +494,21 @@ mod tests {
         assert!(!in_module("example.com/nilextra.F", "example.com/nil"));
         // Exact prefix with no boundary byte must NOT match.
         assert!(!in_module("example.com/nil", "example.com/nil"));
+    }
+
+    #[test]
+    fn in_module_matches_go_ssa_method_ids() {
+        // go/ssa method ids: value receiver `(pkg.T).M`, pointer receiver
+        // `(*pkg.T).M`, method closure `(*pkg.T).M$1` — the leading `(`
+        // and optional `*` precede the import path.
+        assert!(in_module("(example.com/m.T).M", "example.com/m"));
+        assert!(in_module("(*example.com/m.T).M", "example.com/m"));
+        assert!(in_module("(*example.com/m.T).M$1", "example.com/m"));
+        // A method on a package rooted under the module.
+        assert!(in_module("(*example.com/m/sub.T).M", "example.com/m"));
+        // Sibling-module method must still be rejected (boundary guard
+        // holds after peeling the receiver wrapper).
+        assert!(!in_module("(*example.com/hellox.T).M", "example.com/hello"));
     }
 
     #[test]

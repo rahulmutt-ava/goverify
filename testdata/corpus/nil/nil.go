@@ -31,6 +31,15 @@ func LocalNil() int {
 	return p.X // want: nil-deref
 }
 
+// BadMethod dereferences a manifest local nil inside a pointer-receiver
+// method, so its finding carries a go/ssa METHOD id
+// — (*example.com/nil.T).BadMethod — which the check scoping filter must
+// still recognize as in-module (final review F1 fix 2).
+func (t *T) BadMethod() int {
+	var p *T
+	return p.X // want: nil-deref
+}
+
 // Good passes nil only to the guarded function.
 func Good() int { return guarded(nil) }
 

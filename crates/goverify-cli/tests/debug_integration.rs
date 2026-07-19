@@ -272,12 +272,25 @@ fn check_scopes_findings_to_the_module() {
     );
     assert_eq!(scoped.status.code(), Some(1), "in-module findings exit 1");
     let text = String::from_utf8(scoped.stdout).unwrap();
-    for line in text.lines().filter(|l| l.contains('[')) {
+    // Header lines end with the `[<func>]` bracket; snippet/path/with
+    // lines don't. Peel a go/ssa receiver wrapper (`(` / `*`) so a method
+    // id like `(*example.com/nil.T).BadMethod` still reads as in-module.
+    let mut saw_method = false;
+    for line in text.lines().filter(|l| l.ends_with(']')) {
+        let func = line.rsplit_once('[').unwrap().1.trim_end_matches(']');
+        let bare = func.trim_start_matches(['(', '*']);
         assert!(
-            line.contains("[example.com/nil"),
+            bare.starts_with("example.com/nil"),
             "every finding must be in-module, got: {line}"
         );
+        if func.starts_with('(') {
+            saw_method = true;
+        }
     }
+    assert!(
+        saw_method,
+        "the corpus must exercise a method finding (BadMethod) end-to-end:\n{text}"
+    );
 }
 
 #[test]

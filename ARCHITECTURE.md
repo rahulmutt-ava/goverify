@@ -32,9 +32,12 @@ Rust core: IR load ─▶ call-graph SCC order ─▶ per-function analysis
 | `goverify-spec` | summary/annotation format: parse, serialize, validate | inference |
 | `goverify-cache` | content-addressed store (blake3, atomic rename, advisory lock, corrupt=miss); query layer keyed on canonical SMT text ⊕ solver identity ⊕ limits; extraction/summary caching layers arrive in phase 5 | what the bytes mean |
 
-Checkers depend on `goverify-analysis` + `goverify-solver` +
-`goverify-spec` and nothing else — that boundary is what keeps checker
-versioning able to invalidate only its own cached results.
+Checkers depend on `goverify-analysis` + `goverify-ir` + `goverify-solver`
+and nothing else — notably not `goverify-extract`, `goverify-cache`, or
+`goverify-spec`. That thin boundary keeps checkers a pure consumer layer:
+they read the IR, plug into the engine's `Checker` surface, and discharge
+queries through the solver, so a checker change can't ripple into
+extraction or the caching/spec layers.
 
 ## The Go sidecar (`extractor/`)
 

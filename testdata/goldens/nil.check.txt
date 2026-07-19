@@ -9,6 +9,6 @@ nil.go:26:39: nil-deref: call to example.com/nil.wrapper violates its nil-deref 
     path: nil.go:26
 
 nil.go:31:11: nil-deref: nil dereference in example.com/nil.LocalNil [example.com/nil.LocalNil]
-   31 | return p.X // want: nil-deref
+   31 |  return p.X // want: nil-deref
       |           ^
     path: nil.go:31

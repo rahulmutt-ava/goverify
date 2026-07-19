@@ -89,13 +89,24 @@ fn read_source_line(root: &Path, file: &str, line: u32) -> Option<String> {
 
 /// Strip ANSI/control chars from solver- or extractor-derived text
 /// before terminal output (threat-model: model text and `Pos.file` are
-/// both untrusted-ish display input). Every C0 control (`< 0x20`) plus
-/// DEL (`0x7f`) is dropped — no exceptions (traces/bindings/paths are
-/// always single-line, so there's no legitimate tab/newline to
-/// preserve).
+/// both untrusted-ish display input). A TAB maps to a single space; every
+/// other C0 control (`< 0x20`) plus DEL (`0x7f`) is dropped. The tab
+/// mapping (rather than deletion) keeps the echoed source line's columns
+/// aligned with `Pos.col`: go/gofmt indents with tabs, `Pos.col` counts
+/// each tab as one column, so collapsing a leading tab to one space keeps
+/// the caret under the right character (deleting it shifted every caret
+/// left by the leading-tab count).
 fn sanitize(s: &str) -> String {
     s.chars()
-        .filter(|&c| !((c as u32) < 0x20 || c as u32 == 0x7f))
+        .filter_map(|c| {
+            if c == '\t' {
+                Some(' ')
+            } else if (c as u32) < 0x20 || c as u32 == 0x7f {
+                None
+            } else {
+                Some(c)
+            }
+        })
         .collect()
 }
 
@@ -174,9 +185,28 @@ m.go:3:9: nil-deref: nil passed to t.F (violates its nil-deref requirement) [t.B
     #[test]
     fn sanitize_strips_control_sequences() {
         assert_eq!(sanitize("a\x1b[31mred\x07b"), "a[31mredb");
-        // keep \t? no: replace every C0 control except nothing — traces
-        // are single-line; strip chars < 0x20 plus 0x7f.
-        assert_eq!(sanitize("a\tb\nc\x7fd"), "abcd");
+        // A tab maps to a single space (keeps caret column math aligned);
+        // newline and DEL are dropped.
+        assert_eq!(sanitize("a\tb\nc\x7fd"), "a bcd");
+    }
+
+    #[test]
+    fn tab_indented_source_keeps_the_caret_aligned() {
+        // gofmt indents with a leading tab; `Pos.col` counts it as one
+        // column. A deref at col 11 of "\treturn p.X" must put the caret
+        // under `X` — which only holds if the echoed tab is ONE space wide
+        // (matching the column count), not deleted.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("m.go"), "package m\n\treturn p.X\n").unwrap();
+        let mut f = base_finding();
+        f.pos = Some(pos("m.go", 2, 11));
+        let got = render_findings(&[f], dir.path());
+        let want = "\
+m.go:2:11: nil-deref: nil passed to t.F (violates its nil-deref requirement) [t.Bad]
+    2 |  return p.X
+      |           ^
+";
+        assert_eq!(got, want, "leading tab must render as one space so the caret lands on X");
     }
 
     #[test]

@@ -548,8 +548,9 @@ only — upstreaming to etcd-io/bbolt is a separate user decision (design
 - **Dispatch precision** (carried Task-10 watch item, spec §16): across
   all 459 distilled class verdict entries, **none observed** — zero
   classes evidenced a trace routing through a shared-signature
-  over-approximated invoke edge. Basis: all 459 class verdict files
-  (`verdicts/C*.md`) were reviewed and every cited `path:` trail grounds
+  over-approximated invoke edge. Basis: all 459 class verdict entries
+  (across the 409 `verdicts/C*.md` files; subclasses share their parent
+  class's file) were reviewed and every cited `path:` trail grounds
   through static call edges; the per-class dispatch-precision flag
   distilled into `work/reasons.tsv` column 5 is 0 for all 459 rows.
 

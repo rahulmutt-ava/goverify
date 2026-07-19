@@ -1,0 +1,4 @@
+bucket.go:912:15	nil-deref	(*go.etcd.io/bbolt.Bucket).Delete	nil passed to freelist.free (violates its nil-deref requirement)	 f.free(tx.meta.txid, p)	1	p0 = (ptr-nil)	nil-deref|I.I(I.I.I, I)
+node.go:88:10	bounds	go.etcd.io/bbolt.node.item	index may exceed slice length	 return n.inodes[index]	0		bounds|I I.I[I]
+freelist.go:130:12	div-zero	go.etcd.io/bbolt.mod	divisor may be zero	 x := a / b	0	p1 = 0	div-zero|I := I / I
+-:-:-	overflow	go.etcd.io/bbolt.trunc	narrowing conversion may overflow		0		overflow|msg:I I I I

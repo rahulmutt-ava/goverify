@@ -1,0 +1,16 @@
+bucket.go:912:15: nil-deref: nil passed to freelist.free (violates its nil-deref requirement) [(*go.etcd.io/bbolt.Bucket).Delete]
+  912 |  f.free(tx.meta.txid, p)
+      |               ^
+    path: bucket.go:900 -> bucket.go:912
+    with: p0 = (ptr-nil)
+
+node.go:88:10: bounds: index may exceed slice length [go.etcd.io/bbolt.node.item]
+   88 |  return n.inodes[index]
+      |         ^
+
+freelist.go:130:12: div-zero: divisor may be zero [go.etcd.io/bbolt.mod]
+  130 |  x := a / b
+      |       ^
+    with: p1 = 0
+
+-:-:-: overflow: narrowing conversion may overflow [go.etcd.io/bbolt.trunc]

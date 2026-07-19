@@ -1,0 +1,2 @@
+node.go:88:10: bounds: index may exceed slice length [go.etcd.io/bbolt.node.item]
+garbage without shape

@@ -112,15 +112,31 @@ pub fn sort_of(types: &TypeTable, t: TypeId) -> Option<Sort> {
 
 /// DFS edge classification from the entry block: returns `succs` with
 /// back edges (target on the current DFS stack) removed. Unreachable
-/// blocks keep their edges (harmless: their guards become false).
+/// blocks keep their edges (harmless: `encode_guards` forces their guard
+/// to false — see `cut_back_edges_visited`). Public signature FROZEN;
+/// callers needing the reachability flags use `cut_back_edges_visited`.
 pub fn cut_back_edges(f: &Function) -> Vec<Vec<u32>> {
+    cut_back_edges_visited(f).0
+}
+
+/// `cut_back_edges` plus the DFS reachability flags: `visited[b]` is true
+/// iff block `b` is reachable from the entry (block 0). `encode_guards`
+/// consumes these to assert `g_b = false` for every UNREACHABLE block,
+/// closing a crafted-/degraded-.gvir false-positive hole: the DFS only
+/// classifies edges reachable from block 0, so an unreachable cycle keeps
+/// mutually-supporting guard equations (`g1 = g2`, `g2 = g1`) that a
+/// solver can satisfy with both true, letting `reach_query` on an
+/// unreachable block return Sat. go/ssa prunes unreachable blocks, so
+/// only the untrusted-input surface is affected — but it is still a real
+/// no-FP hole.
+pub(crate) fn cut_back_edges_visited(f: &Function) -> (Vec<Vec<u32>>, Vec<bool>) {
     let n = f.blocks.len();
     let mut dag: Vec<Vec<u32>> = f.blocks.iter().map(|b| b.succs.clone()).collect();
     let mut state = vec![0u8; n]; // 0 unvisited, 1 on stack, 2 done
     // Iterative DFS; (block, next-succ-index) frames.
     let mut stack: Vec<(usize, usize)> = Vec::new();
     if n == 0 {
-        return dag;
+        return (dag, Vec::new());
     }
     stack.push((0, 0));
     state[0] = 1;
@@ -150,7 +166,10 @@ pub fn cut_back_edges(f: &Function) -> Vec<Vec<u32>> {
     for (b, s) in cut {
         dag[b].retain(|&x| x != s);
     }
-    dag
+    // A block ends the DFS `done` (state 2) iff it was reached; anything
+    // still `unvisited` (state 0) is unreachable from the entry.
+    let visited = state.iter().map(|&s| s != 0).collect();
+    (dag, visited)
 }
 
 /// Term-count budget: a function whose encoding exceeds this many
@@ -209,7 +228,7 @@ pub fn encode_func(p: &Program, f: FuncId) -> Result<EncodedFunc, String> {
         .func(f)
         .ok_or_else(|| format!("{}: no body to encode", p.func_name(f)))?;
     let n = func.blocks.len();
-    let dag_succs = cut_back_edges(func);
+    let (dag_succs, reachable) = cut_back_edges_visited(func);
     let mut enc = EncodedFunc {
         datatypes: vec![ptr_datatype(), seq_datatype()],
         consts: Vec::new(),
@@ -234,7 +253,7 @@ pub fn encode_func(p: &Program, f: FuncId) -> Result<EncodedFunc, String> {
     // before op defining-equalities (which need edge guards for phi).
     declare_pass(p, func, &mut enc);
     // (3) Guard structure over the cut DAG.
-    encode_guards(func, &mut enc)?;
+    encode_guards(func, &reachable, &mut enc)?;
     // (4) Defining equalities for modeled ops (Assign/BinOp/UnOp/Phi/Make);
     // everything else keeps its declared-but-unconstrained (havoc) dst.
     encode_ops(p, func, &mut enc);
@@ -350,7 +369,17 @@ fn seq_lit(len: u64, cap: u64) -> Option<Term> {
 /// g_b = OR of incoming edge guards; a Branch edge conjoins the branch
 /// condition (positional: succs[0] = cond, succs[1] = ¬cond). A block
 /// whose every in-edge was cut is unreachable in the DAG: g_b = false.
-fn encode_guards(func: &Function, enc: &mut EncodedFunc) -> Result<(), String> {
+/// `reachable[b]` is the DFS reachability flag (`cut_back_edges_visited`):
+/// a block NOT reachable from the entry is pinned `g_b = false` outright,
+/// rather than built from its incoming-edge OR — an unreachable cycle's
+/// edges survive the back-edge cut (the DFS never traverses them), so
+/// their mutually-supporting equations would otherwise stay satisfiable
+/// with the guards true and let `reach_query` mint a false positive.
+fn encode_guards(
+    func: &Function,
+    reachable: &[bool],
+    enc: &mut EncodedFunc,
+) -> Result<(), String> {
     let n = func.blocks.len();
     // Incoming edge guards per block, over the cut DAG only.
     let mut incoming: Vec<Vec<Term>> = vec![Vec::new(); n];
@@ -369,6 +398,8 @@ fn encode_guards(func: &Function, enc: &mut EncodedFunc) -> Result<(), String> {
         let gb = enc.guards[b].clone();
         let rhs = if b == 0 {
             Term::bool_lit(true)
+        } else if !reachable.get(b).copied().unwrap_or(false) {
+            Term::bool_lit(false) // unreachable from entry: force false
         } else if edges.is_empty() {
             Term::bool_lit(false)
         } else if edges.len() == 1 {
@@ -1016,6 +1047,52 @@ mod tests {
         let p = Program::from_packages(vec![pkg("t", vec![f])]);
         let id = p.lookup_func("t.F").unwrap();
         (p, id)
+    }
+
+    #[test]
+    fn unreachable_cycle_guards_are_forced_false() {
+        // 0 returns (reachable); 1 -> 2 -> 1 is an unreachable self-cycle.
+        // The DFS from block 0 never touches 1/2, so their edges survive
+        // the back-edge cut — without the reachability override their
+        // guard equations (g1 depends on g2, g2 on g1) stay mutually
+        // satisfiable as true, so reach_query(1) would return Sat and mint
+        // a crafted-.gvir false positive. Every unreachable block must be
+        // pinned g = false instead.
+        let f = func(
+            "t.F",
+            vec![
+                block_p(0, vec![instr("Return")], vec![], vec![]),
+                block_p(1, vec![instr("Jump")], vec![2], vec![2]),
+                block_p(2, vec![instr("Jump")], vec![1], vec![1]),
+            ],
+        );
+        let (p, id) = one_func_program(f);
+        let enc = encode_func(&p, id).unwrap();
+        let text = enc.reach_query(1, vec![]).canonical_text();
+        assert!(
+            text.contains("(assert (= g1 false))"),
+            "unreachable block 1 must be pinned false:\n{text}"
+        );
+        assert!(
+            text.contains("(assert (= g2 false))"),
+            "unreachable block 2 must be pinned false:\n{text}"
+        );
+        // The no-FP guarantee: reaching an unreachable block is Unsat.
+        let mut solver = goverify_solver::Z3Native::new(goverify_solver::SolverLimits {
+            timeout_ms: 5_000,
+            ..Default::default()
+        });
+        let outcome = goverify_solver::discharge_query(
+            &enc.reach_query(1, vec![]),
+            &mut solver,
+            None,
+            None,
+        );
+        assert_eq!(
+            outcome.result,
+            goverify_solver::SatResult::Unsat,
+            "an unreachable block can never be reached: {outcome:?}"
+        );
     }
 
     #[test]

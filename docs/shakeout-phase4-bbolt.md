@@ -751,8 +751,8 @@ only — upstreaming to etcd-io/bbolt is a separate user decision (design
 Task 5 (`testdata/corpus/knownfp/knownfp.go`,
 `crates/goverify-checkers/tests/knownfp_corpus.rs`) pins CURRENT
 (wrong) analyzer behavior for confirmed FP mechanisms, superseding the
-original per-class pin plan: with 438 confirmed-FP findings across
-~437 classes, one pin per class is not viable. Instead, one minimal
+original per-class pin plan: with 968 confirmed-FP findings across
+438 classes, one pin per class is not viable. Instead, one minimal
 pin per FP *mechanism group* (the encoding-mechanism buckets above, the
 dominant invariant mechanisms, and the requires-lifting canonical
 shapes), each citing 1-3 exemplar class ids. 9 pins reproduced; 3

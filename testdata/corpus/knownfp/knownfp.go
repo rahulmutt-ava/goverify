@@ -5,7 +5,7 @@
 // the point.
 //
 // One minimal repro per FP mechanism group (not per class — the bbolt
-// shakeout triaged 438 confirmed-FP findings into ~437 classes, far too
+// shakeout triaged 968 confirmed-FP findings into 438 classes, far too
 // many for one-pin-per-class). Some mechanism groups have no repro
 // below because they weren't minimally reproducible outside bbolt's own
 // context (see docs/shakeout-phase4-bbolt.md's "Corpus pins" subsection

@@ -6,9 +6,11 @@ FP rate recorded, every fixed FP lands a corpus case, dispatch-precision
 observations recorded for phase-5 planning.
 
 ## Run parameters
-- goverify commit: <sha>
+- goverify commit: c0655e4
 - bbolt ref: v1.4.0
 - timeouts: infer 100 ms / obligation 250 ms (defaults)
+- findings: 1006 (ledger's last recorded run: 1006; no delta)
+- wall clock: cold 372.47 s / warm 29.74 s
 
 ## Findings triage
 | # | pos | tag | verdict (TP/FP/unclear) | note / corpus case |

@@ -860,6 +860,14 @@ pub fn violating_path(
     dag_succs: &[Vec<u32>],
     guards: &BTreeMap<String, bool>,
 ) -> Vec<u32> {
+    // A block-0 seed is only sound when block 0 exists: `trace_for`
+    // indexes `blocks[0]` on the returned path, so an empty function must
+    // yield an empty path (unreachable via real checkers — go/ssa
+    // functions always have an entry block — but crafted/degraded .gvir
+    // need not).
+    if func.blocks.is_empty() {
+        return Vec::new();
+    }
     if guards.get("g0") != Some(&true) {
         return Vec::new();
     }

@@ -243,6 +243,21 @@ pub fn analyze_full(
         let mut backend = mk_backend(BackendRole::Findings);
         let summary_of = |f: FuncId| summaries.get(&f).cloned().unwrap_or_else(Summary::havoc);
         for f in p.func_ids() {
+            // Spec §8 ("oversized function → skip with diagnostic"): every
+            // checker encodes `f` internally and bails silently on an
+            // `encode_func` error (e.g. a function past the assertion cap),
+            // so no finding — and no reason why — ever surfaces. Encode
+            // once here (findings pass only, so the fixpoint's cost is
+            // untouched) and record ONE diagnostic per function when it
+            // fails; the checkers still degrade to zero findings for it.
+            // Bodyless/external functions never reach a checker's encoder,
+            // so skip them. Deterministic: this loop is the single-threaded
+            // ascending-`FuncId` findings scan.
+            if p.func(f).is_some()
+                && let Err(e) = crate::encode::encode_func(p, f)
+            {
+                findings_diagnostics.push(e);
+            }
             // A `Checker` is the phase-4 plugin surface: `obligations` +
             // `discharge_query` runs untrusted (to this engine) code, same
             // as `analyze_function`'s body above. Wrap it in the same
@@ -872,6 +887,147 @@ mod tests {
         assert_eq!(
             a1.findings, a2.findings,
             "findings pass must be deterministic across runs"
+        );
+    }
+
+    /// Mirrors the real checkers' `let Ok(enc) = encode_func(..) else {
+    /// return Vec::new() }` pattern: silently contributes nothing for a
+    /// function that fails to encode, and one trivially-Sat obligation for
+    /// every function that DOES encode. Lets the F4 test show that an
+    /// un-encodable function produces no finding while the engine still
+    /// records the skip diagnostic.
+    struct EncodeGatedChecker;
+    impl Checker for EncodeGatedChecker {
+        fn name(&self) -> &'static str {
+            "encode-gated"
+        }
+        fn infer_requires(
+            &self,
+            p: &Program,
+            f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
+            _discharge: &mut dyn FnMut(&Query) -> SatResult,
+        ) -> Vec<crate::summary::Clause> {
+            // Same silent bail as the shipped checkers.
+            let _ = crate::encode::encode_func(p, f);
+            Vec::new()
+        }
+        fn obligations(
+            &self,
+            p: &Program,
+            f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
+        ) -> Vec<crate::checker::Obligation> {
+            let Ok(_enc) = crate::encode::encode_func(p, f) else {
+                return Vec::new();
+            };
+            vec![crate::checker::Obligation {
+                tag: "encode-gated".into(),
+                message: "encodable".into(),
+                pos: None,
+                query: Query::for_asserts(
+                    goverify_solver::Logic::All,
+                    vec![goverify_solver::Term::bool_lit(true)],
+                ),
+            }]
+        }
+    }
+
+    /// A single-block function whose `int` BinOp count pushes the encoding
+    /// past `encode::ASSERT_CAP` (each modeled BinOp adds one defining
+    /// equality), so `encode_func` returns Err — the cheapest deterministic
+    /// encode failure (the only other Err path is a bodyless function,
+    /// which checkers skip before ever encoding).
+    fn oversized_func(id: &str) -> goverify_extract::gvir::Function {
+        use goverify_extract::gvir;
+        // 50_000 BinOps -> 50_000 defining-equality asserts + the g0 guard
+        // assert = 50_001 > ASSERT_CAP (50_000).
+        const N: u32 = 50_000;
+        let mut instrs: Vec<gvir::Instruction> = Vec::with_capacity(N as usize + 1);
+        for r in 2..2 + N {
+            instrs.push(gvir::Instruction {
+                kind: "BinOp".into(),
+                register: r,
+                r#type: 1, // int
+                operands: vec![1, 1],
+                sem: Some(gvir::instruction::Sem::Binop(gvir::BinOpSem {
+                    op: "+".into(),
+                })),
+                ..Default::default()
+            });
+        }
+        instrs.push(gvir::Instruction {
+            kind: "Return".into(),
+            ..Default::default()
+        });
+        gvir::Function {
+            id: id.into(),
+            params: vec![gvir::Param {
+                id: 1,
+                name: "a".into(),
+                r#type: 1,
+            }],
+            blocks: vec![gvir::BasicBlock {
+                index: 0,
+                instrs,
+                succs: vec![],
+                preds: vec![],
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn program_with_int_type(funcs: Vec<goverify_extract::gvir::Function>) -> Program {
+        use goverify_extract::gvir;
+        Program::from_packages(vec![gvir::Package {
+            import_path: "t".into(),
+            types: vec![gvir::Type {
+                id: 1,
+                repr: "int".into(),
+                kind: gvir::TypeKind::Basic as i32,
+                name: "int".into(),
+                ..Default::default()
+            }],
+            functions: funcs,
+            ..Default::default()
+        }])
+    }
+
+    #[test]
+    fn encode_failure_surfaces_one_engine_diagnostic_and_no_finding() {
+        // t.Small encodes fine; t.Big blows past the assertion cap. Spec
+        // §8 ("oversized function → skip with diagnostic"): the engine must
+        // emit exactly ONE diagnostic naming t.Big and produce no finding
+        // for it (the checker degrades to zero obligations), while t.Small
+        // still reports normally.
+        let p = program_with_int_type(vec![straight("t.Small", vec![]), oversized_func("t.Big")]);
+        let checkers: Vec<&dyn Checker> = vec![&EncodeGatedChecker];
+        let cfg = EngineConfig::default();
+        let a = analyze_full(&p, &cfg, &checkers, &|_role| Box::new(AlwaysSat));
+
+        let big_diags: Vec<&String> = a.diagnostics.iter().filter(|d| d.contains("t.Big")).collect();
+        assert_eq!(
+            big_diags.len(),
+            1,
+            "exactly one encode-skip diagnostic for the oversized function: {:?}",
+            a.diagnostics
+        );
+        assert!(
+            big_diags[0].contains("assertions"),
+            "diagnostic must explain the assertion-cap skip: {:?}",
+            big_diags
+        );
+
+        let found: BTreeSet<&str> = a.findings.iter().map(|f| f.func.as_str()).collect();
+        assert!(
+            !found.contains("t.Big"),
+            "the un-encodable function must yield no finding: {:?}",
+            a.findings
+        );
+        assert!(
+            found.contains("t.Small"),
+            "an encodable function still reports: {:?}",
+            a.findings
         );
     }
 }

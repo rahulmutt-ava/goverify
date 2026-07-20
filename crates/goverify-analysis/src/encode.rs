@@ -115,6 +115,11 @@ pub fn sort_of(types: &TypeTable, t: TypeId) -> Option<Sort> {
         TypeKind::Basic { name } if name == "string" => Some(seq_datatype().sort()),
         TypeKind::Pointer { .. } => Some(ptr_sort()),
         TypeKind::Slice { .. } => Some(seq_datatype().sort()),
+        // An interface value is modeled as an opaque Ptr: nil-ness is the
+        // only observation the theory makes (`err != nil` guards, the
+        // (T, error) ensures correlation). Everything else about it stays
+        // unconstrained — over-approximate, never wrong.
+        TypeKind::Interface => Some(ptr_sort()),
         _ => None,
     }
 }
@@ -1255,6 +1260,52 @@ mod tests {
             sort_of(ty, lookup(&p, "MyInt")),
             Some(Sort::BitVec(64)),
             "named -> underlying"
+        );
+    }
+
+    #[test]
+    fn interface_values_get_ptr_sort() {
+        use goverify_extract::gvir;
+        // Type 1 = interface (e.g. error), function takes one interface param.
+        let package = gvir::Package {
+            import_path: "t".into(),
+            types: vec![gvir::Type {
+                id: 1,
+                repr: "error".into(),
+                kind: gvir::TypeKind::Interface as i32,
+                ..Default::default()
+            }],
+            functions: vec![gvir::Function {
+                id: "t.F".into(),
+                params: vec![gvir::Param {
+                    id: 1,
+                    name: "err".into(),
+                    r#type: 1,
+                }],
+                blocks: vec![gvir::BasicBlock {
+                    index: 0,
+                    instrs: vec![gvir::Instruction {
+                        kind: "Return".into(),
+                        ..Default::default()
+                    }],
+                    succs: vec![],
+                    preds: vec![],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let p = goverify_ir::Program::from_packages(vec![package]);
+        let f = p.lookup_func("t.F").unwrap();
+        let enc = encode_func(&p, f).unwrap();
+        let func = p.func(f).unwrap();
+        let t = enc
+            .value(func.params[0])
+            .expect("interface param must have a term");
+        assert_eq!(
+            t.sort(),
+            &ptr_sort(),
+            "interfaces model as Ptr (nil-ness only)"
         );
     }
 

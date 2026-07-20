@@ -73,6 +73,10 @@ len/cap can legitimately violate the invariant on an out-of-bounds
 slice, and asserting it there would make the whole function's query
 spuriously Unsat, silently swallowing every real finding in it.
 
+The encoder can consume summaries: `encode_func_with` asserts callee
+`ensures` (inferred postconditions) at static call sites; `encode_func`
+is the summary-free delegate.
+
 ## Checkers (`goverify-checkers`)
 
 Two checkers ship: `NilChecker` (`nil-deref`) and `BoundsChecker`

@@ -257,6 +257,7 @@ pub fn encode_func(p: &Program, f: FuncId) -> Result<EncodedFunc, String> {
     // (4) Defining equalities for modeled ops (Assign/BinOp/UnOp/Phi/Make);
     // everything else keeps its declared-but-unconstrained (havoc) dst.
     encode_ops(p, func, &mut enc);
+    encode_load_forwarding(func, &mut enc);
     if enc.asserts.len() > ASSERT_CAP {
         return Err(format!(
             "{}: encoding exceeds {ASSERT_CAP} assertions; skipped",
@@ -551,6 +552,106 @@ fn encode_ops(p: &Program, func: &Function, enc: &mut EncodedFunc) {
         for ins in &block.instrs {
             if let Some(def) = op_def(p, func, bi, &ins.op, enc) {
                 enc.asserts.push(def);
+            }
+        }
+    }
+}
+
+/// Structural value number for an address: Assign-transparent;
+/// FieldAddr keyed by (base key, field); IndexAddr by (base key,
+/// index value). Everything else is its own root. Two addresses with
+/// equal keys compute the same location in SSA (address ops are pure).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum AddrKey {
+    Root(ValueId),
+    Field(Box<AddrKey>, u32),
+    Index(Box<AddrKey>, ValueId),
+}
+
+fn key_of(keys: &BTreeMap<ValueId, AddrKey>, v: ValueId) -> AddrKey {
+    keys.get(&v).cloned().unwrap_or(AddrKey::Root(v))
+}
+
+/// DFS postorder from the entry over the cut DAG, reversed — a
+/// topological order (the DAG is acyclic by construction). Only blocks
+/// reachable from the entry appear; unreachable blocks have guards
+/// pinned false, nothing to forward.
+pub(crate) fn topo_order(dag: &[Vec<u32>]) -> Vec<usize> {
+    let n = dag.len();
+    let mut order = Vec::with_capacity(n);
+    if n == 0 {
+        return order;
+    }
+    let mut state = vec![0u8; n];
+    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+    state[0] = 1;
+    while let Some(frame) = stack.last_mut() {
+        let (b, i) = (frame.0, frame.1);
+        if i < dag[b].len() {
+            frame.1 += 1;
+            let s = dag[b][i] as usize;
+            if s < n && state[s] == 0 {
+                state[s] = 1;
+                stack.push((s, 0));
+            }
+        } else {
+            order.push(b);
+            stack.pop();
+        }
+    }
+    order.reverse();
+    order
+}
+
+/// Same-function load forwarding (fix-wave fix 2a): repeated loads of
+/// the same value-numbered address see the same value when no
+/// potentially-aliasing write can intervene. Blocks are walked in
+/// topological order, so any Store on any path between two loads sits
+/// between them in walk order (topo order respects edges; a parallel
+/// branch's Store only costs precision, never soundness). A Store or a
+/// dst-less Havoc (unmodeled op with unknown effect) conservatively
+/// clears ALL pending forwards. Calls deliberately do NOT invalidate:
+/// assuming callees don't mutate a re-read field is a documented
+/// under-approximation (threat model, "deliberate under-
+/// approximations") — the bug-finder invariant prefers a missed exotic
+/// mutation to the shakeout's dominant FP class (mechanism 1).
+fn encode_load_forwarding(func: &Function, enc: &mut EncodedFunc) {
+    let mut keys: BTreeMap<ValueId, AddrKey> = BTreeMap::new();
+    let mut seen: BTreeMap<AddrKey, ValueId> = BTreeMap::new();
+    for b in topo_order(&enc.dag_succs) {
+        let Some(block) = func.blocks.get(b) else {
+            continue;
+        };
+        for ins in &block.instrs {
+            match &ins.op {
+                Op::Assign { dst, src } => {
+                    if let Some(k) = keys.get(src).cloned() {
+                        keys.insert(*dst, k);
+                    }
+                }
+                Op::FieldAddr { dst, base, field } => {
+                    let bk = key_of(&keys, *base);
+                    keys.insert(*dst, AddrKey::Field(Box::new(bk), *field));
+                }
+                Op::IndexAddr { dst, base, index } => {
+                    let bk = key_of(&keys, *base);
+                    keys.insert(*dst, AddrKey::Index(Box::new(bk), *index));
+                }
+                Op::Load { dst, addr } => {
+                    let k = key_of(&keys, *addr);
+                    if let Some(prev) = seen.get(&k) {
+                        if let (Some(d), Some(pv)) =
+                            (enc.values.get(dst).cloned(), enc.values.get(prev).cloned())
+                            && let Ok(eq) = Term::eq(d, pv)
+                        {
+                            enc.asserts.push(eq);
+                        }
+                    } else {
+                        seen.insert(k, *dst);
+                    }
+                }
+                Op::Store { .. } | Op::Havoc { dst: None } => seen.clear(),
+                _ => {}
             }
         }
     }
@@ -1391,6 +1492,109 @@ mod tests {
         assert!(
             enc.asserts.contains(&want),
             "FieldAddr dst must carry a non-nil assert (fix 1)"
+        );
+    }
+
+    /// Shared builder for the fix-2a load-forwarding tests: a FieldAddr at
+    /// `.0` off `base`, field/dst type `*T` (id 5) so the loaded value is
+    /// Ptr-sorted (modelable — the forwarding assert needs a real term on
+    /// both dsts).
+    fn field_addr_ins(reg: u32, base: u32) -> goverify_extract::gvir::Instruction {
+        use goverify_extract::gvir;
+        gvir::Instruction {
+            kind: "FieldAddr".into(),
+            register: reg,
+            r#type: 5, // *T
+            operands: vec![base],
+            sem: Some(gvir::instruction::Sem::Field(gvir::FieldSem {
+                index: 0,
+                name: "X".into(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// `*addr` (go/ssa UnOp "*"): the only lowering that produces `Op::Load`.
+    fn load_ins(reg: u32, addr: u32) -> goverify_extract::gvir::Instruction {
+        use goverify_extract::gvir;
+        gvir::Instruction {
+            kind: "UnOp".into(),
+            register: reg,
+            r#type: 5, // *T
+            operands: vec![addr],
+            sem: Some(gvir::instruction::Sem::Unop(gvir::UnOpSem {
+                op: "*".into(),
+                comma_ok: false,
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn repeated_field_load_is_forwarded() {
+        // f(p0 *T): v2=FieldAddr p0 .0; v3=Load v2; v4=FieldAddr p0 .0; v5=Load v4.
+        let f = goverify_extract::gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 5)],
+            blocks: vec![block_p(
+                0,
+                vec![
+                    field_addr_ins(2, 1),
+                    load_ins(3, 2),
+                    field_addr_ins(4, 1),
+                    load_ins(5, 4),
+                    ret(vec![5]),
+                ],
+                vec![],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let enc = encode_func(&p, id).unwrap();
+        let d = enc.value(goverify_ir::ValueId(5)).unwrap().clone();
+        let prev = enc.value(goverify_ir::ValueId(3)).unwrap().clone();
+        let want = Term::eq(d, prev).unwrap();
+        assert!(
+            enc.asserts.contains(&want),
+            "second load forwarded to first (fix 2a)"
+        );
+    }
+
+    #[test]
+    fn store_between_loads_kills_forwarding() {
+        // Same shape, with `Store v2 <- p0` inserted between the two loads.
+        let store_ins = goverify_extract::gvir::Instruction {
+            kind: "Store".into(),
+            operands: vec![2, 1], // addr = v2, val = p0
+            ..Default::default()
+        };
+        let f = goverify_extract::gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 5)],
+            blocks: vec![block_p(
+                0,
+                vec![
+                    field_addr_ins(2, 1),
+                    load_ins(3, 2),
+                    store_ins,
+                    field_addr_ins(4, 1),
+                    load_ins(5, 4),
+                    ret(vec![5]),
+                ],
+                vec![],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let enc = encode_func(&p, id).unwrap();
+        let d = enc.value(goverify_ir::ValueId(5)).unwrap().clone();
+        let prev = enc.value(goverify_ir::ValueId(3)).unwrap().clone();
+        let eq = Term::eq(d, prev).unwrap();
+        assert!(
+            !enc.asserts.contains(&eq),
+            "a Store must invalidate forwarding"
         );
     }
 

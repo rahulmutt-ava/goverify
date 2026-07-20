@@ -55,3 +55,34 @@ func LoopGuarded(ts []*T) int {
 	}
 	return total
 }
+
+// --- fix-wave fix 2a: same-function dominating check carried forward ---
+
+type inner struct{ n int }
+
+type holder struct{ cached *inner }
+
+func use(i *inner) int { return i.n } // infers requires: i != nil
+
+func observe() {}
+
+// RecheckedField mirrors bbolt C015a: the nil-check dominates the use,
+// and the intervening call must not invalidate the forwarded load of
+// h.cached. Green: no finding.
+func RecheckedField(h *holder) int {
+	if h.cached == nil {
+		return 0
+	}
+	observe()
+	return use(h.cached)
+}
+
+// StoreInvalidates: a store to the checked field between check and use
+// makes the re-read genuinely unconstrained again — must still report.
+func StoreInvalidates(h *holder, fresh *inner) int {
+	if h.cached == nil {
+		return 0
+	}
+	h.cached = fresh
+	return use(h.cached) // want: nil-deref
+}

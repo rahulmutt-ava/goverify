@@ -5,7 +5,7 @@
 //! Pure: `Program` in, declarations + assertions out. Anything not
 //! modeled havocs — degrade, never die.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use goverify_ir::{
     BinOpKind, Callee, ConstVal, FuncId, Function, MakeKind, Op, Program, TypeId, TypeKind,
@@ -669,19 +669,34 @@ fn encode_load_forwarding(func: &Function, enc: &mut EncodedFunc) {
 /// True iff `v`'s value is minted from uintptr arithmetic: v is
 /// uintptr-typed, or unsafe.Pointer-typed ("Pointer" is go/types' Basic
 /// name for it — no other Basic collides) and itself the dst of a
-/// Convert from a uintptr-provenance value. Depth-capped: .gvir bytes
-/// are untrusted and a crafted Convert cycle must degrade (to "no"),
-/// never hang — parsers of bytes the analyzer didn't write reject,
-/// never panic.
-fn uintptr_provenance(p: &Program, func: &Function, v: ValueId, depth: u32) -> bool {
-    if depth > 8 {
+/// Convert from a uintptr-provenance value. `visited` memoizes explored
+/// ValueIds (review fix): the depth cap alone bounds PATH length, not
+/// TOTAL work — legitimate SSA defines each register once, but lowering
+/// doesn't enforce dst uniqueness on crafted `.gvir`, so N instructions
+/// all `Convert { dst: v, src: v }` would otherwise make every level's
+/// `.any()` match all N and recurse without short-circuiting (~N^depth
+/// calls, each rescanning every instruction). Marking `v` visited before
+/// recursing bounds total work by the function's own value count instead
+/// — a crafted fan-out/self-loop degrades to "no" after re-visiting each
+/// id at most once, never hangs (`.gvir` bytes are untrusted; parsers of
+/// bytes the analyzer didn't write reject, never panic). `BTreeSet`, not
+/// `HashSet`: consistent with this codebase's determinism convention,
+/// even though iteration order can't reach output here (membership only).
+fn uintptr_provenance(
+    p: &Program,
+    func: &Function,
+    v: ValueId,
+    depth: u32,
+    visited: &mut BTreeSet<ValueId>,
+) -> bool {
+    if depth > 8 || !visited.insert(v) {
         return false;
     }
     match basic_name(p.types(), func.value(v).ty) {
         Some("uintptr") => true,
         Some("Pointer") => func.blocks.iter().flat_map(|b| &b.instrs).any(|ins| {
             matches!(&ins.op, Op::Convert { dst, src } if *dst == v
-                && uintptr_provenance(p, func, *src, depth + 1))
+                && uintptr_provenance(p, func, *src, depth + 1, visited))
         }),
         _ => false,
     }
@@ -832,7 +847,9 @@ fn op_def(p: &Program, func: &Function, block: usize, op: &Op, enc: &EncodedFunc
         // not uintptr.
         Op::Convert { dst, src } => {
             let d = t(dst)?;
-            if d.sort() != &ptr_sort() || !uintptr_provenance(p, func, *src, 0) {
+            if d.sort() != &ptr_sort()
+                || !uintptr_provenance(p, func, *src, 0, &mut BTreeSet::new())
+            {
                 return None;
             }
             Term::not(ptr_is_nil(d).ok()?).ok()
@@ -1619,6 +1636,40 @@ mod tests {
         assert!(
             !enc.asserts.contains(&unwanted),
             "pointer pun must stay nilable (fix 3 red)"
+        );
+    }
+
+    #[test]
+    fn fanout_convert_cycle_on_crafted_gvir_terminates() {
+        // Crafted, NOT legitimate SSA (single-def-per-register is a
+        // go/ssa invariant, unenforced on untrusted `.gvir` bytes): 12
+        // `Convert` instructions all write the SAME dst v5
+        // (unsafe.Pointer-typed) from itself, followed by a Ptr-sorted
+        // Convert consuming v5. Pre-fix, `uintptr_provenance`'s depth cap
+        // bounded PATH length only — every level's `.any()` matched all
+        // 12 self-referencing instructions and re-recursed into all of
+        // them, so total work grew ~12^depth. This test's value is that
+        // it completes AT ALL (review fix: `uintptr_provenance` now
+        // memoizes visited ValueIds, so revisiting v5 short-circuits to
+        // "no" after the first visit — total work bounded, not just
+        // per-path depth).
+        const FANOUT: u32 = 12;
+        let mut instrs: Vec<goverify_extract::gvir::Instruction> =
+            (0..FANOUT).map(|_| convert_ins(5, 8, 5)).collect();
+        instrs.push(convert_ins(6, 5, 5)); // v6 = Convert v5(Pointer) -> *T
+        instrs.push(ret(vec![6]));
+        let f = goverify_extract::gvir::Function {
+            id: "t.F".into(),
+            blocks: vec![block_p(0, instrs, vec![], vec![])],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let enc = encode_func(&p, id).unwrap();
+        let d = enc.value(goverify_ir::ValueId(6)).unwrap().clone();
+        let unwanted = Term::not(goverify_solver::ptr_is_nil(d).unwrap()).unwrap();
+        assert!(
+            !enc.asserts.contains(&unwanted),
+            "crafted fan-out/self-loop cycle must degrade to no provenance, not hang (review fix)"
         );
     }
 

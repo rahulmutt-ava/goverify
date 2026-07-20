@@ -8,6 +8,11 @@ nil.go:23:30: nil-deref: call to example.com/nil.deref violates its nil-deref re
       |                              ^
     path: nil.go:23
 
+nil.go:216:39: nil-deref: call to example.com/nil.chained violates its nil-deref requirement [example.com/nil.BadChained]
+  216 | func BadChained() int { return chained(nil) } // want: nil-deref
+      |                                       ^
+    path: nil.go:216
+
 nil.go:26:39: nil-deref: call to example.com/nil.wrapper violates its nil-deref requirement [example.com/nil.BadTwoHops]
    26 | func BadTwoHops() int { return wrapper(nil) } // want: nil-deref
       |                                       ^

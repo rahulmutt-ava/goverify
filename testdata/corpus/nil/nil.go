@@ -197,3 +197,20 @@ func GuardedErr(fail bool) int {
 func fresh() *Bucket { return &Bucket{} }
 
 func UnguardedFresh() int { return fresh().Fill }
+
+// --- interprocedural summaries: ChangeType/Assign canonicalization ---
+
+type NamedPtr *T
+
+// chained reaches p only through ChangeType copies (each lowers to an
+// SSA Assign). The deref subject must canonicalize back to p so
+// chained emits its own ¬nil(p) requires — previously the copy's
+// checked-deref assumption silently discharged p without any caller
+// ever being told (the documented Assign/ChangeType composition FN).
+func chained(p *T) int {
+	q := NamedPtr(p)
+	r := (*T)(q)
+	return r.X
+}
+
+func BadChained() int { return chained(nil) } // want: nil-deref

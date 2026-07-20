@@ -114,7 +114,8 @@ impl Checker for NilChecker {
         // Own deref sites: every subject whose nil path is reachable
         // (Sat-gated) and expressible over this function's own params.
         for (bi, ii, subject, _pos) in &sites {
-            let Some(subj) = enc.value(*subject).cloned() else {
+            let canon = crate::shared::canonical_value(func, *subject);
+            let Some(subj) = enc.value(canon).cloned() else {
                 continue;
             };
             let Ok(is_nil) = ptr_is_nil(subj) else {
@@ -290,10 +291,11 @@ impl Checker for NilChecker {
         // `declare_value`, so treating it as ground would manufacture a
         // finding off a genuinely free variable.
         for (bi, ii, subject, pos) in &sites {
-            let Some(subj) = enc.value(*subject).cloned() else {
+            let canon = crate::shared::canonical_value(func, *subject);
+            let Some(subj) = enc.value(canon).cloned() else {
                 continue;
             };
-            let is_const_nil = matches!(func.value(*subject).kind, ValueKind::Const(ConstVal::Nil));
+            let is_const_nil = matches!(func.value(canon).kind, ValueKind::Const(ConstVal::Nil));
             let expressible = is_const_nil || subj.free_vars().is_empty() || params_only(&subj);
             // Summary-constrained call results (spec §4): a deref of a
             // static call's result qualifies iff the callee's INFERRED

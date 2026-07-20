@@ -161,11 +161,8 @@ func ReadElem(buf []byte, i int) uint32 {
 // Follow-up: call-graph precision for `func()`-typed indirect calls,
 // or preserving a widened function's own singleton-derivable requires.
 
-// KNOWN-FN (fix-wave, undischarged): FP/encoding's dual — a FALSE
-// NEGATIVE, not a false positive, so no `// want` pin lives here (one
-// would fail: the analyzer stays silent where it should report). Same
-// "documented, not corpus-pinnable as a want" convention as the
-// SCC-widening residual block above — here because the shape is a
+// FIXED (interprocedural summaries, 2026-07-20): this was FP/encoding's
+// dual — a FALSE NEGATIVE, not a false positive — where the shape was a
 // same-function *composition* between fix 2b's checked-deref-dominance
 // assumptions and nil.rs's `params_only` filter, not a minimal
 // standalone repro.
@@ -177,28 +174,29 @@ func ReadElem(buf []byte, i int) uint32 {
 //	func f(p *T) {
 //		q := NamedPtr(p)
 //		_ = q.x
-//		_ = p.y // should want: nil-deref, but is silently discharged
+//		_ = p.y // used to be silently discharged; now wants: nil-deref
 //	}
 //
 // `q := NamedPtr(p)` lowers to an Assign/ChangeType copy of `p` (same
-// underlying pointer, new SSA value `v_q`). The deref of `q.x` fails
-// `nil.rs`'s `params_only` filter — `v_q` is its own SMT var, not
-// literally `p0` — so it never emits its own requires clause. But
+// underlying pointer, new SSA value `v_q`). The deref of `q.x` used to
+// fail `nil.rs`'s `params_only` filter — `v_q` is its own SMT var, not
+// literally `p0` — so it never emitted its own requires clause. But
 // `q.x` still counts as a deref *site*, so `shared::
 // checked_deref_assumptions` grants `¬nil(v_q)` once that site is
-// reached. Combined with the Assign defining equality `v_q = p0`
-// (`encode_ops`, unconditional), the solver derives `¬nil(p0)` —
+// reached; combined with the Assign defining equality `v_q = p0`
+// (`encode_ops`, unconditional), the solver could derive `¬nil(p0)` —
 // discharging the *unrelated* `p.y` deref's would-be requires clause,
-// even though nothing ever actually checked `p` itself. Net effect:
-// callers of `f` that pass nil are no longer flagged, though `f`
-// genuinely panics on `p.y`.
+// even though nothing ever actually checked `p` itself.
 //
-// Fix direction (deferred to the plan owner, not applied by this
-// commit): canonicalize a deref subject through same-function Assign/
-// ChangeType chains to its root value *before* `params_only` decides
-// expressibility, so `q.x`'s deref is recognized as a deref of `p`
-// itself and emits its own `nonnil(p0)` requires clause instead of
-// being silently absorbed by `checked_deref_assumptions`.
+// Applied fix: deref subjects now canonicalize through same-function
+// Assign/ChangeType chains (`shared::canonical_value`, depth-capped 64)
+// to their root value *before* `nil.rs`'s `params_only` decides
+// expressibility. `q.x`'s deref subject canonicalizes to `p0`, so it is
+// recognized as a deref of `p` itself and emits `nonnil(p0)` on its own
+// — nothing is left for `checked_deref_assumptions` to silently absorb.
+// Live red coverage: `testdata/corpus/nil/nil.go`'s `chained`/
+// `BadChained` (a two-hop ChangeType chain inside `chained`, exercised
+// through a real call site, closing the composition FN end to end).
 
 // KNOWN-FP(phase-5): FP/encoding — other/miscellaneous encoding gap:
 // a reslice is only reached after an in-bounds length check on the same

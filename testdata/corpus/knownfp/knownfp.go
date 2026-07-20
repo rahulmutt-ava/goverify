@@ -236,16 +236,20 @@ func commitFn(tx *txn) error {
 	return nil
 }
 
-// KNOWN-FP(phase-5): FP/requires-lifting — caller's prior dereference
-// not carried into callee: `Use` reads `s.db` inline (proving `s`
-// non-nil for the remainder of `Use`, mirroring bbolt's inline
-// `top.FillPercent` write before the later `top.CreateBucketIfNotExists`
-// call), and passes the identical, unreassigned `s` to `closeSession`
-// right after — but `closeSession`'s own nil-receiver check is analyzed
-// as a standalone summary that never inherits the caller-established
-// fact (exemplars C031a, C053b: bbolt's `tx.rollback`/`(*node).split`,
-// whose sole callers already dereferenced the identical receiver
-// earlier in the same function).
+// FIXED (fix-wave 2026-07-20, fix 2b): formerly KNOWN-FP, filed under
+// FP/requires-lifting (exemplars C031a, C053b: bbolt's
+// `tx.rollback`/`(*node).split`) because the callee's own nil-receiver
+// check looked like it needed the caller's fact lifted INTO its
+// analysis. But the obligation this pin actually pins is raised at the
+// CALL SITE inside `Use`, not inside `closeSession`'s body — and
+// `Use`'s own prior dereference `_ = s.db` strictly dominates that call
+// in the same function, which is exactly fix 2b's mechanism (no
+// interprocedural lifting needed at all: the checked-deref assumption
+// discharges the call-site obligation directly). Kept as the green
+// regression case; still misfiled as its own class in
+// docs/shakeout-phase4-bbolt.md's C031a/C053b rows since the true
+// remaining "requires-lifting" instances lift facts across the
+// CALLEE's boundary, which this one never needed.
 type session struct{ db *int }
 
 func maybeSession(nilPath bool) *session {
@@ -260,7 +264,7 @@ func closeSession(s *session) bool { return s.db == nil }
 func Use(nilPath bool) bool {
 	s := maybeSession(nilPath)
 	_ = s.db
-	return closeSession(s) // want: nil-deref
+	return closeSession(s)
 }
 
 // KNOWN-FP(phase-5): FP/requires-lifting — length-guard established by

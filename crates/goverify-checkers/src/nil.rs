@@ -61,10 +61,15 @@ impl Checker for NilChecker {
             return Vec::new();
         };
         let mut out = Vec::new();
+        let sites = deref_sites(p, func);
+        let idom = goverify_analysis::dominators(&enc.dag_succs);
+        let assume = |bi: usize, ii: usize| {
+            crate::shared::checked_deref_assumptions(&sites, &enc, &idom, bi, ii)
+        };
         // Own deref sites: every subject whose nil path is reachable
         // (Sat-gated) and expressible over this function's own params.
-        for (bi, _ii, subject, _pos) in deref_sites(p, func) {
-            let Some(subj) = enc.value(subject).cloned() else {
+        for (bi, ii, subject, _pos) in &sites {
+            let Some(subj) = enc.value(*subject).cloned() else {
                 continue;
             };
             let Ok(is_nil) = ptr_is_nil(subj) else {
@@ -73,7 +78,9 @@ impl Checker for NilChecker {
             if !params_only(&is_nil) {
                 continue; // not expressible as a precondition over params
             }
-            if discharge(&enc.reach_query(bi, vec![is_nil.clone()])) != SatResult::Sat {
+            let mut extra = assume(*bi, *ii);
+            extra.push(is_nil.clone());
+            if discharge(&enc.reach_query(*bi, extra)) != SatResult::Sat {
                 continue; // guarded (unsat) or unknown: stay silent
             }
             let Ok(nonnil) = Term::not(is_nil) else {
@@ -89,7 +96,16 @@ impl Checker for NilChecker {
         }
         // Propagated: violable callee requires expressible over this
         // function's own params, bottom-up through the SCC fixpoint.
-        propagate_requires(p, func, &enc, "nil-deref", summary_of, discharge, &mut out);
+        propagate_requires(
+            p,
+            func,
+            &enc,
+            "nil-deref",
+            summary_of,
+            discharge,
+            &assume,
+            &mut out,
+        );
         out
     }
 
@@ -113,6 +129,11 @@ impl Checker for NilChecker {
         };
         let pre = own_preconditions(&summary_of(f));
         let mut out = Vec::new();
+        let sites = deref_sites(p, func);
+        let idom = goverify_analysis::dominators(&enc.dag_succs);
+        let assume = |bi: usize, ii: usize| {
+            crate::shared::checked_deref_assumptions(&sites, &enc, &idom, bi, ii)
+        };
 
         // Local manifest sites: subject term ground (const nil reached
         // through modeled ops) or params-only (then preconditions decide).
@@ -125,11 +146,11 @@ impl Checker for NilChecker {
         // (malformed/fuzzed .gvir) gets no defining assert from
         // `declare_value`, so treating it as ground would manufacture a
         // finding off a genuinely free variable.
-        for (bi, _ii, subject, pos) in deref_sites(p, func) {
-            let Some(subj) = enc.value(subject).cloned() else {
+        for (bi, ii, subject, pos) in &sites {
+            let Some(subj) = enc.value(*subject).cloned() else {
                 continue;
             };
-            let is_const_nil = matches!(func.value(subject).kind, ValueKind::Const(ConstVal::Nil));
+            let is_const_nil = matches!(func.value(*subject).kind, ValueKind::Const(ConstVal::Nil));
             let expressible = is_const_nil || subj.free_vars().is_empty() || params_only(&subj);
             if !expressible {
                 continue; // havoc'd heap value: silent (spec §4)
@@ -138,12 +159,13 @@ impl Checker for NilChecker {
                 continue;
             };
             let mut extra = pre.clone();
+            extra.extend(assume(*bi, *ii));
             extra.push(is_nil);
             out.push(Obligation {
                 tag: "nil-deref".into(),
                 message: format!("nil dereference in {}", p.func_name(f)),
-                pos,
-                query: enc.reach_query(bi, extra),
+                pos: pos.clone(),
+                query: enc.reach_query(*bi, extra),
             });
         }
 
@@ -155,6 +177,7 @@ impl Checker for NilChecker {
             "nil-deref",
             &pre,
             summary_of,
+            &assume,
         ));
         out
     }
@@ -613,6 +636,104 @@ mod tests {
             z3_discharge()(&obs[0].query),
             SatResult::Sat,
             "the nil edge of the phi is a reachable violation"
+        );
+    }
+
+    /// Builds `t.Caller(q *T)`: `v3 = FieldAddr q .0 ; v4 = Load v3 ; call
+    /// t.F(v4)` with an extra `v5 = FieldAddr v4 .0` deref of the loaded,
+    /// havoc'd pointer either BEFORE (`deref_before_call = true`) or
+    /// AFTER the call — fix 2b's dominating-vs-not shape. Returns the
+    /// candidate obligations from `NilChecker.obligations` on the caller,
+    /// with `t.F`'s own inferred `¬nil(p0)` requirement wired through
+    /// `summary_of` exactly as the real engine would (mirrors
+    /// `const_nil_arg_produces_obligation_other_args_dont`).
+    fn dominating_deref_fixture(deref_before_call: bool) -> Vec<Obligation> {
+        let mut v3 = field_addr_on(3, 1); // v3 = FieldAddr(q, .0)
+        v3.r#type = 2; // *T: usable as Load's address operand
+        let mut v4 = instr("UnOp");
+        v4.register = 4;
+        v4.r#type = 2; // *T: the loaded, havoc'd pointer
+        v4.operands = vec![3];
+        v4.sem = Some(Sem::Unop(gvir::UnOpSem {
+            op: "*".into(),
+            comma_ok: false,
+        }));
+        let v5 = field_addr_on(5, 4); // v5 = FieldAddr(v4, .0): the deref
+        let call = call_static("t.F", 0, 0, vec![4]);
+        let instrs = if deref_before_call {
+            vec![v3, v4, v5, call, instr("Return")]
+        } else {
+            vec![v3, v4, call, v5, instr("Return")]
+        };
+        let caller = gvir::Function {
+            id: "t.Caller".into(),
+            params: vec![gvir::Param {
+                id: 1,
+                name: "q".into(),
+                r#type: 2,
+            }],
+            blocks: vec![block(0, instrs, vec![])],
+            ..Default::default()
+        };
+        let p = pkg_with_ptr_types(vec![
+            deref_func(vec![block(
+                0,
+                vec![field_addr_on_param(), instr("Return")],
+                vec![],
+            )]),
+            caller,
+        ]);
+        let callee_id = p.lookup_func("t.F").unwrap();
+        let caller_id = p.lookup_func("t.Caller").unwrap();
+        let requires: Vec<Clause> =
+            NilChecker.infer_requires(&p, callee_id, &no_summaries, &mut z3_discharge());
+        assert!(!requires.is_empty(), "precondition of this test");
+        let summary_with_f_only = |f: FuncId| {
+            let mut s = Summary::default();
+            if f == callee_id {
+                s.requires = requires.clone();
+            }
+            s
+        };
+        let caller_requires =
+            NilChecker.infer_requires(&p, caller_id, &summary_with_f_only, &mut z3_discharge());
+        let summary_of = |f: FuncId| {
+            let mut s = Summary::default();
+            if f == callee_id {
+                s.requires = requires.clone();
+            } else if f == caller_id {
+                s.requires = caller_requires.clone();
+            }
+            s
+        };
+        NilChecker.obligations(&p, caller_id, &summary_of)
+    }
+
+    #[test]
+    fn dominating_deref_discharges_call_obligation() {
+        // Caller: v3 = FieldAddr p0 .0 ; v4 = Load v3 ; v5 = FieldAddr v4 .0
+        // (a dereference of the LOADED, havoc'd pointer v4) ; then
+        // Call callee(v4) where callee requires ¬nil(p0).
+        // Before fix 2b the call obligation is Sat (v4 is a free heap
+        // value). With the dominating deref at v5 assumed to have
+        // succeeded, it must discharge Unsat: no finding.
+        let obs = dominating_deref_fixture(true);
+        let mut d = z3_discharge();
+        assert!(
+            obs.iter().all(|o| d(&o.query) != SatResult::Sat),
+            "call obligation dominated by a prior deref of the same value must be Unsat (fix 2b): {obs:?}"
+        );
+    }
+
+    #[test]
+    fn later_deref_grants_no_assumption() {
+        // Same shape but the extra FieldAddr deref of v4 comes AFTER the
+        // call instruction: nothing dominates the call, obligation stays Sat.
+        let obs = dominating_deref_fixture(false);
+        let mut d = z3_discharge();
+        assert!(
+            obs.iter().any(|o| d(&o.query) == SatResult::Sat),
+            "an obligation with no dominating deref must survive (fix 2b red): {obs:?}"
         );
     }
 }

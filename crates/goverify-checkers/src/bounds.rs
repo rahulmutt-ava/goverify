@@ -488,7 +488,16 @@ impl Checker for BoundsChecker {
             );
         }
         for tag in ["bounds", "div-zero", "overflow"] {
-            propagate_requires(p, func, &enc, tag, summary_of, discharge, &mut out);
+            propagate_requires(
+                p,
+                func,
+                &enc,
+                tag,
+                summary_of,
+                discharge,
+                &|_, _| Vec::new(),
+                &mut out,
+            );
         }
         out
     }
@@ -528,7 +537,15 @@ impl Checker for BoundsChecker {
         }
 
         for tag in ["bounds", "div-zero", "overflow"] {
-            out.extend(call_site_obligations(p, func, &enc, tag, &pre, summary_of));
+            out.extend(call_site_obligations(
+                p,
+                func,
+                &enc,
+                tag,
+                &pre,
+                summary_of,
+                &|_, _| Vec::new(),
+            ));
         }
         out
     }

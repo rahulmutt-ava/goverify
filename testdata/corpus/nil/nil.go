@@ -86,3 +86,20 @@ func StoreInvalidates(h *holder, fresh *inner) int {
 	h.cached = fresh
 	return use(h.cached) // want: nil-deref
 }
+
+// --- fix-wave fix 2b: checked-deref (not just nil-check) dominance ---
+
+// DerefThenCall (fix 2b): the field read itself — not a nil-check —
+// dominates the call; reaching the call means the deref succeeded, so
+// the callee's non-nil requirement is met. Green: no finding.
+func DerefThenCall(h *holder) int {
+	n := h.cached.n
+	return n + use(h.cached)
+}
+
+// CallThenDeref (fix 2b red): the call precedes any deref — nothing
+// dominates it, the obligation must survive.
+func CallThenDeref(h *holder) int {
+	n := use(h.cached) // want: nil-deref
+	return n + h.cached.n
+}

@@ -66,10 +66,11 @@ be added, not silently tolerated.
   equal even across function calls. A callee that mutates the re-read
   field between a caller's check and its use is missed at the re-read
   site. Stores and unmodeled (Havoc) effects still invalidate.
-- **uintptr-derived pointers are non-nil** (`op_def` Convert arm): a
-  pointer minted via uintptr arithmetic
-  (`unsafe.Pointer(uintptr(base)+off)`) is assumed non-nil; deliberate
-  wraparound to exactly address 0 is assumed away. Plain
+- **uintptr-derived pointers are non-nil** (`op_def` Convert arm,
+  `uintptr_provenance`): any pointer that transits uintptr is assumed
+  non-nil — including zero-valued uintptrs from parameters, calls, or
+  stored handles, and exact nil→uintptr→pointer round-trips;
+  deliberate wraparound is a special case. Plain
   pointer→unsafe.Pointer→pointer puns keep their nilability.
 - **Curated constructor trust** (`NEVER_NIL_RESULT`): externs in the
   table (currently `flag.NewFlagSet`) are trusted to return non-nil

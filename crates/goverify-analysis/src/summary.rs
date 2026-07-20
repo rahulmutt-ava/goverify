@@ -273,7 +273,7 @@ mod tests {
         let callee = callee_with_ensures(vec![nonnil_result_clause(0)]);
         let dst = Term::var("v7", ptr_sort());
         let bound = instantiate_ensures(&callee, &[], &[Some(dst)]);
-        assert_eq!(bound.len(), 1);
+        assert_eq!(bound.len(), 1, "one ensures clause in, one bound clause out");
         let b = bound[0]
             .bound
             .as_ref()
@@ -320,7 +320,7 @@ mod tests {
         let vars = b.free_vars();
         let mut free: Vec<&String> = vars.keys().collect();
         free.sort();
-        assert_eq!(free, vec!["va", "vd"]);
+        assert_eq!(free, vec!["va", "vd"], "mixed p0/r0 clause binds both caller terms");
     }
 
     #[test]
@@ -330,7 +330,8 @@ mod tests {
         let callee = callee_with(vec![nonnil_result_clause(0)]);
         assert_eq!(
             instantiate_requires(&callee, &[Some(ptr_nil())])[0].violation,
-            None
+            None,
+            "instantiate_requires must keep rejecting r<i> vars"
         );
     }
 }

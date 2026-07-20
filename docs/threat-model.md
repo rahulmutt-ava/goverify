@@ -61,11 +61,16 @@ the enemy) buys precision with four enumerated blind spots. Each is a
 conscious trade, not an accident — anything found missing here should
 be added, not silently tolerated.
 
-- **Load forwarding ignores calls** (`encode_load_forwarding`): two
-  reads of the same address with no intervening store are modeled as
-  equal even across function calls. A callee that mutates the re-read
-  field between a caller's check and its use is missed at the re-read
-  site. Stores and unmodeled (Havoc) effects still invalidate.
+- **Load forwarding ignores anything that isn't a store**
+  (`encode_load_forwarding`): two reads of the same address with no
+  intervening store are modeled as equal. Function calls don't
+  invalidate forwarding — but neither do goroutine spawns (`go`),
+  deferred calls, or any other register-producing unmodeled op
+  (`Havoc` with a dst); a callee/goroutine/deferred call that mutates
+  the re-read field between a caller's check and its use is missed at
+  the re-read site. Only a `Store` (including map updates, which lower
+  to `Store`) or a dst-less unmodeled effect (`Havoc` with no dst)
+  invalidates forwarding.
 - **uintptr-derived pointers are non-nil** (`op_def` Convert arm,
   `uintptr_provenance`): any pointer that transits uintptr is assumed
   non-nil — including zero-valued uintptrs from parameters, calls, or

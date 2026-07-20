@@ -1,8 +1,23 @@
-// Package knownfp pins CURRENT false-positive analyzer behavior found
-// by the phase-4 bbolt shakeout (docs/shakeout-phase4-bbolt.md). Every
-// want here is a KNOWN FP: phase 5 must make it disappear and flip the
-// pin. Do not "fix" these functions — their unsafety-to-the-analyzer is
-// the point.
+// Package knownfp pins false-positive analyzer behavior found by the
+// phase-4 bbolt shakeout (docs/shakeout-phase4-bbolt.md), post the
+// 2026-07-20 FP/encoding fix-wave (fixes 1-5, commits 9c9d99f..788f25a;
+// re-run + gate results: docs/shakeout-phase4-bbolt.md's "Fix-wave
+// re-run" addendum). Two kinds of `// want` live here now:
+//
+//   - FIXED / FIXED-partially: the pin is a GREEN REGRESSION CASE. The
+//     analyzer no longer reports the FP at that line (or reports fewer
+//     of the family's original findings); do not "unfix" these — they
+//     guard against the fix-wave regressing.
+//   - KNOWN-FP(phase-5) and residual KNOWN-FP entries below: the pin is
+//     STILL a live false positive. These are the families this wave's
+//     narrow, same-function/same-Convert mechanisms don't reach: plain
+//     FP/invariant (whole-program construction invariants), FP/requires-
+//     lifting (cross-call-boundary postconditions), and re-attributed
+//     residuals (call-boundary-indirected unsafe-pointer arithmetic,
+//     closure-capture boundaries, SCC-widening) documented in the
+//     addendum's gate-1/gate-3 sections — all awaiting their own wave.
+//     Do not "fix" these functions — their unsafety-to-the-analyzer is
+//     still the point until that wave lands.
 //
 // One minimal repro per FP mechanism group (not per class — the bbolt
 // shakeout triaged 968 confirmed-FP findings into 438 classes, far too

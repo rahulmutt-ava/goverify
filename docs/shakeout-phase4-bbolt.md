@@ -780,3 +780,293 @@ are recorded below instead.
 | FP/encoding group 1 — same-function dominating check not carried forward | C015a, C007a, C012 | Every minimal repro tried (a receiver from a branching constructor, a bare field/pointer-chain `!= nil` comparison checked twice around an intervening call, both flat map-field and two-hop pointer-field forms) produced no finding at either check. This checker snapshot does not appear to attach a nil-deref obligation to a bare `!= nil` comparison read in isolation — only to reads that flow into a further call, index, or arithmetic operation — so the mechanism doesn't reproduce standalone. |
 | FP/encoding group 4 — stdlib constructor documented never-nil | C003 | Reproducing it needs a genuine external-package constructor (the point is that the analyzer treats an opaque dependency's return as generically nilable). Pulling in a real stdlib package ("flag") to test this dragged its entire transitive closure into the corpus's whole-DAG analysis and empirically blew the single-test run past 30 minutes — unacceptable for a blocking-tier corpus test — so this was reverted before it could even be assessed for correctness. |
 | FP/encoding group 5 — nil-map range is legal | C038 | Same underlying reason as group 1 above: ranging over a map field used only for a nil-safe operation (`range`, which never dereferences a nil map) didn't register as an obligation site in either a bare-map-field or two-hop pointer-field form. |
+
+## Fix-wave re-run (2026-07-20)
+
+Status: gate check 2 initially triggered a hard-stop (task-9 report,
+`.superpowers/sdd/task-9-report.md`); a follow-up per-commit bisection
+investigation (`.superpowers/sdd/task-9-investigation.md`, gitignored —
+its evidence is reproduced inline below since it cannot be
+cross-referenced from a committed doc) resolved all three open questions.
+This section records the re-run, the four gate outcomes as adjudicated
+after that investigation, and the wave's honest net effect.
+
+### Run parameters
+
+- goverify commit: `5e891cf0478217d9896b572f19f53d7d09bb8c8a` (branch
+  `fixwave/fp-encoding`, fixes 1-5: commits `9c9d99f..788f25a`)
+- bbolt ref: v1.4.0
+- timeouts: infer 100 ms / obligation 250 ms (defaults, unchanged)
+- findings: **509** (baseline: 1006 — a 497-finding, 49.4% reduction)
+- wall clock: cache-cleared 108 s; warm (cache reused) 23-25 s across two
+  repeated runs
+- **cold-run caveat**: the phase-4 baseline's cold figure (372.47 s)
+  included a first-ever bbolt clone plus a from-scratch release build.
+  Neither was needed here (already present from prior sessions), so 108 s
+  reflects only clearing the SMT query cache, not a true first-run figure.
+- **determinism note**: three independent runs (cache-cleared + two warm)
+  produced byte-identical finding *headers* (509/509, signature-level diff
+  empty). The only non-determinism observed was in solver counterexample
+  witnesses (`with:`/occasional `path:` detail) — cosmetic, outside the
+  `(file:line:col, tag)` signature every gate check and the bucketer's own
+  class-key are keyed on.
+
+### Before/after totals per verdict bucket
+
+| verdict (baseline) | baseline rows | rows still present (same signature) | vanished |
+|---|---|---|---|
+| TP | 33 | 24 | 9 |
+| FP/encoding | 434 | 167 | 267 |
+| FP/invariant | 410 | 217 | 193 |
+| FP/requires-lifting | 124 | 102 | 22 |
+| mixed (C015b) | 5 | not separately gated | — |
+| **total** | **1006** | — | — |
+
+New-run total: 509 findings.
+
+### Before/after per fixed mechanism
+
+Fixes 1-5 collectively target FP/encoding mechanisms 1-5 (fix1→mechanism 2,
+fix2a/2b→mechanism 1, fix3→mechanism 3, fix4→mechanism 4, fix5→mechanism
+5); mechanism 6 (other/misc) and the bounds/overflow checkers were not
+touched by this wave.
+
+- **FP/encoding overall (mechanisms 1-5 combined): 434 → 167 findings
+  (61.5% reduction)**, 185 → 101 classes fully at zero.
+- **Mechanism 5 (nil-map range, fix 5) — the one mechanism with a
+  pre-documented partial result**: C038's 8 original findings → 4 remain
+  (hashmap.go:237:29, 255:29, 271:27, shared.go:224:24 — SCC-widening
+  residual, Task 7, binding, not re-litigated here).
+- A fully exhaustive per-position reclassification into mechanisms 1/2/3/4
+  vs. 6 for all 434 baseline findings was not redone from scratch for this
+  task (that is itself the "83-class residual coverage decision" scope
+  question below, not a bookkeeping gap); the class-level "reason" text in
+  this doc's per-class table records each class's dominant, triage-time
+  mechanism attribution, and gate 1 below is evaluated against that
+  attribution plus targeted case-study verification.
+- FP/requires-lifting: 124 → 102 (22 vanished, ~18%) — Use/closeSession
+  (C031a/C053b family) plus the writeMeta relocation (see gate 3).
+- FP/invariant: 410 → 217 (193 vanished, ~47%) — see gate 4; larger than
+  any mechanism this wave nominally targeted, a side effect of fix 2b's
+  dominance reasoning applying wave-wide across verdict buckets, not just
+  FP/encoding.
+
+### Gate 1 — vanished-class check: FAILS the plan's numeric bar (≥156 classes at zero); documented as a plan-expectation miss, not fix bugs
+
+- 185 baseline FP/encoding classes; **101 fully vanished** (zero surviving
+  positions); **84 have ≥1 surviving position** (167/434 findings survive,
+  61.5% reduction at the finding level).
+- Of the 84 survivors, **1 is the pre-documented C038 exception** (4
+  positions, SCC-widening family, Task 7, binding — not a fix bug, not
+  re-litigated).
+- The remaining **83 classes** are the call-boundary / closure-capture /
+  cross-function-postcondition **generalization of C038's own theme**: the
+  fixes provably implement their specified *same-function* mechanisms (the
+  corpus regression suite for fixes 1-5 passes in full — see Step 4 below),
+  but real bbolt code routes the same textual patterns through boundaries
+  those same-function mechanisms don't reach. Three verified case studies
+  (via `goverify debug ir` + source inspection, not assumption):
+  - **C001** (43 baseline findings, 27 survive): `internal/common/inode.go`'s
+    `elem := p.LeafPageElement(...)` computes its pointer via a **call** to
+    a shared `UnsafeIndex` helper
+    (`(*leafPageElement)(UnsafeIndex(unsafe.Pointer(p), ...))`), not an
+    inline `uintptr(...)+offset` conversion in the same function. Fix 3's
+    Convert-arm non-nil assertion fires only when the uintptr arithmetic is
+    syntactically inline in the *same* Convert; it does not propagate as a
+    callee postcondition across the extra `UnsafeIndex` call boundary that
+    bbolt's real code factors this into (the corpus's `elemAt` inlines
+    everything in one function; `LeafPageElement`/`BranchPageElement` do
+    not).
+  - **C009b** (7 baseline findings, 7 survive — 100%, despite being the
+    class explicitly pinned as fixed via the `BuildSurgeryOptions` corpus
+    case): every real-bbolt instance
+    (`newSurgeryClearPageCommand`/`newSurgeryClearPageElementsCommand`/etc.)
+    has a `RunE: func(cmd, args) error { ... o.Validate() ... }`
+    **closure** sitting between `var o T` and the later
+    `o.AddFlags(...)`/`o.Validate()` call; the corpus repro has no such
+    closure. Fix 1's never-nil-Alloc-dst fact, established for `o` in the
+    enclosing function, does not visibly reach the closure's own analysis
+    of the captured variable.
+  - **C030** (6 baseline findings, 1 survives — `tx.go:338:59`,
+    `tx.db.meta().Freelist()`): the 5 that vanished were "is tx.db nil"
+    dominance cases (soundly fixed by fix 2b); the 1 survivor's subject is
+    the **return value of `DB.meta()`** — a cross-function postcondition
+    ("does `meta()` ever return nil?") that same-function dominance was
+    never going to reach.
+- **Full survivor-class enumeration** (84 classes, by tag; bounds/overflow
+  survivors are trivially expected since neither checker was touched by
+  this wave):
+  - nil-deref (73, excl. C038): C001, C002b, C007a, C008a, C009b, C012,
+    C014a, C017a, C022a, C030, C033, C039b, C055, C057, C060a, C061, C071,
+    C088, C090b, C095, C105, C106b, C109, C110, C115, C116a, C118b, C126,
+    C132, C140, C146, C153, C154, C155, C156, C163, C164, C172, C174,
+    C175, C189, C209, C211, C214, C232, C234, C236, C238, C241, C244,
+    C245, C251, C260, C264, C267, C268, C271, C274, C280, C327, C330,
+    C333, C336, C346, C351, C354, C357, C359, C361, C390, C391, C394
+  - bounds (9): C062, C215, C217, C218b, C399, C400, C401, C404, C408
+  - overflow (2): C064, C226
+  - nil-deref, mechanism 5 exception (1, pre-documented): C038
+- **Plan-owner decision required**: closing the 83-class residual requires
+  cross-function capabilities not in this fix-wave's plan (interprocedural
+  propagation of non-nil facts across a call to a small shared helper,
+  across closure-capture boundaries, and across certain postcondition-style
+  cross-function facts). Accept as wave 1 + a follow-up wave, or extend
+  this wave's scope — not a call this task makes unilaterally.
+
+### Gate 2 — TP preservation (hard gate): PASSES at the letter after re-adjudication; one substantive cost to headline
+
+All 9 originally-missing baseline TP-row signatures were bisected
+per-commit (worktree builds of `6c1b879`/`9c9d99f`/`1feef18`/`3de8824`/
+`d9ace1f`/`4ab6f54` against a shared `.gvir` extraction, since
+`extractor`/`proto` are byte-identical across the whole wave). All 9 are
+**sound attribution shifts** — the underlying vulnerability subject
+remains separately caught (5 classes: C213, C097/C037a-family, C084, C380,
+C049b — same-function redundant outer-receiver recheck discharged by a
+dominating earlier deref, deeper subject unaffected), and the 6th
+(**C083**) is a **mis-triage correction**, not a lost detector:
+
+- **C083 itself is a sound discharge of a genuinely false positive.**
+  `main.go:1035:28` was a lifted `options *BenchOptions != nil`
+  precondition on `runWrites`, raised at its call site in
+  `benchCommand.Run`. `Run` dereferences `options` unconditionally and
+  repeatedly *before* line 1035 (`options.Work` at 1015, `options.Path` at
+  1016/1022, `options.NoSync` at 1026) — every one of these strictly
+  dominates 1035, so fix 2b's dominance reasoning correctly proves
+  `options` non-nil there: if `options` were nil, `Run` would already have
+  panicked at 1015. The baseline finding was a checker gap (dominance
+  wasn't tracked pre-fix), not a live bug — the same textbook discharge
+  already blessed for C213/C097/C084/C380/C049b.
+
+- **Headline cost — the real FillPercent bug it was misattributed to has
+  lost all detection.** The genuine, reachable panic is in
+  `runWritesWithSource` at **`cmd/bbolt/main.go:1191`**:
+  ```go
+  b, _ := tx.CreateBucketIfNotExists(benchBucketName) // error IGNORED
+  b.FillPercent = options.FillPercent                 // deref possibly-nil b
+  ```
+  `CreateBucketIfNotExists` returns `(nil, err)` on failure; discarding the
+  error and writing `b.FillPercent` panics when a prior `-work` run left an
+  incompatible non-bucket value at the key. This exact statement (line
+  1191) was **never** flagged in *any* run, baseline included — `b` is a
+  havoc'd call-result value, and `nil.rs`'s `obligations()` only raises a
+  manifest finding when the subject is `is_const_nil`, has no free
+  variables, or is params-only (nil.rs:149-157); a call-extract result is
+  none of these, so the true first-failure site has always been
+  inexpressible as a local obligation (a pre-existing phase-4 gap, not
+  introduced by this wave). Baseline detection instead came entirely from
+  *downstream* re-derefs of the same `b` — `main.go:1202:20` (`b.Put`,
+  triaged **C190 / FP/encoding**) and the nested variants at `1239:41`/
+  `1254:20` (triaged **C031a / FP/requires-lifting**). Post-fix-2b, the
+  store at 1191 strictly dominates the loop body containing 1202, so
+  fix 2b's `¬is_nil(b)` dominance fact discharges `b.Put`'s receiver
+  requirement too — locally sound (reaching 1202 means 1191's store
+  already executed, which faults on nil `b`) — and the nested call sites
+  are discharged the same way. **Net effect: every detector of a real,
+  reachable panic is now silent, each individual discharge is sound, and
+  the aggregate loses the bug.** In-wave repair is out of scope: fixing
+  1191 directly would require lifting a callee postcondition
+  (`CreateBucketIfNotExists`'s `err == nil ⇒ result != nil`) across an
+  ignored-error boundary — exactly the requires-lifting capability this
+  wave doesn't implement — and any narrower patch risks reintroducing the
+  FP/encoding classes fix 2b correctly retired. Phase-5 callee-postcondition
+  / ignored-error work must restore this detector; recorded here as the
+  wave's principal known cost.
+
+- **Triage-quality implication**: baseline verdicts contain at least one
+  TP/FP inversion. The row labelled TP (`C083`/1035) was the soundly-
+  dischargeable false positive; the rows that actually covered the real
+  bug (`C190`@1202, `C031a`@1239/1254) were triaged FP. The gate's raw
+  "9 missing TP rows" count therefore *understates* the problem for this
+  specific case: no TP *row* was truly lost, but a real, reachable bug
+  that baseline caught is now caught nowhere.
+
+**Verdict: gate 2 passes** (no genuine true positive lost at the row
+level; all 9 signatures are sound), **with the FillPercent detection loss
+recorded as the wave's most important open cost**, not folded into a
+clean pass.
+
+### Gate 3 — no new signatures: PASSES with explanations, both resolved
+
+- **`tx.go:558:11`** (nil-deref, `writeMeta`): this is **C185**'s
+  `writeMeta` concern (`tx.go:570:22`, `fdatasync` call-site requires,
+  FP/requires-lifting) relocated by fix 2b to the function's *earliest*
+  dereference of `tx.db` (`lg := tx.db.Logger()`, the function's first
+  statement) — the later `fdatasync(tx.db)` call is then soundly
+  discharged by dominance from this earlier point. Coverage is preserved;
+  this is gate-4 (requires-lifting) territory, an allowed shrinkage, not a
+  new bug. Its sibling, C185's `write()` half (`tx.go:526:22`), relocated
+  identically to `tx.go:480:11` at fix 2b, but was then **removed
+  entirely by fix 3** (`d9ace1f`) — `write()` has zero findings in the
+  current build, with no surviving replacement. `write()` contains uintptr
+  arithmetic (`written += uintptr(sz)`, `common.UnsafeByteSlice(...)`)
+  that `writeMeta` does not, which is why fix 3 (uintptr-provenance work)
+  affects one and not the other; the removal is a genuine solver-result
+  change from fix 3's added asserts, not a skipped/bailed-out function.
+  Recorded as an asymmetry worth flagging: two mitigating caveats keep it
+  from being a lost *true* bug — C185 itself is triaged FP/requires-lifting
+  (a checker gap, not a real vulnerability), and the relocated
+  480/558 receiver-nil manifest finding is itself most likely an FP
+  (`write`/`writeMeta` are only ever called on a live, open `tx` during
+  commit) — so `write()` ending clean is arguably the better outcome, and
+  `writeMeta` retaining 558 is arguably a residual FP rather than a
+  meaningful detector. The asymmetry (relocated-then-removed vs.
+  relocated-and-kept) is nonetheless real and worth a plan-owner's
+  attention.
+- **`cmd/bbolt/command_surgery.go:268:55`** (overflow,
+  `surgeryClearPageElementFunc`): this is **C221**'s manifest overflow
+  inside `ClearPageElements` (`internal/surgeon/surgeon.go:78:20`,
+  `p.SetCount(uint16(start))`) converted by **fix 3** (`d9ace1f`) into an
+  interprocedural overflow `requires` on `ClearPageElements` itself. All
+  three call sites were checked for consistency: `ClearPageElements`'s
+  only call with an unbounded caller value
+  (`command_surgery.go:268`, `cfg.startElementIdx`, a raw CLI int) is
+  flagged; `internal/surgeon/surgeon.go:20`'s `ClearPage` (which always
+  passes the literal `start=0`) and its sole caller
+  (`command_surgery.go:201`) are silent because `0` is provably in
+  `uint16` range. Detection of the uint16 truncation is **preserved**, and
+  arguably **more precise** than baseline: the old manifest fired
+  unconditionally inside the callee (including on the always-safe
+  `start=0` path); the new requires fires exactly at the one call site
+  that can actually overflow.
+
+### Gate 4 — requires-lifting / invariant delta (report-only, not gated)
+
+- FP/requires-lifting: 124 → 102 (22 vanished, ~18%) — the documented
+  Use/closeSession (C031a/C053b family, fix 2b) resolution plus the
+  writeMeta relocation (gate 3).
+- FP/invariant: 410 → 217 (193 vanished, ~47%) — substantially larger than
+  any verdict bucket this wave explicitly targeted. This is the same
+  dominance mechanism (fix 2b) discharging redundant same-function
+  re-checks wave-wide, not confined to FP/encoding or TP rows; it should
+  be read as further evidence that fix 2b's effect is systemic across
+  verdict buckets rather than scoped narrowly to "mechanism 1."
+
+### Known costs and open items
+
+1. **FillPercent detection loss** (gate 2): the reachable panic at
+   `cmd/bbolt/main.go:1191` (`b, _ := tx.CreateBucketIfNotExists(...);
+   b.FillPercent = ...`, ignored error) is detected at no site in the
+   current build. Every prior detector (`main.go:1035:28`/1202:20/1239:41/
+   1254:20) is now soundly discharged by fix 2b's dominance reasoning, but
+   the true first-failure site was never locally expressible (a
+   pre-existing gap: a havoc'd call-result subject doesn't qualify for a
+   manifest obligation under `nil.rs`'s `obligations()` — needs
+   `is_const_nil`, no free vars, or params-only). Restoring detection
+   needs phase-5 callee-postcondition / ignored-error-result lifting work
+   (lifting `CreateBucketIfNotExists`'s `err == nil ⇒ result != nil`
+   across the `b, _ := ...` discard) — out of scope for an in-wave patch,
+   which risks reintroducing the FP/encoding classes fix 2b correctly
+   retired.
+2. **83-class gate-1 residual** (gate 1): a plan-owner decision — bless
+   the C038-style closure/call-boundary/cross-function-postcondition gap
+   wave-wide (generalizing the existing Task 7 adjustment, at roughly 20x
+   its original scope) and accept as wave 1 + a follow-up wave, or treat
+   the residual as unfinished scope for this wave.
+3. **Triage TP/FP inversion** (gate 2): baseline verdicts contain at least
+   one confirmed TP/FP inversion — `C083` (labelled TP) is the sound
+   discharge; `C190`/`C031a` (labelled FP) covered the real bug. Worth a
+   note for anyone re-deriving FP-rate statistics from the phase-4 totals
+   above: the headline FP-rate arithmetic is unaffected (both sides of the
+   inversion are single-digit finding counts), but it's a data point that
+   phase-4's per-class triage, while extensively cross-checked, was not
+   immune to this failure mode.

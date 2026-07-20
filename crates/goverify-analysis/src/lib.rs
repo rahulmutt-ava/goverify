@@ -15,8 +15,8 @@ pub use checker::{Checker, Finding, Obligation, TraceStep};
 pub use dom::{dominators, strictly_dominates};
 pub use effects::{ChanOp, Effects, Loc, LockOp, Root, Spawns, collect};
 pub use encode::{
-    EncodedFunc, array_len, cut_back_edges, encode_func, guard_values, int_repr, model_bindings,
-    seq_datatype, sort_of, violating_path,
+    EncodedFunc, array_len, cut_back_edges, encode_func, encode_func_with, guard_values, int_repr,
+    model_bindings, seq_datatype, sort_of, violating_path,
 };
 pub use engine::{
     Analysis, BackendRole, EngineConfig, Options, analyze, analyze_full, dump_findings,

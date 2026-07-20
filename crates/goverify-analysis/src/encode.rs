@@ -238,6 +238,21 @@ fn value_name(f: &Function, v: ValueId) -> String {
 }
 
 pub fn encode_func(p: &Program, f: FuncId) -> Result<EncodedFunc, String> {
+    encode_func_with(p, f, &|_| crate::summary::Summary::havoc())
+}
+
+/// `encode_func` plus callee postconditions: after the defining
+/// equalities, every static call whose callee summary is Inferred and
+/// carries ensures gets each clause bound (p<i> := arg terms, r<i> :=
+/// result terms) and asserted GATED on the call's block guard
+/// (¬g_b ∨ clause): a postcondition holds only on executions that
+/// performed the call. Unbindable clauses are skipped — weaker, never
+/// wrong.
+pub fn encode_func_with(
+    p: &Program,
+    f: FuncId,
+    summary_of: &dyn Fn(FuncId) -> crate::summary::Summary,
+) -> Result<EncodedFunc, String> {
     let func = p
         .func(f)
         .ok_or_else(|| format!("{}: no body to encode", p.func_name(f)))?;
@@ -272,6 +287,7 @@ pub fn encode_func(p: &Program, f: FuncId) -> Result<EncodedFunc, String> {
     // everything else keeps its declared-but-unconstrained (havoc) dst.
     encode_ops(p, func, &mut enc);
     encode_load_forwarding(func, &mut enc);
+    encode_call_ensures(p, func, summary_of, &mut enc);
     if enc.asserts.len() > ASSERT_CAP {
         return Err(format!(
             "{}: encoding exceeds {ASSERT_CAP} assertions; skipped",
@@ -705,6 +721,89 @@ fn encode_load_forwarding(func: &Function, enc: &mut EncodedFunc) {
                 }
                 Op::Store { .. } | Op::Havoc { dst: None } => seen.clear(),
                 _ => {}
+            }
+        }
+    }
+}
+
+/// The r<i> binding targets for a call's results: a single-value call
+/// binds r0 to the dst's own term; a tuple call binds r<i> to the term
+/// of the first `Extract { tuple: dst, index: i }` dst in instruction
+/// order (deterministic; SSA emits at most one per index — crafted
+/// .gvir with duplicates just picks the first). A component with no
+/// Extract (`b, _ := …`) or no term stays None.
+fn call_result_terms(
+    func: &Function,
+    dst: Option<ValueId>,
+    enc: &EncodedFunc,
+) -> Vec<Option<Term>> {
+    let Some(d) = dst else { return Vec::new() };
+    if let Some(t) = enc.values.get(&d) {
+        return vec![Some(t.clone())]; // single-value call: dst has a sort
+    }
+    // Tuple-typed dst (no sort): collect Extract components.
+    let mut out: Vec<Option<Term>> = Vec::new();
+    for b in &func.blocks {
+        for ins in &b.instrs {
+            let Op::Extract {
+                dst: ed,
+                tuple,
+                index,
+            } = &ins.op
+            else {
+                continue;
+            };
+            if *tuple != d {
+                continue;
+            }
+            let i = *index as usize;
+            if out.len() <= i {
+                out.resize(i + 1, None);
+            }
+            if out[i].is_none() {
+                out[i] = enc.values.get(ed).cloned();
+            }
+        }
+    }
+    out
+}
+
+/// Assert every bindable ensures clause of every static callee with an
+/// Inferred summary, gated on the call's block guard. Havoc-provenance
+/// summaries are never consulted for facts.
+fn encode_call_ensures(
+    p: &Program,
+    func: &Function,
+    summary_of: &dyn Fn(FuncId) -> crate::summary::Summary,
+    enc: &mut EncodedFunc,
+) {
+    let _ = p;
+    for (bi, b) in func.blocks.iter().enumerate() {
+        for ins in &b.instrs {
+            let Op::Call {
+                dst,
+                callee: Callee::Static(c),
+                args,
+            } = &ins.op
+            else {
+                continue;
+            };
+            let s = summary_of(*c);
+            if s.provenance != crate::summary::Provenance::Inferred || s.ensures.is_empty() {
+                continue;
+            }
+            let arg_terms: Vec<Option<Term>> =
+                args.iter().map(|a| enc.values.get(a).cloned()).collect();
+            let result_terms = call_result_terms(func, *dst, enc);
+            let Some(g) = enc.guards.get(bi).cloned() else {
+                continue;
+            };
+            let Ok(ng) = Term::not(g) else { continue };
+            for bc in crate::summary::instantiate_ensures(&s, &arg_terms, &result_terms) {
+                let Some(bound) = bc.bound else { continue };
+                if let Ok(gated) = Term::or(vec![ng.clone(), bound]) {
+                    enc.asserts.push(gated);
+                }
             }
         }
     }
@@ -2477,5 +2576,233 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// t.Caller() { v2 = call t.Mk() } with t.Mk
+    /// given an ensures ¬is_nil(r0): reach ∧ is_nil(v2) must be Unsat
+    /// under encode_func_with, and Sat under plain encode_func (havoc).
+    #[test]
+    fn call_ensures_constrain_single_result() {
+        use goverify_extract::gvir;
+        use goverify_extract::gvir::instruction::Sem;
+        let mut call = gvir::Instruction {
+            kind: "Call".into(),
+            register: 2,
+            r#type: 2, // *T
+            operands: vec![0],
+            ..Default::default()
+        };
+        call.sem = Some(Sem::Call(gvir::CallSem {
+            static_callee: "t.Mk".into(),
+            ..Default::default()
+        }));
+        let package = gvir::Package {
+            import_path: "t".into(),
+            types: vec![
+                gvir::Type {
+                    id: 1,
+                    repr: "T".into(),
+                    kind: gvir::TypeKind::Struct as i32,
+                    ..Default::default()
+                },
+                gvir::Type {
+                    id: 2,
+                    repr: "*T".into(),
+                    kind: gvir::TypeKind::Pointer as i32,
+                    elem: 1,
+                    ..Default::default()
+                },
+            ],
+            functions: vec![
+                gvir::Function {
+                    id: "t.Mk".into(),
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![gvir::Instruction {
+                            kind: "Return".into(),
+                            ..Default::default()
+                        }],
+                        succs: vec![],
+                        preds: vec![],
+                    }],
+                    ..Default::default()
+                },
+                gvir::Function {
+                    id: "t.Caller".into(),
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![
+                            call,
+                            gvir::Instruction {
+                                kind: "Return".into(),
+                                ..Default::default()
+                            },
+                        ],
+                        succs: vec![],
+                        preds: vec![],
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let p = goverify_ir::Program::from_packages(vec![package]);
+        let mk = p.lookup_func("t.Mk").unwrap();
+        let caller = p.lookup_func("t.Caller").unwrap();
+
+        let r0 = Term::var("r0", ptr_sort());
+        let mk_summary = crate::summary::Summary {
+            ensures: vec![crate::summary::Clause {
+                tag: "nil-deref".into(),
+                formula: crate::summary::Formula {
+                    term: Term::not(ptr_is_nil(r0).unwrap()).unwrap(),
+                },
+            }],
+            ..crate::summary::Summary::default()
+        };
+        let summary_of = move |f: goverify_ir::FuncId| {
+            if f == mk {
+                mk_summary.clone()
+            } else {
+                crate::summary::Summary::default()
+            }
+        };
+
+        let mut solver = goverify_solver::Z3Native::new(goverify_solver::SolverLimits {
+            timeout_ms: 5_000,
+            mem_mb: 1024,
+        });
+        let mut discharge = |q: &goverify_solver::Query| {
+            goverify_solver::discharge_query(q, &mut solver, None, None).result
+        };
+
+        let with = encode_func_with(&p, caller, &summary_of).unwrap();
+        let dst = with.value(goverify_ir::ValueId(2)).unwrap().clone();
+        let q = with.reach_query(0, vec![ptr_is_nil(dst).unwrap()]);
+        assert_eq!(
+            discharge(&q),
+            goverify_solver::SatResult::Unsat,
+            "asserted ensures must make is_nil(dst) unreachable"
+        );
+
+        let without = encode_func(&p, caller).unwrap();
+        let dst = without.value(goverify_ir::ValueId(2)).unwrap().clone();
+        let q = without.reach_query(0, vec![ptr_is_nil(dst).unwrap()]);
+        assert_eq!(
+            discharge(&q),
+            goverify_solver::SatResult::Sat,
+            "plain encode_func keeps the havoc'd dst"
+        );
+    }
+
+    /// Same fixture as `call_ensures_constrain_single_result`, but the
+    /// callee summary carries `Provenance::Havoc` ensures: the encoder
+    /// must never consult a havoc'd summary for facts, so the assertion
+    /// stays absent and `is_nil(dst)` remains Sat even under
+    /// `encode_func_with`.
+    #[test]
+    fn havoc_provenance_summaries_assert_nothing() {
+        use goverify_extract::gvir;
+        use goverify_extract::gvir::instruction::Sem;
+        let mut call = gvir::Instruction {
+            kind: "Call".into(),
+            register: 2,
+            r#type: 2, // *T
+            operands: vec![0],
+            ..Default::default()
+        };
+        call.sem = Some(Sem::Call(gvir::CallSem {
+            static_callee: "t.Mk".into(),
+            ..Default::default()
+        }));
+        let package = gvir::Package {
+            import_path: "t".into(),
+            types: vec![
+                gvir::Type {
+                    id: 1,
+                    repr: "T".into(),
+                    kind: gvir::TypeKind::Struct as i32,
+                    ..Default::default()
+                },
+                gvir::Type {
+                    id: 2,
+                    repr: "*T".into(),
+                    kind: gvir::TypeKind::Pointer as i32,
+                    elem: 1,
+                    ..Default::default()
+                },
+            ],
+            functions: vec![
+                gvir::Function {
+                    id: "t.Mk".into(),
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![gvir::Instruction {
+                            kind: "Return".into(),
+                            ..Default::default()
+                        }],
+                        succs: vec![],
+                        preds: vec![],
+                    }],
+                    ..Default::default()
+                },
+                gvir::Function {
+                    id: "t.Caller".into(),
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![
+                            call,
+                            gvir::Instruction {
+                                kind: "Return".into(),
+                                ..Default::default()
+                            },
+                        ],
+                        succs: vec![],
+                        preds: vec![],
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let p = goverify_ir::Program::from_packages(vec![package]);
+        let mk = p.lookup_func("t.Mk").unwrap();
+        let caller = p.lookup_func("t.Caller").unwrap();
+
+        let r0 = Term::var("r0", ptr_sort());
+        let mk_summary = crate::summary::Summary {
+            ensures: vec![crate::summary::Clause {
+                tag: "nil-deref".into(),
+                formula: crate::summary::Formula {
+                    term: Term::not(ptr_is_nil(r0).unwrap()).unwrap(),
+                },
+            }],
+            provenance: crate::summary::Provenance::Havoc,
+            ..crate::summary::Summary::default()
+        };
+        let summary_of = move |f: goverify_ir::FuncId| {
+            if f == mk {
+                mk_summary.clone()
+            } else {
+                crate::summary::Summary::default()
+            }
+        };
+
+        let mut solver = goverify_solver::Z3Native::new(goverify_solver::SolverLimits {
+            timeout_ms: 5_000,
+            mem_mb: 1024,
+        });
+        let mut discharge = |q: &goverify_solver::Query| {
+            goverify_solver::discharge_query(q, &mut solver, None, None).result
+        };
+
+        let with = encode_func_with(&p, caller, &summary_of).unwrap();
+        let dst = with.value(goverify_ir::ValueId(2)).unwrap().clone();
+        let q = with.reach_query(0, vec![ptr_is_nil(dst).unwrap()]);
+        assert_eq!(
+            discharge(&q),
+            goverify_solver::SatResult::Sat,
+            "a Havoc-provenance summary's ensures must never be asserted"
+        );
     }
 }

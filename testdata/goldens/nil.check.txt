@@ -13,7 +13,24 @@ nil.go:26:39: nil-deref: call to example.com/nil.wrapper violates its nil-deref 
       |                                       ^
     path: nil.go:26
 
+nil.go:103:10: nil-deref: call to example.com/nil.use violates its nil-deref requirement [example.com/nil.CallThenDeref]
+  103 |  n := use(h.cached) // want: nil-deref
+      |          ^
+    path: nil.go:103
+    with: p0 = (ptr-addr #x0000000000000000)
+
 nil.go:31:11: nil-deref: nil dereference in example.com/nil.LocalNil [example.com/nil.LocalNil]
    31 |  return p.X // want: nil-deref
       |           ^
     path: nil.go:31
+
+nil.go:128:50: nil-deref: call to example.com/nil.RangeNilMap violates its nil-deref requirement [example.com/nil.RangeNilMapCaller]
+  128 | func RangeNilMapCaller() int { return RangeNilMap(nil) } // want: nil-deref
+      |                                                  ^
+    path: nil.go:128
+
+nil.go:87:12: nil-deref: call to example.com/nil.use violates its nil-deref requirement [example.com/nil.StoreInvalidates]
+   87 |  return use(h.cached) // want: nil-deref
+      |            ^
+    path: nil.go:83 -> nil.go:86
+    with: p0 = (ptr-addr #x0000000000000000)

@@ -52,17 +52,18 @@ func BuildSurgeryOptions() error {
 
 var errPathRequired = &constructError{}
 
-// KNOWN-FP(phase-5): FP/encoding — unsafe-pointer / pointer-arithmetic
-// derived value: `elemAt`'s pointer is computed by
-// `unsafe.Pointer(uintptr(base) + offset)` off an already-non-nil base
-// (`&buf[0]`); the arithmetic-derived offset is opaque to the checker,
-// so it flags the call as a possibly invalid access instead of relating
-// it back to buf's own length (in this checker snapshot the mismodeled
-// base+offset construct surfaces as a bounds obligation rather than the
-// nil-deref tag bbolt's real C001/C057 findings carry, but it is the
-// same "arithmetic decoupled from its non-null/in-bounds base" encoding
-// gap: mechanism group 3, 35 classes / 111 findings; exemplars C001,
-// C057, C033).
+// KNOWN-FP(phase-5): FP/requires-lifting — residual, re-attributed after
+// fix-wave fix 3 (task 5, 2026-07-20). Fix 3 (encode.rs `op_def`'s
+// `Convert` arm) now asserts non-nil on `elemAt`'s `(*elem)(...)` dst
+// itself, so the nil-deref half of mechanism group 3 is closed (see
+// `PageAt`/`page.Count` below, the green case for that half). This
+// finding persists as a `bounds` obligation for a different reason: the
+// checker has no fact relating `&buf[0]`'s (length-1-implying) address
+// back to `buf`'s own `len`, so `i`'s in-bounds-ness against `buf` can't
+// be derived through the `uintptr(base)+i*size` conversion chain — the
+// `&buf[0]` length / index-conversion shape, requires-lifting territory
+// (C101-family: bbolt's `LeafPageElement`/`BranchPageElement`, same
+// family as `BranchElemOffset` below). Exemplars C001, C057, C033.
 type elem struct{ v uint32 }
 
 func elemAt(base unsafe.Pointer, i int) *elem {
@@ -304,4 +305,25 @@ func elemOffset(base uintptr, elemSize uintptr, n int) uintptr {
 
 func BranchElemOffset(base uintptr, idx uint16) uintptr {
 	return elemOffset(base, 16, int(idx)) // want: overflow
+}
+
+// fix-wave fix 3 (green): the nil-deref manifestation of mechanism
+// group 3 — a method with an inferred non-nil-receiver requirement is
+// called on a pointer minted from uintptr arithmetic (bbolt C001's
+// db.page/LeafPageElement shape). Verified: `p.Count()` carries NO
+// nil-deref finding (fix 3 closes exactly that half of mechanism 3).
+//
+// KNOWN-FP(phase-5): FP/requires-lifting — this repro reuses the same
+// `&buf[0]` idiom as `ReadElem`/`elemAt` above, so it also inherits
+// that unrelated residual: the checker has no fact relating `&buf[0]`'s
+// address back to `buf`'s own `len`, so it raises its own `bounds`
+// obligation on the index independent of anything fix 3 touches (same
+// C101-family requires-lifting gap, not a fix-3 regression).
+type page struct{ count uint32 }
+
+func (p *page) Count() uint32 { return p.count }
+
+func PageAt(buf []byte, off uintptr) uint32 {
+	p := (*page)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + off)) // want: bounds
+	return p.Count()
 }

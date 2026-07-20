@@ -61,6 +61,15 @@ pub fn int_repr(types: &TypeTable, t: TypeId) -> Option<(u32, bool)> {
     }
 }
 
+/// Basic-type name after peeling Named wrappers; None for non-basic.
+fn basic_name(types: &TypeTable, t: TypeId) -> Option<&str> {
+    match types.kind(t) {
+        TypeKind::Named { underlying, .. } => basic_name(types, *underlying),
+        TypeKind::Basic { name } => Some(name),
+        _ => None,
+    }
+}
+
 /// The static length backing `ty`, when `ty` is itself an array OR a
 /// pointer to one (through any number of `Named` wrappers on either
 /// side, mirroring `int_repr`/`sort_of`'s own resolution — a `type Arr
@@ -657,6 +666,27 @@ fn encode_load_forwarding(func: &Function, enc: &mut EncodedFunc) {
     }
 }
 
+/// True iff `v`'s value is minted from uintptr arithmetic: v is
+/// uintptr-typed, or unsafe.Pointer-typed ("Pointer" is go/types' Basic
+/// name for it — no other Basic collides) and itself the dst of a
+/// Convert from a uintptr-provenance value. Depth-capped: .gvir bytes
+/// are untrusted and a crafted Convert cycle must degrade (to "no"),
+/// never hang — parsers of bytes the analyzer didn't write reject,
+/// never panic.
+fn uintptr_provenance(p: &Program, func: &Function, v: ValueId, depth: u32) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match basic_name(p.types(), func.value(v).ty) {
+        Some("uintptr") => true,
+        Some("Pointer") => func.blocks.iter().flat_map(|b| &b.instrs).any(|ins| {
+            matches!(&ins.op, Op::Convert { dst, src } if *dst == v
+                && uintptr_provenance(p, func, *src, depth + 1))
+        }),
+        _ => false,
+    }
+}
+
 /// The defining equality for a modeled op, if every term it needs exists;
 /// `None` = havoc (dst stays declared but unconstrained). Never panics:
 /// missing terms and out-of-range preds degrade to `None`.
@@ -793,6 +823,20 @@ fn op_def(p: &Program, func: &Function, block: usize, op: &Op, enc: &EncodedFunc
             let len = Term::dt_get(&seq_datatype(), "seq-val", "seq-len", arg).ok()?;
             Term::eq(dt, len).ok()
         }
+        // A pointer minted from uintptr arithmetic is never nil (fix-wave
+        // fix 3): unsafe.Pointer(uintptr(base)+off) idioms compute offsets
+        // from live bases, and producing exactly nil would need deliberate
+        // 64-bit wraparound — documented under-approximation (threat model,
+        // "deliberate under-approximations"). A plain pointer→unsafe.Pointer
+        // →pointer pun keeps its nilability: its provenance is a pointer,
+        // not uintptr.
+        Op::Convert { dst, src } => {
+            let d = t(dst)?;
+            if d.sort() != &ptr_sort() || !uintptr_provenance(p, func, *src, 0) {
+                return None;
+            }
+            Term::not(ptr_is_nil(d).ok()?).ok()
+        }
         // Address-of ops never produce nil (fix-wave fix 1): a Go
         // allocation, field address, or element address is a valid non-nil
         // address — the op faults on a bad base before a value exists, so
@@ -805,7 +849,8 @@ fn op_def(p: &Program, func: &Function, block: usize, op: &Op, enc: &EncodedFunc
             }
             Term::not(ptr_is_nil(d).ok()?).ok()
         }
-        _ => None, // Load/Store/Call/Convert/... havoc (declared, unconstrained)
+        _ => None, // Load/Store/Call/... havoc (declared, unconstrained); Convert havocs
+                   // except the uintptr-provenance arm above
     }
 }
 
@@ -1371,6 +1416,14 @@ mod tests {
                 elem: 1,
                 ..Default::default()
             },
+            basic(7, "uintptr"),
+            gvir::Type {
+                id: 8,
+                repr: "unsafe.Pointer".into(),
+                kind: gvir::TypeKind::Basic as i32,
+                name: "Pointer".into(),
+                ..Default::default()
+            },
         ]
     }
 
@@ -1492,6 +1545,80 @@ mod tests {
         assert!(
             enc.asserts.contains(&want),
             "FieldAddr dst must carry a non-nil assert (fix 1)"
+        );
+    }
+
+    /// Shared builder for the fix-3 uintptr-provenance tests: `reg =
+    /// Convert src`, with an explicit dst type (`*T` id 5 or
+    /// unsafe.Pointer id 8).
+    fn convert_ins(reg: u32, ty: u32, src: u32) -> goverify_extract::gvir::Instruction {
+        use goverify_extract::gvir;
+        gvir::Instruction {
+            kind: "Convert".into(),
+            register: reg,
+            r#type: ty,
+            operands: vec![src],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn uintptr_convert_chain_asserts_nonnil() {
+        // f(p0 uintptr): v2 = Convert p0 -> unsafe.Pointer;
+        //                v3 = Convert v2 -> *T.
+        // The canonical (*T)(unsafe.Pointer(uintptr...)) idiom: v3 must
+        // carry a non-nil assert (fix 3).
+        let f = goverify_extract::gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 7)], // uintptr
+            blocks: vec![block_p(
+                0,
+                vec![
+                    convert_ins(2, 8, 1), // v2 = Convert p0(uintptr) -> Pointer
+                    convert_ins(3, 5, 2), // v3 = Convert v2(Pointer) -> *T
+                    ret(vec![3]),
+                ],
+                vec![],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let enc = encode_func(&p, id).unwrap();
+        let d = enc.value(goverify_ir::ValueId(3)).unwrap().clone();
+        let want = Term::not(goverify_solver::ptr_is_nil(d).unwrap()).unwrap();
+        assert!(
+            enc.asserts.contains(&want),
+            "uintptr-derived pointer non-nil (fix 3)"
+        );
+    }
+
+    #[test]
+    fn pointer_pun_stays_nilable() {
+        // f(p0 *T): v2 = Convert p0 -> unsafe.Pointer; v3 = Convert v2 -> *T.
+        // A plain pointer pun preserves nilability: NO non-nil assert on v3.
+        let f = goverify_extract::gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 5)], // *T
+            blocks: vec![block_p(
+                0,
+                vec![
+                    convert_ins(2, 8, 1), // v2 = Convert p0(*T) -> Pointer
+                    convert_ins(3, 5, 2), // v3 = Convert v2(Pointer) -> *T
+                    ret(vec![3]),
+                ],
+                vec![],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let enc = encode_func(&p, id).unwrap();
+        let d = enc.value(goverify_ir::ValueId(3)).unwrap().clone();
+        let unwanted = Term::not(goverify_solver::ptr_is_nil(d).unwrap()).unwrap();
+        assert!(
+            !enc.asserts.contains(&unwanted),
+            "pointer pun must stay nilable (fix 3 red)"
         );
     }
 

@@ -1085,8 +1085,10 @@ original phase-4 total (1006).
 ### Run parameters
 
 - goverify branch: `summaries/interprocedural` @ `b94581a` (Tasks 1-9
-  committed and gate-green; fix-wave `5e891cf` is a verified ancestor, so
-  the wave strictly adds facts/obligations on top of the fix-wave build).
+  committed and gate-green; fix-wave `5e891cf` is a verified ancestor). The
+  wave predominantly *adds* facts/obligations on top of the fix-wave build
+  (discharging findings), with one overflow signature re-internalized — see
+  gate 3.
 - bbolt ref: v1.4.0
 - timeouts: infer 100 ms / obligation 250 ms (defaults, unchanged)
 - command: `mise run shakeout` (`scripts/shakeout.sh` → `goverify check
@@ -1105,24 +1107,43 @@ original phase-4 total (1006).
 
 ### Before/after totals per verdict bucket
 
-Each current unique signature mapped to its phase-4 (1006) triage verdict
-by `(pos, tag)`; `NEW` = signature absent from the 1006 baseline.
+Both columns are on a **unique `(pos, tag)` signature basis** — each finding
+mapped to its phase-4 (1006) triage verdict; `NEW` = signature absent from
+the 1006 baseline. The fix-wave column is recomputed directly from a re-run
+of the shakeout at fix-wave commit `5e891cf` (**509 findings, 504 unique
+signatures**); it is *not* the fix-wave doc's "rows still present" table
+above, whose 167/217/… numbers are 1006-*row* counts that over-sum the 509
+total.
 
-| verdict (phase-4 label) | fix-wave (509) | interproc re-run | delta |
+| verdict (phase-4 label) | fix-wave (504 uniq) | interproc (456 uniq) | delta |
 |---|---|---|---|
 | TP | 24 | 24 | 0 |
-| FP/encoding | 167 | 146 | −21 |
-| FP/invariant | 217 | 193 | −24 |
+| FP/encoding | 158 | 146 | −12 |
+| FP/invariant | 213 | 193 | −20 |
 | FP/requires-lifting | 102 | 86 | −16 |
 | mixed (C015b) | 5 | 5 | 0 |
-| NEW (not in 1006) | 2 | 2 | — |
-| **total (unique sigs)** | — | **456** | — |
+| NEW (not in 1006) | 2 | 2 | 0 |
+| **total (unique sigs)** | **504** | **456** | **−48** |
 
-The two `NEW` signatures are `cmd/bbolt/main.go:1191:6` (the restored
-`FillPercent` TP — see gate 1) and `tx.go:558:11` (the fix-wave `writeMeta`
-relocation, already present in the 509 baseline — see gate 3). Genuine TP
-detection is therefore **25** (24 surviving phase-4 TP rows + the restored
-1191), one more than the fix-wave, which had zero detectors for 1191.
+**Reconciliation (both bases agree at −48):**
+- unique signatures: 504 → 456 = **−48** (column deltas 0 − 12 − 20 − 16 + 0
+  + 0 = −48).
+- findings: 509 → 461 = **−48**. Both runs carry the *same* 5 multi-context
+  positions (`bucket.go:843:9`, `main.go:1634:22` ×3, `tx.go:53:16`,
+  `tx.go:561:15`), so the findings-minus-uniques offset is +5 on both sides
+  and cancels in the delta (509 − 504 = 461 − 456 = 5).
+- The earlier draft's spurious −61 came from pairing this unique-basis
+  current column against the fix-wave *doc's* row-basis numbers
+  (167/217/… summing to 517 > 509); corrected here.
+
+The `NEW (not in 1006)` bucket holds 2 signatures on each side but its
+**composition changed** (footnote → gate 3): fix-wave =
+{`command_surgery.go:268:55` overflow, `tx.go:558:11` nil-deref}; interproc =
+{`main.go:1191:6` nil-deref, `tx.go:558:11` nil-deref}. (The resurrected
+`surgeon.go:78:20` overflow is *in* the 1006 set, so it maps to FP/encoding,
+not NEW — it is the reason FP/encoding falls only −12 rather than −13; see
+gate 3.) Genuine TP detection is **25** (24 surviving phase-4 TP rows + the
+restored 1191), one more than the fix-wave, which had zero detectors for 1191.
 
 ### Gate 1 — FillPercent nil-deref exists (HARD GATE): PASSES
 
@@ -1157,28 +1178,28 @@ flagged) across the **78 PHASE5-NOTE classes**, narrowed to **102** by the
 fix-wave. **86 survive** the interprocedural re-run — i.e. the wave newly
 discharged **16** of the fix-wave's 102 requires-lifting findings.
 
-Classes fully or partially discharged by this wave (base = phase-4 count,
-surv = surviving positions now):
+The 16 newly-discharged requires-lifting findings, measured **fix-wave
+survivor → current survivor** (so the differences foot to exactly 16), all
+inside the wave's nominal ensures-inference scope:
 
-- **`err == nil ⇒ result != nil` callee-postcondition family** (the wave's
-  core ensures-inference mechanism): **C008c** (readMetaPage, 2→0),
-  **C120** (ReadPage, 2→0), **C193** (2→0), **C200** (2→0), **C249** (1→0),
-  **C250** (1→0), **C373** (ReadPage correlation, 1→0), **C262**
-  (ReadMetaPageAt, 1→0), **C375** (ReadMetaPageAt correlation, 1→0),
-  **C160a** (findLastBucket, 1→0), **C371** (db.mmap, 1→0), **C379**
-  (loadFreelist, 1→0).
-- **caller-guard / dominance lifted across a call edge**: **C133** (removeTx
-  tx.db, 2→0), **C179** (Commit→spill tx.db, 2→1), **C347** (spill tx.meta,
-  1→0), **C389** (writeMeta tx.db, 1→0), **C303** (composite-literal
-  receiver into `read`, 1→0), **C340** (db.file straight-line, 1→0).
-- **composite-literal / constructor never-nil across call**: **C072a**
-  (newPageCommand, 1→0), **C073a** (cobra Flags(), 1→0), **C277**
-  (newXCommand, 1→0).
-- **partials** (some positions killed, class not fully clean): **C024c**
-  (4→3), **C042** (4→2), **C051b** (2→1), **C107** (2→1), **C181** (2→1).
-- **fix-wave-attributed, not this wave**: **C185** (writeMeta relocation,
-  2→0) and 2 of **C031a** (4→2, the Use/closeSession family) were already
-  discharged in the 509 baseline.
+- **`err == nil ⇒ result != nil` callee-postcondition family** (15 of 16):
+  **C008c** (readMetaPage, 2→0), **C120** (ReadPage, 2→0), **C193** (2→0),
+  **C200** (2→0), **C249** (1→0), **C250** (1→0), **C373** (ReadPage
+  correlation, 1→0), **C262** (ReadMetaPageAt, 1→0), **C375** (ReadMetaPageAt
+  correlation, 1→0), **C160a** (findLastBucket, 1→0), **C009c** (2→1, the
+  ReadMetaPageAt half — see partial miss below).
+- **constructor composite-literal non-nil through a call site** (1 of 16):
+  **C072a** (newPageCommand's `&pageCommand{}` substituted through
+  `main.go:140` into `Run`'s receiver, 1→0).
+
+Foot: (2+2+2+2+1+1+1+1+1+1+1) postcondition + 1 (C072a) = **16**. ✓
+
+> Measurement note: per-class effect is fix-wave-survivor → current-survivor,
+> **not** phase-4-base → current. An earlier draft used phase-4 base counts
+> and thereby folded in fix-wave-era dominance discharges that were already
+> gone in the 509 baseline (C133, C179, C303, C340, C347, C389, C073a, C277,
+> C024c, C042, C051b, C107, C181, C185, part of C031a) — those are *not* this
+> wave's work and are excluded here.
 
 Survivors match the spec's non-goals almost exactly:
 
@@ -1204,26 +1225,35 @@ incomplete case (C009c/DB.Begin) inside its own nominal scope.
 
 ### Gate 3 — new finding signatures vs the 509 baseline (report-only)
 
-Diffing the 456 current signatures against the 1006 phase-4 baseline yields
-exactly two not-in-1006 signatures; triaged against the 509 fix-wave
+Computed by diffing the 456 current unique signatures against the **504
+fix-wave unique signatures** (from the `5e891cf` re-run) — not merely against
+the 1006 phase-4 set, so resurrections (phase-4 signatures the fix-wave
+discharged that reappear now) are caught. Two signatures are new vs the 509
 baseline:
 
-| signature | in 509 baseline? | new vs 509? | verdict | reason |
+| signature | in 1006? | in 509? | verdict | reason |
 |---|---|---|---|---|
-| `cmd/bbolt/main.go:1191:6` nil-deref | no (never flagged in any prior run) | **YES** | **TP** | ignored-error `CreateBucketIfNotExists` result dereferenced (`b.FillPercent`) — the gate-1 headline; genuine reachable panic |
-| `tx.go:558:11` nil-deref | **yes** (fix-wave `writeMeta` relocation, documented in the fix-wave gate-3 section) | no | — | already in the 509 baseline, not introduced by this wave |
+| `cmd/bbolt/main.go:1191:6` nil-deref | no | no | **TP** | ignored-error `CreateBucketIfNotExists` result dereferenced (`b.FillPercent`) — the gate-1 headline; genuine reachable panic |
+| `internal/surgeon/surgeon.go:78:20` overflow | **yes** (C221, FP/encoding) | no (fix-wave relocated it) | **FP** | `p.SetCount(uint16(start))`; `start` is guarded to `[0, elementCnt)` and `elementCnt = int(p.Count()) ≤ 65535`, so the `uint16` conversion never truncates — a resurrected phase-4 false positive |
 
-- **New findings vs the 509 baseline: exactly 1** (`main.go:1191:6`),
-  triaged **TP**. **FP rate among new findings: 0/1 = 0%.**
-- No resurrections: the wave builds strictly on the fix-wave ancestor and
-  only *adds* non-nil facts (discharging findings) and call-result
-  obligations (creating findings only at new call-site positions). The
-  empirical diff confirms this — the sole new position is the intended
-  call-result obligation at 1191; no fix-wave-discharged position reappears.
-- The fix-wave's other introduced signature,
-  `command_surgery.go:268:55` (overflow requires), is **gone** in this run
-  (discharged by the interprocedural bounds/overflow reasoning at the call
-  edge) — a further net improvement, not a regression.
+- **New vs 509: 2 findings — 1 TP (`main.go:1191:6`), 1 FP
+  (`surgeon.go:78:20`). FP rate among new findings: 1/2 = 50%.**
+- **Resurrection + paired departure (no *net* new FP, but a precision
+  regression).** Fix-3 (fix-wave) had converted C221's manifest overflow
+  inside `ClearPageElements` (`surgeon.go:78:20`) into a narrower
+  interprocedural overflow *requires* at its one unbounded call site
+  (`command_surgery.go:268:55`). This wave **removes that call-site requires**
+  (`command_surgery.go:268:55` is gone in this run) and **re-internalizes the
+  manifest overflow** at `surgeon.go:78:20`. Both are the same underlying
+  C221 non-bug (an FP either way), so there is no *net* new false positive —
+  one FP signature departs, one arrives — but fix-3's precision improvement
+  (firing only on the genuinely-unbounded CLI path rather than
+  unconditionally inside the callee) is undone. Recorded as an open item.
+  This corrects an earlier draft that reported "no resurrections, 0% FP" and
+  mislabelled the `command_surgery.go:268:55` departure as a net improvement.
+- `tx.go:558:11` (nil-deref) surfaces when diffing only against the 1006 set,
+  but it is a fix-wave `writeMeta` relocation already present in the 509
+  baseline — **not** new vs 509.
 
 ### Gate 4 — performance delta (report-only, not gated)
 
@@ -1246,17 +1276,25 @@ baseline:
    this site. This is inside the wave's nominal scope — worth a targeted
    look at whether `Begin`'s dispatch (`beginRWTx`/`beginTx`) defeats the
    ensures inference (multi-callee dispatch) before accepting the wave.
-2. **Closure/cobra requires-lifting residual** (gate 2, expected): C027,
+2. **C221 overflow precision regression** (gate 3): the wave re-internalizes
+   the C221 `uint16(start)` overflow as a manifest FP at
+   `internal/surgeon/surgeon.go:78:20` and drops fix-3's narrower call-site
+   *requires* at `command_surgery.go:268:55`. No net new false positive (one
+   FP swaps for another over the same non-bug), but fix-3's precision gain is
+   lost. Worth checking whether the interprocedural overflow reasoning should
+   preserve a call-site *requires* form here.
+3. **Closure/cobra requires-lifting residual** (gate 2, expected): C027,
    C216, C257, C258, C402 (cobra `ExactArgs` through `RunE` closures)
    survive — a declared non-goal (closure-capture boundary). Carry to a
    follow-up wave if closure-capture propagation is ever prioritized.
-3. **Bounds/overflow requires-lifting residual** (gate 2, expected): C101,
+4. **Bounds/overflow requires-lifting residual** (gate 2, expected): C101,
    C181, C223-C225, C229, C405, C406 survive — neither checker gained
    interprocedural bounds propagation here; explicitly out of scope.
-4. **Acceptance recommendation**: the wave meets its headline goal (gate 1
-   restores the FillPercent detector, 0% FP among new findings, determinism
-   preserved) and cleanly discharges the postcondition-lifting requires
-   classes it targeted (−16 requires-lifting, −48 findings overall) with no
-   regressions and no new FPs. Recommend **accept**, with item 1
-   (C009c/DB.Begin) tracked as a small in-scope follow-up rather than a
-   blocker.
+5. **Acceptance recommendation**: the wave meets its headline goal — gate 1
+   restores the FillPercent detector (genuine TP), determinism is preserved,
+   and it cleanly discharges the postcondition-lifting requires classes it
+   targeted (−16 requires-lifting, −48 findings overall). Of the 2 new-vs-509
+   findings, 1 is that headline TP and 1 is the C221 FP re-internalization
+   (item 2) — no *net* new false positive. Recommend **accept**, with item 1
+   (C009c/DB.Begin partial miss) and item 2 (C221 precision regression)
+   tracked as small in-scope follow-ups rather than blockers.

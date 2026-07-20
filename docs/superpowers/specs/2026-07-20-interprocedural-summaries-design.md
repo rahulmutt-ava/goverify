@@ -102,6 +102,30 @@ behavior — the sound direction for facts consumed as assumptions.
 Queries run on the `Infer`-role backend (two-tier timeouts apply) and
 hit the existing query cache.
 
+**Go-idiom rule for the correlation template** (planning amendment,
+2026-07-20): the dominant real shape returns *global sentinel errors*
+(`return nil, ErrDatabaseNotOpen`) whose loads are havoc'd, so a
+strict per-site SMT proof of `is_nil(r_e) ⇒ ¬is_nil(r_i)` is
+unobtainable exactly where the mechanism matters. Validation of the
+correlation template is therefore per return site: when the error
+component is the **literal nil constant**, the paired result must be
+SMT-proven non-nil (reach ∧ is_nil Unsat); any other error expression
+is treated as a non-nil error (the universal Go idiom). This is a
+deliberate under-approximation, documented in `docs/threat-model.md`
+alongside the uintptr one: a callee returning a nil-valued error
+*variable* with a nil result yields a wrong caller-side discharge.
+The unconditional `¬is_nil(r_i)` template stays strictly proven.
+
+**Interface modeling prerequisite** (planning amendment, 2026-07-20):
+`sort_of` currently gives interface types no sort, so `error`-typed
+values havoc entirely — the callee's `err != nil` guards, the
+caller's discharge guard, and the correlation template are all
+inexpressible without it. This cycle extends `sort_of` with
+`TypeKind::Interface → Ptr` (nil-ness is the only modeled
+observation; `Eq`/`Neq` already encode for every sort). Corpus and
+check goldens are expected to churn and are re-baselined under
+review.
+
 Fixpoint interaction: `Summary` equality drives SCC convergence and
 already compares the full struct, so ensures participate with no engine
 change; if `PartialEq` derivation turns out to skip `ensures`, fixing

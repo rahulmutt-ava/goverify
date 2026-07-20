@@ -57,7 +57,7 @@ Explicit v1 stance from the
 ## Deliberate under-approximations (FP/encoding fix-wave, 2026-07-20)
 
 The bug-finder invariant (findings only on Sat; false positives are
-the enemy) buys precision with three enumerated blind spots. Each is a
+the enemy) buys precision with four enumerated blind spots. Each is a
 conscious trade, not an accident — anything found missing here should
 be added, not silently tolerated.
 
@@ -76,3 +76,19 @@ be added, not silently tolerated.
   per their documented behavior; a stdlib behavior change contrary to
   its documentation would be missed. The phase-6 annotation language
   externalizes this table.
+- **Assign/ChangeType copies can silently discharge an unrelated
+  deref's requires** (`nil.rs`'s `params_only` filter composed with
+  `shared::checked_deref_assumptions`, fix 2b): a same-function copy
+  `q := NamedPtr(p)` (Assign/ChangeType) that is itself dereferenced
+  fails `params_only` (its encoded term is its own SMT var, not `p`'s),
+  so it never emits its own requires clause — but it IS a deref site,
+  so `checked_deref_assumptions` grants it `¬nil(v_q)` once reached.
+  The Assign equality `v_q = p0` then lets the solver derive `¬nil(p0)`
+  from that grant, discharging a genuinely unrelated `p`-deref's
+  requires even though nothing checked `p` itself. Net effect: `f`'s
+  callers passing nil are no longer flagged, though `f` genuinely
+  panics (exemplar and fix direction: `testdata/corpus/knownfp/
+  knownfp.go`'s `f`/`NamedPtr` KNOWN-FN block). The in-code fix —
+  canonicalizing a deref subject through same-function Assign/
+  ChangeType chains before `params_only` decides expressibility — is
+  queued, not yet applied.

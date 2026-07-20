@@ -139,6 +139,67 @@ pub(crate) fn propagate_requires(
     }
 }
 
+/// Resolve `v` through same-function `Op::Assign` chains (`ChangeType`
+/// lowers to Assign — lower.rs) to its root value. Depth-capped at 64,
+/// mirroring AddrKey's cap: crafted .gvir may fabricate cycles or
+/// arbitrarily long chains, and untrusted bytes must degrade (return
+/// the current value), never hang or recurse unboundedly.
+pub(crate) fn canonical_value(func: &Function, v: ValueId) -> ValueId {
+    let mut cur = v;
+    for _ in 0..64 {
+        let src = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instrs)
+            .find_map(|ins| match &ins.op {
+                Op::Assign { dst, src } if *dst == cur && *src != cur => Some(*src),
+                _ => None,
+            });
+        match src {
+            Some(s) => cur = s,
+            None => return cur,
+        }
+    }
+    cur
+}
+
+/// `v` resolved (through Assign chains) to "result <index> of a static
+/// call": the call's own dst for a single-value call, or an Extract
+/// component of a tuple call. None for anything else.
+pub(crate) fn call_result_of(func: &Function, v: ValueId) -> Option<(FuncId, u32)> {
+    let cur = canonical_value(func, v);
+    for b in &func.blocks {
+        for ins in &b.instrs {
+            match &ins.op {
+                Op::Call {
+                    dst: Some(d),
+                    callee: Callee::Static(c),
+                    ..
+                } if *d == cur => return Some((*c, 0)),
+                Op::Extract { dst, tuple, index } if *dst == cur => {
+                    let t = canonical_value(func, *tuple);
+                    for b2 in &func.blocks {
+                        for i2 in &b2.instrs {
+                            if let Op::Call {
+                                dst: Some(d),
+                                callee: Callee::Static(c),
+                                ..
+                            } = &i2.op
+                                && *d == t
+                            {
+                                return Some((*c, *index));
+                            }
+                        }
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 /// Call-site obligations: every callee requires-clause tagged `tag`,
 /// instantiated with the call site's real (possibly symbolic) argument
 /// terms, raised as a candidate `Obligation` under `func`'s own
@@ -188,4 +249,95 @@ pub(crate) fn call_site_obligations(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testfix::{block, call_static, instr, pkg_with_ptr_types};
+
+    /// t.F(p *T) { v3 := p (Assign); v4 := v3 (Assign); … }: the chain
+    /// canonicalizes to the param.
+    #[test]
+    fn canonical_value_follows_assign_chains() {
+        let mut a1 = instr("ChangeType"); // lowers to Op::Assign
+        a1.register = 3;
+        a1.r#type = 2;
+        a1.operands = vec![1];
+        let mut a2 = instr("ChangeType");
+        a2.register = 4;
+        a2.r#type = 2;
+        a2.operands = vec![3];
+        let f = goverify_extract::gvir::Function {
+            id: "t.F".into(),
+            params: vec![goverify_extract::gvir::Param {
+                id: 1,
+                name: "p".into(),
+                r#type: 2,
+            }],
+            blocks: vec![block(0, vec![a1, a2, instr("Return")], vec![])],
+            ..Default::default()
+        };
+        let p = pkg_with_ptr_types(vec![f]);
+        let func = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        assert_eq!(
+            canonical_value(func, ValueId(4)),
+            ValueId(1),
+            "v4 chain resolves to param"
+        );
+        assert_eq!(
+            canonical_value(func, ValueId(3)),
+            ValueId(1),
+            "v3 resolves to param"
+        );
+        assert_eq!(
+            canonical_value(func, ValueId(1)),
+            ValueId(1),
+            "param is its own root"
+        );
+    }
+
+    /// A crafted self-cycle (dst == src) must terminate at the depth cap.
+    #[test]
+    fn canonical_value_survives_crafted_cycles() {
+        let mut a = instr("ChangeType");
+        a.register = 3;
+        a.r#type = 2;
+        a.operands = vec![3]; // v3 := v3
+        let f = goverify_extract::gvir::Function {
+            id: "t.F".into(),
+            blocks: vec![block(0, vec![a, instr("Return")], vec![])],
+            ..Default::default()
+        };
+        let p = pkg_with_ptr_types(vec![f]);
+        let func = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let _ = canonical_value(func, ValueId(3)); // must return, not hang
+    }
+
+    /// t.F() { v2 := call t.K() } — v2 resolves to (t.K, 0).
+    #[test]
+    fn call_result_of_single_value_call() {
+        let f = goverify_extract::gvir::Function {
+            id: "t.F".into(),
+            blocks: vec![block(
+                0,
+                vec![call_static("t.K", 2, 2, vec![]), instr("Return")],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let p = pkg_with_ptr_types(vec![f]);
+        let k = p.lookup_func("t.K").unwrap();
+        let func = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        assert_eq!(
+            call_result_of(func, ValueId(2)),
+            Some((k, 0)),
+            "call dst resolves to (t.K, 0)"
+        );
+        assert_eq!(
+            call_result_of(func, ValueId(1)),
+            None,
+            "non-call value has no call result"
+        );
+    }
 }

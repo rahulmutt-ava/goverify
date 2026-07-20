@@ -295,7 +295,30 @@ impl Checker for NilChecker {
             };
             let is_const_nil = matches!(func.value(*subject).kind, ValueKind::Const(ConstVal::Nil));
             let expressible = is_const_nil || subj.free_vars().is_empty() || params_only(&subj);
-            if !expressible {
+            // Summary-constrained call results (spec §4): a deref of a
+            // static call's result qualifies iff the callee's INFERRED
+            // summary carries a nil-deref ensures clause constraining
+            // that exact result index — every finding this raises is
+            // backed by a proven callee correlation, and results the
+            // inference couldn't characterize stay silent (no FP flood
+            // where inference failed).
+            let call_result = if expressible {
+                None
+            } else {
+                crate::shared::call_result_of(func, *subject).filter(|(callee, idx)| {
+                    let s = summary_of(*callee);
+                    s.provenance == goverify_analysis::Provenance::Inferred
+                        && s.ensures.iter().any(|c| {
+                            c.tag == "nil-deref"
+                                && c.formula
+                                    .term
+                                    .free_vars()
+                                    .keys()
+                                    .any(|n| n == &format!("r{idx}"))
+                        })
+                })
+            };
+            if !expressible && call_result.is_none() {
                 continue; // havoc'd heap value: silent (spec §4)
             }
             let Ok(is_nil) = ptr_is_nil(subj) else {
@@ -304,9 +327,17 @@ impl Checker for NilChecker {
             let mut extra = pre.clone();
             extra.extend(assume(*bi, *ii));
             extra.push(is_nil);
+            let message = match call_result {
+                Some((callee, _)) => format!(
+                    "possibly-nil result of {} dereferenced in {}",
+                    p.func_name(callee),
+                    p.func_name(f)
+                ),
+                None => format!("nil dereference in {}", p.func_name(f)),
+            };
             out.push(Obligation {
                 tag: "nil-deref".into(),
-                message: format!("nil dereference in {}", p.func_name(f)),
+                message,
                 pos: pos.clone(),
                 query: enc.reach_query(*bi, extra),
             });

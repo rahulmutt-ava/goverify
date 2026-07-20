@@ -152,3 +152,48 @@ func BranchDerefJoinCall(h *holder, flip bool) int {
 	}
 	return n + use(h.cached) // want: nil-deref
 }
+
+// --- interprocedural summaries: obligations on call-result subjects ---
+
+type Bucket struct{ Fill int }
+
+type createError struct{}
+
+func (e *createError) Error() string { return "create failed" }
+
+var errCreate = &createError{}
+
+// createBucket carries the inferred correlation err==nil ⇒ result!=nil
+// (Go-idiom rule: the failure site returns a sentinel).
+func createBucket(fail bool) (*Bucket, error) {
+	if fail {
+		return nil, errCreate
+	}
+	return &Bucket{}, nil
+}
+
+// IgnoredErr discards the error and dereferences the result — the
+// FillPercent restoration shape (bbolt cmd/bbolt/main.go:1191): the
+// discarded error leaves the correlation unbindable, the result stays
+// possibly-nil, and the deref must now be flagged at the true
+// first-failure site.
+func IgnoredErr(fail bool) int {
+	b, _ := createBucket(fail)
+	return b.Fill // want: nil-deref
+}
+
+// GuardedErr checks the error first: the asserted correlation plus the
+// guard discharge the deref. No finding.
+func GuardedErr(fail bool) int {
+	b, err := createBucket(fail)
+	if err != nil {
+		return 0
+	}
+	return b.Fill
+}
+
+// fresh always allocates: the unconditional ensures discharges the
+// unguarded deref of its result. No finding.
+func fresh() *Bucket { return &Bucket{} }
+
+func UnguardedFresh() int { return fresh().Fill }

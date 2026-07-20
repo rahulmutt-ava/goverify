@@ -25,6 +25,11 @@ nil.go:103:10: nil-deref: call to example.com/nil.use violates its nil-deref req
     path: nil.go:103
     with: p0 = (ptr-addr #x0000000000000000)
 
+nil.go:182:11: nil-deref: possibly-nil result of example.com/nil.createBucket dereferenced in example.com/nil.IgnoredErr [example.com/nil.IgnoredErr]
+  182 |  return b.Fill // want: nil-deref
+      |           ^
+    path: nil.go:181
+
 nil.go:31:11: nil-deref: nil dereference in example.com/nil.LocalNil [example.com/nil.LocalNil]
    31 |  return p.X // want: nil-deref
       |           ^

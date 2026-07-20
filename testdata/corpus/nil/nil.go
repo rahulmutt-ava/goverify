@@ -103,3 +103,26 @@ func CallThenDeref(h *holder) int {
 	n := use(h.cached) // want: nil-deref
 	return n + h.cached.n
 }
+
+// --- fix-wave fix 5: nil-map range raises no obligation ---
+
+// RangeNilMap (fix 5): ranging over a nil map is legal Go — zero
+// iterations, no dereference. The range header must not report.
+// (Dereferencing f itself infers a requires clause on f, which is a
+// summary, not a finding.)
+type freeMaps struct{ maps map[uint64]bool }
+
+func RangeNilMap(f *freeMaps) int {
+	n := 0
+	for k := range f.maps {
+		if k > 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// RangeNilMapCaller (fix 5 red): the receiver deref (f.maps reads f)
+// is real — RangeNilMap's inferred requires must still propagate, so
+// a nil argument still reports at the call site.
+func RangeNilMapCaller() int { return RangeNilMap(nil) } // want: nil-deref

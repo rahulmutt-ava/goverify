@@ -86,16 +86,65 @@ func ReadElem(buf []byte, i int) uint32 {
 // test. Recorded as not minimally reproducible (see the report's
 // "Corpus pins" subsection).
 
-// Mechanism group 5 (nil-map range is legal, e.g. C038's `for size,
-// idSet := range f.freemaps` over a `map[uint64]pidSet` field) is NOT
-// pinned here: both a bare-map-field and a two-hop pointer-field form
-// were tried (a receiver from a branching constructor, ranging over its
-// map field/its pointer-field's map field) and neither produced a
-// finding — consistent with mechanism group 1's finding above that a
-// field read used only for a nil-safe operation (here, `range`, which
-// never dereferences a nil map) doesn't register as an obligation site
-// in this checker snapshot. Recorded as not minimally reproducible (see
-// the report's "Corpus pins" subsection).
+// FIXED-partially (fix-wave 2026-07-20, task 7 / "fix 5"): formerly
+// KNOWN-FP — nil-map range is legal (mechanism group 5, e.g. C038's
+// `for size, idSet := range f.freemaps` over a `map[uint64]pidSet`
+// field; 3 classes / 8 findings: C038 x5, C362 x1, and — contrary to
+// the candidate guessed during planning (C178, cursor.go:403, a
+// dominance/widening case per its own verdict row, not this
+// mechanism) — C186 x2, a nil-map-index-read sibling of the same
+// underlying fact). Verified rather than assumed against a live,
+// full-`./...` bbolt re-run: Range/Next already lower to `Op::Havoc`,
+// so the obligation was always the FieldAddr+Load chain feeding the
+// range header, and fixes 1/2b (non-nil address-of dsts; dominating
+// checked-deref assumptions) do subsume it for 4 of the 8 original
+// findings — confirmed clean at hashmap.go:126 (C362, `freePageIds`,
+// silenced by an earlier same-function deref of the same receiver at
+// line 125's `len(f.forwardMap)`), shared.go:113 (C038, `Rollback`,
+// likewise silenced by line 91's `t.pending[txid]`), and
+// bucket.go:863/942 (C186). The green case now lives in the regular
+// nil corpus as `RangeNilMap`/`RangeNilMapCaller` (see nil.go), not
+// here.
+//
+// The remaining 4 of 8 (hashmap.go:237/255/271 — `idsFromFreemaps`,
+// `idsFromForwardMap`, `idsFromBackwardMap` — and shared.go:224 —
+// `NoSyncReload`; all C038) still report, but NOT for a range-legality
+// reason: each has no OTHER same-function deref of its receiver to
+// dominate the range header (fix 2b has nothing to anchor to), so
+// discharging relies entirely on the function's own self-inferred
+// `receiver != nil` requires — and each of these four transitively
+// reaches `fmt.Sprintf`/reflect internals (three via a sibling
+// `mergeSpans$1` `common.Verify` closure's duplicate-page-ID panic
+// path; `NoSyncReload` via the same freelist-wide component once the
+// FULL program's call graph is built), which `debug sccs` shows lands
+// them in one multi-hundred-member SCC the call graph treats as
+// recursive (indirect calls through `func()`-typed closure parameters,
+// e.g. `common.Verify`/`sync.Once.Do`, conservatively fan out to every
+// nullary closure in the reachable program). That SCC doesn't converge
+// within `widen_after` rounds, so it widens to `Summary::havoc()`,
+// discarding the self-requires that would otherwise silence these
+// four. This is a distinct, deeper mechanism (closure-call-graph
+// precision / requires surviving SCC widening) than fix 5's remit and
+// is intentionally left unaddressed here; still tracked below as its
+// own KNOWN-FP. (Scope-dependent: analyzing `internal/freelist/...`
+// alone keeps `NoSyncReload` in a small non-recursive SCC and it stays
+// clean there — only the full-module SCC pulls it in; the three
+// `idsFrom*Map` functions report under either scope.)
+
+// KNOWN-FP(phase-5, residual after fix 5): FP/encoding — SCC-widening
+// swallows a locally-derivable receiver-nonnil requires: a function
+// whose only nil-deref site is its own unguarded receiver, with no
+// other in-function deref to dominate it, loses that self-requires
+// (and so self-reports) whenever it lands in a widened SCC — here,
+// because it transitively reaches `fmt.Sprintf`/reflect through a
+// debug-only `common.Verify` closure (or, module-wide, other
+// `func()`-typed indirection) that the call graph conservatively
+// treats as mutually recursive with unrelated fmt/reflect internals.
+// Not minimally reproducible outside a real closure-heavy,
+// fmt.Sprintf-reaching call graph of bbolt's actual size; left as a
+// real, documented shakeout finding rather than a corpus pin.
+// Follow-up: call-graph precision for `func()`-typed indirect calls,
+// or preserving a widened function's own singleton-derivable requires.
 
 // KNOWN-FP(phase-5): FP/encoding — other/miscellaneous encoding gap:
 // a reslice is only reached after an in-bounds length check on the same

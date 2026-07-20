@@ -70,6 +70,25 @@ pub trait Checker: Sync {
         discharge: &mut dyn FnMut(&Query) -> SatResult,
     ) -> Vec<Clause>;
 
+    /// Derive `f`'s own postconditions from its body: Bool clauses over
+    /// r<i> (and, when arg-dependent, p<i>) interface vars. Same solver
+    /// discipline as `infer_requires`, with the polarity INVERTED: a
+    /// clause may only be emitted when its violation is proven
+    /// unreachable (`Unsat`) at every return site — `Sat` and `Unknown`
+    /// both drop the candidate. Emitted ensures are asserted as facts in
+    /// callers (encode_func_with), so an unproven clause here is a wrong
+    /// discharge there. Default: no postconditions (sound: weakest).
+    fn infer_ensures(
+        &self,
+        p: &Program,
+        f: FuncId,
+        summary_of: &dyn Fn(FuncId) -> Summary,
+        discharge: &mut dyn FnMut(&Query) -> SatResult,
+    ) -> Vec<Clause> {
+        let _ = (p, f, summary_of, discharge);
+        Vec::new()
+    }
+
     /// Raise obligations at `f`'s call sites against each callee's
     /// summary (as resolved by `summary_of`).
     fn obligations(

@@ -408,15 +408,18 @@ fn analyze_function(
         // first), then per-checker clause order (Task 12 design). See the
         // recursive-SCC caveat above the calling loop.
         let mut requires = Vec::new();
+        let mut ensures = Vec::new();
         for checker in checkers {
             let mut discharge =
                 |q: &Query| discharge_query(q, &mut *backend, cache, emit_dir).result;
             requires.extend(checker.infer_requires(p, f, summary_of, &mut discharge));
+            ensures.extend(checker.infer_ensures(p, f, summary_of, &mut discharge));
         }
 
         Summary {
             effects,
             requires,
+            ensures,
             ..Summary::default()
         }
     }));
@@ -739,6 +742,100 @@ mod tests {
                 ),
             }]
         }
+    }
+
+    /// Emits one ensures clause for every function: engine-plumbing probe.
+    struct EnsuresChecker;
+    impl Checker for EnsuresChecker {
+        fn name(&self) -> &'static str {
+            "ensures-probe"
+        }
+        fn infer_requires(
+            &self,
+            _p: &Program,
+            _f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
+            _discharge: &mut dyn FnMut(&Query) -> SatResult,
+        ) -> Vec<crate::summary::Clause> {
+            Vec::new()
+        }
+        fn infer_ensures(
+            &self,
+            _p: &Program,
+            _f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
+            _discharge: &mut dyn FnMut(&Query) -> SatResult,
+        ) -> Vec<crate::summary::Clause> {
+            use goverify_solver::{Term, ptr_is_nil, ptr_sort};
+            let r0 = Term::var("r0", ptr_sort());
+            vec![crate::summary::Clause {
+                tag: "nil-deref".into(),
+                formula: crate::summary::Formula {
+                    term: Term::not(ptr_is_nil(r0).unwrap()).unwrap(),
+                },
+            }]
+        }
+        fn obligations(
+            &self,
+            _p: &Program,
+            _f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
+        ) -> Vec<crate::checker::Obligation> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn checker_ensures_land_in_summaries() {
+        let p = Program::from_packages(vec![pkg("t", vec![straight("t.F", vec![])])]);
+        let checkers: Vec<&dyn Checker> = vec![&EnsuresChecker];
+        let a = analyze_full(&p, &EngineConfig::default(), &checkers, &|_role| {
+            Box::new(StubSolver)
+        });
+        let f = p.lookup_func("t.F").unwrap();
+        assert_eq!(
+            a.summaries[&f].ensures.len(),
+            1,
+            "infer_ensures output must reach Summary.ensures: {:?}",
+            a.summaries[&f]
+        );
+        assert_eq!(
+            a.summaries[&f].ensures[0].tag, "nil-deref",
+            "ensures clause tag must survive the engine collection: {:?}",
+            a.summaries[&f]
+        );
+    }
+
+    #[test]
+    fn widening_drops_ensures() {
+        // Recursive SCC + widen_after 0: the widened summary is havoc,
+        // whose ensures are empty — an ensures clause must never survive
+        // widening (soundness: empty is the weakest postcondition).
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                straight("t.Even", vec![call("(*sync.Mutex).Lock"), call("t.Odd")]),
+                straight("t.Odd", vec![call("t.Even")]),
+            ],
+        )]);
+        let checkers: Vec<&dyn Checker> = vec![&EnsuresChecker];
+        let cfg = EngineConfig {
+            opts: Options { widen_after: 0 },
+            ..EngineConfig::default()
+        };
+        let a = analyze_full(&p, &cfg, &checkers, &|_role| Box::new(StubSolver));
+        let even = p.lookup_func("t.Even").unwrap();
+        assert_eq!(
+            a.summaries[&even].provenance,
+            Provenance::Havoc,
+            "widen_after 0 must widen this recursive SCC to Havoc: {:?}",
+            a.summaries[&even]
+        );
+        assert!(
+            a.summaries[&even].ensures.is_empty(),
+            "widening must drop ensures: {:?}",
+            a.summaries[&even]
+        );
     }
 
     #[test]

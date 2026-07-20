@@ -5,9 +5,14 @@
 //! over this function's params. Obligations (call-site + manifest-local)
 //! are raised in `obligations` under the function's own preconditions.
 
-use goverify_analysis::{Checker, Clause, Formula, Obligation, Summary, encode_func};
-use goverify_ir::{ConstVal, FuncId, Function, Op, Pos, Program, TypeKind, ValueId, ValueKind};
-use goverify_solver::{Query, SatResult, Term, ptr_is_nil};
+use goverify_analysis::{
+    Checker, Clause, Formula, IfaceVar, Obligation, Summary, encode_func, encode_func_with,
+    iface_var_name, sort_of,
+};
+use goverify_ir::{
+    ConstVal, FuncId, Function, Op, Pos, Program, TypeId, TypeKind, TypeTable, ValueId, ValueKind,
+};
+use goverify_solver::{Query, SatResult, Term, ptr_is_nil, ptr_sort};
 
 use crate::shared::{
     call_site_obligations, own_preconditions, params_only, propagate_requires, push_clause,
@@ -40,6 +45,46 @@ pub(crate) fn deref_sites(
         }
     }
     out
+}
+
+/// ¬is_nil(r<i>) as a canonical ensures clause. None on term-construction
+/// failure (degrade).
+fn nonnil_result_clause(i: u32) -> Option<Clause> {
+    let r = Term::var(&iface_var_name(&IfaceVar::Result(i)), ptr_sort());
+    Some(Clause {
+        tag: "nil-deref".into(),
+        formula: Formula {
+            term: Term::not(ptr_is_nil(r).ok()?).ok()?,
+        },
+    })
+}
+
+/// ¬is_nil(r<e>) ∨ ¬is_nil(r<i>): "never both nil", the (T, error)
+/// correlation in disjunctive normal form.
+fn correlation_clause(e: u32, i: u32) -> Option<Clause> {
+    let rv = |idx: u32| Term::var(&iface_var_name(&IfaceVar::Result(idx)), ptr_sort());
+    Some(Clause {
+        tag: "nil-deref".into(),
+        formula: Formula {
+            term: Term::or(vec![
+                Term::not(ptr_is_nil(rv(e)).ok()?).ok()?,
+                Term::not(ptr_is_nil(rv(i)).ok()?).ok()?,
+            ])
+            .ok()?,
+        },
+    })
+}
+
+/// The predeclared `error` interface: Named{name: "error"} over an
+/// Interface underlying. Deliberately narrow — a custom interface that
+/// happens to embed error is not a correlation anchor.
+fn is_error_type(types: &TypeTable, t: TypeId) -> bool {
+    match types.kind(t) {
+        TypeKind::Named { name, underlying } => {
+            name == "error" && matches!(types.kind(*underlying), TypeKind::Interface)
+        }
+        _ => false,
+    }
 }
 
 impl Checker for NilChecker {
@@ -106,6 +151,104 @@ impl Checker for NilChecker {
             &assume,
             &mut out,
         );
+        out
+    }
+
+    /// Postconditions (spec §3.1): two templates per pointer-sorted
+    /// result, candidate-and-check against the function's own encoding.
+    ///
+    /// 1. Unconditional ¬is_nil(r_i): proven iff, at EVERY return site,
+    ///    reach(site) ∧ is_nil(returned term) is Unsat.
+    /// 2. Correlation ¬is_nil(r_e) ∨ ¬is_nil(r_i) (≡ is_nil(r_e) ⇒
+    ///    ¬is_nil(r_i)) for each error-typed result e, tried only when
+    ///    template 1 failed (subsumption). Per-site Go-idiom rule
+    ///    (spec planning amendment): a site whose error component is
+    ///    the LITERAL nil constant needs the SMT proof on the paired
+    ///    result; any other error expression is treated as a non-nil
+    ///    error — the documented under-approximation (threat model).
+    ///
+    /// Every failure degrades to "no clause": missing terms, arity
+    /// mismatches, Sat, Unknown. No return sites ⇒ no ensures.
+    fn infer_ensures(
+        &self,
+        p: &Program,
+        f: FuncId,
+        summary_of: &dyn Fn(FuncId) -> Summary,
+        discharge: &mut dyn FnMut(&Query) -> SatResult,
+    ) -> Vec<Clause> {
+        let Some(func) = p.func(f) else {
+            return Vec::new();
+        };
+        let Ok(enc) = encode_func_with(p, f, summary_of) else {
+            return Vec::new();
+        };
+        // Result types from the signature.
+        let TypeKind::Signature { results, .. } = p.types().kind(func.sig) else {
+            return Vec::new();
+        };
+        let results = results.clone();
+        // Return sites: (block index, returned ValueIds). Arity mismatch
+        // anywhere (malformed .gvir) drops ALL candidates.
+        let mut sites: Vec<(usize, Vec<ValueId>)> = Vec::new();
+        for (bi, b) in func.blocks.iter().enumerate() {
+            for ins in &b.instrs {
+                if let Op::Return { vals } = &ins.op {
+                    if vals.len() != results.len() {
+                        return Vec::new();
+                    }
+                    sites.push((bi, vals.clone()));
+                }
+            }
+        }
+        if sites.is_empty() {
+            return Vec::new();
+        }
+        let ptr_results: Vec<usize> = (0..results.len())
+            .filter(|&i| sort_of(p.types(), results[i]).is_some_and(|s| s == ptr_sort()))
+            .collect();
+        let error_results: Vec<usize> = (0..results.len())
+            .filter(|&i| is_error_type(p.types(), results[i]))
+            .collect();
+
+        // A site's returned component proven non-nil?
+        let mut site_nonnil = |bi: usize, v: ValueId| -> bool {
+            let Some(t) = enc.value(v).cloned() else {
+                return false;
+            };
+            let Ok(is_nil) = ptr_is_nil(t) else {
+                return false;
+            };
+            discharge(&enc.reach_query(bi, vec![is_nil])) == SatResult::Unsat
+        };
+
+        let mut out = Vec::new();
+        for &i in &ptr_results {
+            // Template 1: unconditional.
+            if sites.iter().all(|(bi, vals)| site_nonnil(*bi, vals[i])) {
+                if let Some(c) = nonnil_result_clause(i as u32) {
+                    push_clause(&mut out, c);
+                }
+                continue; // correlation is subsumed
+            }
+            // Template 2: correlate with each error result.
+            for &e in &error_results {
+                if e == i {
+                    continue;
+                }
+                let proven = sites.iter().all(|(bi, vals)| {
+                    let err_is_nil_literal =
+                        matches!(func.value(vals[e]).kind, ValueKind::Const(ConstVal::Nil));
+                    if err_is_nil_literal {
+                        site_nonnil(*bi, vals[i])
+                    } else {
+                        true // Go-idiom rule: non-literal error ⇒ non-nil
+                    }
+                });
+                if proven && let Some(c) = correlation_clause(e as u32, i as u32) {
+                    push_clause(&mut out, c);
+                }
+            }
+        }
         out
     }
 

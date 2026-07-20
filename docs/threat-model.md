@@ -98,3 +98,14 @@ be added, not silently tolerated.
   canonicalizing a deref subject through same-function Assign/
   ChangeType chains before `params_only` decides expressibility — is
   queued, not yet applied.
+- **Go-idiom error correlation (ensures inference).** The
+  `is_nil(err) ⇒ ¬is_nil(result)` postcondition template validates per
+  return site: a site whose error component is the literal nil constant
+  must SMT-prove the paired result non-nil, but a site returning any
+  other error expression (a sentinel global, a wrapped error) is
+  accepted as returning a non-nil error without proof — the universal
+  Go idiom, unprovable locally because sentinel loads are havoc'd. A
+  callee that returns a nil-valued error *variable* together with a nil
+  result earns a wrong ensures, and callers guarding `err != nil` get a
+  wrong discharge (false negative). The unconditional `¬is_nil(result)`
+  template carries no such assumption (strictly proven).

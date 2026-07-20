@@ -53,3 +53,26 @@ Explicit v1 stance from the
 - cargo-audit: blocking `audit` CI job plus the nightly schedule (new
   CVEs land on old code).
 - clippy correctness lints: blocking tier, `-D warnings`.
+
+## Deliberate under-approximations (FP/encoding fix-wave, 2026-07-20)
+
+The bug-finder invariant (findings only on Sat; false positives are
+the enemy) buys precision with three enumerated blind spots. Each is a
+conscious trade, not an accident — anything found missing here should
+be added, not silently tolerated.
+
+- **Load forwarding ignores calls** (`encode_load_forwarding`): two
+  reads of the same address with no intervening store are modeled as
+  equal even across function calls. A callee that mutates the re-read
+  field between a caller's check and its use is missed at the re-read
+  site. Stores and unmodeled (Havoc) effects still invalidate.
+- **uintptr-derived pointers are non-nil** (`op_def` Convert arm): a
+  pointer minted via uintptr arithmetic
+  (`unsafe.Pointer(uintptr(base)+off)`) is assumed non-nil; deliberate
+  wraparound to exactly address 0 is assumed away. Plain
+  pointer→unsafe.Pointer→pointer puns keep their nilability.
+- **Curated constructor trust** (`NEVER_NIL_RESULT`): externs in the
+  table (currently `flag.NewFlagSet`) are trusted to return non-nil
+  per their documented behavior; a stdlib behavior change contrary to
+  its documentation would be missed. The phase-6 annotation language
+  externalizes this table.

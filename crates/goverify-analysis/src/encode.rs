@@ -702,6 +702,15 @@ fn uintptr_provenance(
     }
 }
 
+/// Extern constructors documented never to return nil (fix-wave
+/// fix 4). A curated lookup table, deliberately NOT inference — the
+/// phase-6 annotation language externalizes it. Seeded from the
+/// shakeout's mechanism-4 classes (C003, C011, C034, C073b, C122,
+/// C123, C124, C207 — all 42 findings trace to flag.NewFlagSet, which
+/// returns &FlagSet{...} unconditionally per its stdlib source/docs;
+/// verified 2026-07-20).
+const NEVER_NIL_RESULT: &[&str] = &["flag.NewFlagSet"];
+
 /// The defining equality for a modeled op, if every term it needs exists;
 /// `None` = havoc (dst stays declared but unconstrained). Never panics:
 /// missing terms and out-of-range preds degrade to `None`.
@@ -837,6 +846,22 @@ fn op_def(p: &Program, func: &Function, block: usize, op: &Op, enc: &EncodedFunc
             }
             let len = Term::dt_get(&seq_datatype(), "seq-val", "seq-len", arg).ok()?;
             Term::eq(dt, len).ok()
+        }
+        // A static call to a curated never-nil extern constructor (fix-wave
+        // fix 4, e.g. flag.NewFlagSet) asserts its dst non-nil rather than
+        // havoc'ing. A `len` call never resolves to a table name (and vice
+        // versa: no table entry is named "len"), so this arm and the one
+        // above stay mutually exclusive despite both guarding `Op::Call`.
+        Op::Call {
+            dst: Some(d),
+            callee: Callee::Static(fid),
+            ..
+        } if NEVER_NIL_RESULT.contains(&p.func_name(*fid)) => {
+            let dt = t(d)?;
+            if dt.sort() != &ptr_sort() {
+                return None;
+            }
+            Term::not(ptr_is_nil(dt).ok()?).ok()
         }
         // A pointer minted from uintptr arithmetic is never nil (fix-wave
         // fix 3): unsafe.Pointer(uintptr(base)+off) idioms compute offsets
@@ -1562,6 +1587,73 @@ mod tests {
         assert!(
             enc.asserts.contains(&want),
             "FieldAddr dst must carry a non-nil assert (fix 1)"
+        );
+    }
+
+    #[test]
+    fn table_constructor_result_is_nonnil() {
+        use goverify_extract::gvir;
+        // Two functions in one package: t.F calls the curated table
+        // member "flag.NewFlagSet" (fix-wave fix 4), t.G calls a
+        // same-shape but NOT-in-table callee "pkg.NewThing". Both dsts
+        // are v2, *T-typed (id 5). Only t.F's v2 should carry the
+        // non-nil assert.
+        let call_flag = gvir::Instruction {
+            kind: "Call".into(),
+            register: 2,
+            r#type: 5, // *T
+            operands: vec![0],
+            sem: Some(gvir::instruction::Sem::Call(gvir::CallSem {
+                static_callee: "flag.NewFlagSet".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let f = gvir::Function {
+            id: "t.F".into(),
+            blocks: vec![block_p(0, vec![call_flag, ret(vec![2])], vec![], vec![])],
+            ..Default::default()
+        };
+        let call_pkg = gvir::Instruction {
+            kind: "Call".into(),
+            register: 2,
+            r#type: 5, // *T
+            operands: vec![0],
+            sem: Some(gvir::instruction::Sem::Call(gvir::CallSem {
+                static_callee: "pkg.NewThing".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let g = gvir::Function {
+            id: "t.G".into(),
+            blocks: vec![block_p(0, vec![call_pkg, ret(vec![2])], vec![], vec![])],
+            ..Default::default()
+        };
+        let package = gvir::Package {
+            import_path: "t".into(),
+            types: std_type_list(),
+            functions: vec![f, g],
+            ..Default::default()
+        };
+        let p = Program::from_packages(vec![package]);
+        let f_id = p.lookup_func("t.F").unwrap();
+        let g_id = p.lookup_func("t.G").unwrap();
+
+        let enc = encode_func(&p, f_id).unwrap();
+        let d = enc.value(goverify_ir::ValueId(2)).unwrap().clone();
+        let want = Term::not(goverify_solver::ptr_is_nil(d).unwrap()).unwrap();
+        assert!(
+            enc.asserts.contains(&want),
+            "table constructor dst non-nil (fix 4)"
+        );
+
+        let enc2 = encode_func(&p, g_id).unwrap();
+        let d2 = enc2.value(goverify_ir::ValueId(2)).unwrap().clone();
+        let unwanted = Term::not(goverify_solver::ptr_is_nil(d2).unwrap()).unwrap();
+        assert!(
+            !enc2.asserts.contains(&unwanted),
+            "non-table callee stays nilable (fix 4 red)"
         );
     }
 

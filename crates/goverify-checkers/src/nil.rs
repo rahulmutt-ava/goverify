@@ -6,8 +6,8 @@
 //! are raised in `obligations` under the function's own preconditions.
 
 use goverify_analysis::{
-    Checker, Clause, Formula, IfaceVar, Obligation, Summary, encode_func, encode_func_with,
-    iface_var_name, sort_of,
+    Checker, Clause, Formula, IfaceVar, Obligation, Summary, encode_func_with, iface_var_name,
+    sort_of,
 };
 use goverify_ir::{
     ConstVal, FuncId, Function, Op, Pos, Program, TypeId, TypeKind, TypeTable, ValueId, ValueKind,
@@ -102,7 +102,7 @@ impl Checker for NilChecker {
         let Some(func) = p.func(f) else {
             return Vec::new();
         };
-        let Ok(enc) = encode_func(p, f) else {
+        let Ok(enc) = encode_func_with(p, f, summary_of) else {
             return Vec::new();
         };
         let mut out = Vec::new();
@@ -267,7 +267,7 @@ impl Checker for NilChecker {
         let Some(func) = p.func(f) else {
             return Vec::new();
         };
-        let Ok(enc) = encode_func(p, f) else {
+        let Ok(enc) = encode_func_with(p, f, summary_of) else {
             return Vec::new();
         };
         let pre = own_preconditions(&summary_of(f));

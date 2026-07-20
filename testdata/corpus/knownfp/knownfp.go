@@ -215,14 +215,19 @@ func Tail(args []string) []string {
 
 // --- FP/invariant dominant mechanisms ---
 
-// KNOWN-FP(phase-5): FP/invariant — field set at every construction
-// site before exposure: the only constructor for `bucket` sets
-// `rootNode` immediately after allocation, before the value is ever
-// exposed to a caller, so no live `*bucket` can have a nil `rootNode`;
-// the analyzer only tracks local facts and has no whole-program view of
-// every construction site, so it flags the dereference anyway
-// (exemplars C002a, C017b: bbolt's `InBucket`/`rootNode` fields set at
-// every `newBucket`/`openBucket` call before the `*Bucket` escapes).
+// FIXED (interprocedural summaries, 2026-07-20): formerly
+// KNOWN-FP(phase-5) FP/invariant — the FP this pin actually pinned was
+// never rootNode's own field-level nilness (still untracked field-by-
+// field, so that half of the original description remains true in
+// spirit) but `Depth`'s own precondition ¬is_nil(b) failing to
+// discharge at UseBucket's call site because `newBucket`'s return value
+// was havoc'd there. `newBucket`'s inferred ensures (unconditional
+// ¬is_nil(r0): its sole return path always yields a freshly allocated
+// `*bucket`) is now asserted at that call site, discharging the
+// propagated call-site obligation (exemplars C002a, C017b: bbolt's
+// `InBucket`/`rootNode` fields set at every `newBucket`/`openBucket`
+// call before the `*Bucket` escapes). Kept as the green regression
+// case.
 type node struct{ depth int }
 
 type bucket struct{ rootNode *node }
@@ -244,18 +249,21 @@ func newBucket() *bucket {
 
 func UseBucket() int {
 	b := newBucket()
-	return b.Depth() // want: nil-deref
+	return b.Depth()
 }
 
-// KNOWN-FP(phase-5): FP/invariant — err==nil ⇒ result!=nil paired-
+// FIXED (interprocedural summaries, 2026-07-20): formerly
+// KNOWN-FP(phase-5) FP/invariant — err==nil ⇒ result!=nil paired-
 // return contract of a callee, checked locally within the same
-// function immediately after the call: `newHandle`'s only error path
-// returns `(nil, err)` and its only success path returns a freshly
-// allocated non-nil value, so `err == nil` implies `h != nil` right
-// where it's checked; the analyzer doesn't encode this stdlib-style
-// paired-return contract and still treats `h` as possibly nil past the
-// guard (exemplars C025, C004a: `bolt.Open`'s `err == nil ⇒ *DB !=
-// nil` contract, checked immediately before `db.View`).
+// function immediately after the call: `newHandle`'s inferred
+// correlation ensures (is_nil(err) ⇒ ¬is_nil(h), validated under the
+// Go-idiom rule for the errConstructFailed sentinel returns across all
+// three early guards) is now asserted at UseHandle's call site; the
+// `err != nil` guard then renders is_nil(h) unreachable at the
+// handleID call, discharging the propagated nil-deref requirement
+// (exemplars C025, C004a: `bolt.Open`'s `err == nil ⇒ *DB != nil`
+// contract, checked immediately before `db.View`). Kept as the green
+// regression case.
 type handleStats struct{ id int }
 
 type handle struct{ stats *handleStats }
@@ -293,20 +301,19 @@ func UseHandle(a, b, c bool) int {
 	if err != nil {
 		return -1
 	}
-	return handleID(h) // want: nil-deref
+	return handleID(h)
 }
 
 // --- FP/requires-lifting canonical shapes (primary phase-5 flip targets) ---
 
-// KNOWN-FP(phase-5): FP/requires-lifting — err==nil ⇒ result!=nil
-// postcondition not lifted across a call boundary, and re-derived
-// across a SECOND guarded reassignment of the same variable: `beginTx`
-// is called twice, each immediately guarded by its own `err != nil`
-// check, mirroring compact.go's `dst.Begin(true)` called once up front
-// and again on reassignment inside the loop before `tx.Commit()`
-// (exemplar C009c). `commitTx` never sees either guard — its own
-// `tx.in.id` read is analyzed as a standalone summary that doesn't
-// inherit either call site's proof.
+// FIXED (interprocedural summaries, 2026-07-20): formerly
+// KNOWN-FP(phase-5) FP/requires-lifting — `beginTx`'s inferred
+// correlation ensures (is_nil(err) ⇒ ¬is_nil(tx), validated under the
+// Go-idiom rule for the errConstructFailed sentinel returns) is now
+// asserted at both call sites in Compact; each `err != nil` guard then
+// renders is_nil(tx) unreachable at the commitFn call, discharging the
+// propagated nil-deref requirement. Kept as the green regression case
+// for exemplar C009c.
 type txnStats struct{ id int }
 
 type txn struct{ in *txnStats }
@@ -332,7 +339,7 @@ func Compact(a, b bool) error {
 	if err != nil {
 		return err
 	}
-	return commitFn(tx) // want: nil-deref
+	return commitFn(tx)
 }
 
 func commitFn(tx *txn) error {

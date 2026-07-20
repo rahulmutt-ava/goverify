@@ -273,7 +273,11 @@ mod tests {
         let callee = callee_with_ensures(vec![nonnil_result_clause(0)]);
         let dst = Term::var("v7", ptr_sort());
         let bound = instantiate_ensures(&callee, &[], &[Some(dst)]);
-        assert_eq!(bound.len(), 1, "one ensures clause in, one bound clause out");
+        assert_eq!(
+            bound.len(),
+            1,
+            "one ensures clause in, one bound clause out"
+        );
         let b = bound[0]
             .bound
             .as_ref()
@@ -320,7 +324,11 @@ mod tests {
         let vars = b.free_vars();
         let mut free: Vec<&String> = vars.keys().collect();
         free.sort();
-        assert_eq!(free, vec!["va", "vd"], "mixed p0/r0 clause binds both caller terms");
+        assert_eq!(
+            free,
+            vec!["va", "vd"],
+            "mixed p0/r0 clause binds both caller terms"
+        );
     }
 
     #[test]

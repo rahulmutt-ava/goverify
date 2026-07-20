@@ -1071,3 +1071,192 @@ clean pass.
    inversion are single-digit finding counts), but it's a data point that
    phase-4's per-class triage, while extensively cross-checked, was not
    immune to this failure mode.
+
+## Interprocedural-summaries re-run addendum (2026-07-20)
+
+Re-run of the phase-4 shakeout against the merged interprocedural-summaries
+mechanism stack (Tasks 1-9), evaluated against the fix-wave baseline of 509
+findings. The wave's headline goal was to restore the `FillPercent`
+detection the fix-wave lost (recorded as that wave's "principal known
+cost"). This section records the four spec §8 gate verdicts with evidence.
+Baseline for every gate below is the fix-wave re-run (509 findings), not the
+original phase-4 total (1006).
+
+### Run parameters
+
+- goverify branch: `summaries/interprocedural` @ `b94581a` (Tasks 1-9
+  committed and gate-green; fix-wave `5e891cf` is a verified ancestor, so
+  the wave strictly adds facts/obligations on top of the fix-wave build).
+- bbolt ref: v1.4.0
+- timeouts: infer 100 ms / obligation 250 ms (defaults, unchanged)
+- command: `mise run shakeout` (`scripts/shakeout.sh` → `goverify check
+  ./...`)
+- findings: **461** (456 unique `(file:line:col, tag)` signatures; 5
+  positions flagged in more than one call context: `bucket.go:843:9`,
+  `cmd/bbolt/main.go:1634:22` ×3, `tx.go:53:16`, `tx.go:561:15`). Baseline
+  fix-wave: **509**. Net **−48**.
+- wall clock: first run under the new checker logic (cold SMT cache — the
+  interprocedural changes invalidate every cached query) **≈163 s**; warm
+  re-run **31 s**.
+- **determinism note**: two independent runs (cold + warm) produced
+  byte-identical signature sets (456/456, signature-level diff empty), and
+  the `main.go:1191` hard-gate finding is present in both. Determinism
+  invariant holds.
+
+### Before/after totals per verdict bucket
+
+Each current unique signature mapped to its phase-4 (1006) triage verdict
+by `(pos, tag)`; `NEW` = signature absent from the 1006 baseline.
+
+| verdict (phase-4 label) | fix-wave (509) | interproc re-run | delta |
+|---|---|---|---|
+| TP | 24 | 24 | 0 |
+| FP/encoding | 167 | 146 | −21 |
+| FP/invariant | 217 | 193 | −24 |
+| FP/requires-lifting | 102 | 86 | −16 |
+| mixed (C015b) | 5 | 5 | 0 |
+| NEW (not in 1006) | 2 | 2 | — |
+| **total (unique sigs)** | — | **456** | — |
+
+The two `NEW` signatures are `cmd/bbolt/main.go:1191:6` (the restored
+`FillPercent` TP — see gate 1) and `tx.go:558:11` (the fix-wave `writeMeta`
+relocation, already present in the 509 baseline — see gate 3). Genuine TP
+detection is therefore **25** (24 surviving phase-4 TP rows + the restored
+1191), one more than the fix-wave, which had zero detectors for 1191.
+
+### Gate 1 — FillPercent nil-deref exists (HARD GATE): PASSES
+
+The reachable panic the fix-wave lost is detected again. Exact finding:
+
+```
+cmd/bbolt/main.go:1191:6: nil-deref: possibly-nil result of (*go.etcd.io/bbolt.Tx).CreateBucketIfNotExists dereferenced in (*go.etcd.io/bbolt/cmd/bbolt.benchCommand).runWritesWithSource$1 [(*go.etcd.io/bbolt/cmd/bbolt.benchCommand).runWritesWithSource$1]
+ 1191 |    b.FillPercent = options.FillPercent
+      |      ^
+    path: cmd/bbolt/main.go:1190 -> :1194 -> :1195 -> :1203
+    with: p0 = (ptr-addr #x0000000000000000)
+```
+
+- The subject resolves through the Extract: it is named the **possibly-nil
+  result of `CreateBucketIfNotExists`** (not a generic havoc'd value), and
+  the counterexample witness `p0 = (ptr-addr #x0000000000000000)` pins `b =
+  nil`. This is the ignored-error store `b, _ := tx.CreateBucketIfNotExists(...)
+  ; b.FillPercent = ...` — a genuine, reachable panic when a prior `-work`
+  run left an incompatible non-bucket value at the key.
+- Mechanism: Task 7's obligations on summary-constrained call results.
+  `CreateBucketIfNotExists`'s inferred ensures (`err == nil ⇒ result != nil`)
+  makes the discarded-error result expressible as a manifest obligation at
+  the deref site — the exact capability the fix-wave lacked (a havoc'd
+  call-result subject did not qualify under `nil.rs`'s `obligations()`).
+- Present in both the cold and warm runs. **Gate 1 passes.**
+
+### Gate 2 — requires-lifting bucket accounting (report-only)
+
+Baseline: the requires-lifting bucket held **124 findings** in phase-4 (122
+unique positions; `db.go:880:22` and `node.go:324:24` are each doubly
+flagged) across the **78 PHASE5-NOTE classes**, narrowed to **102** by the
+fix-wave. **86 survive** the interprocedural re-run — i.e. the wave newly
+discharged **16** of the fix-wave's 102 requires-lifting findings.
+
+Classes fully or partially discharged by this wave (base = phase-4 count,
+surv = surviving positions now):
+
+- **`err == nil ⇒ result != nil` callee-postcondition family** (the wave's
+  core ensures-inference mechanism): **C008c** (readMetaPage, 2→0),
+  **C120** (ReadPage, 2→0), **C193** (2→0), **C200** (2→0), **C249** (1→0),
+  **C250** (1→0), **C373** (ReadPage correlation, 1→0), **C262**
+  (ReadMetaPageAt, 1→0), **C375** (ReadMetaPageAt correlation, 1→0),
+  **C160a** (findLastBucket, 1→0), **C371** (db.mmap, 1→0), **C379**
+  (loadFreelist, 1→0).
+- **caller-guard / dominance lifted across a call edge**: **C133** (removeTx
+  tx.db, 2→0), **C179** (Commit→spill tx.db, 2→1), **C347** (spill tx.meta,
+  1→0), **C389** (writeMeta tx.db, 1→0), **C303** (composite-literal
+  receiver into `read`, 1→0), **C340** (db.file straight-line, 1→0).
+- **composite-literal / constructor never-nil across call**: **C072a**
+  (newPageCommand, 1→0), **C073a** (cobra Flags(), 1→0), **C277**
+  (newXCommand, 1→0).
+- **partials** (some positions killed, class not fully clean): **C024c**
+  (4→3), **C042** (4→2), **C051b** (2→1), **C107** (2→1), **C181** (2→1).
+- **fix-wave-attributed, not this wave**: **C185** (writeMeta relocation,
+  2→0) and 2 of **C031a** (4→2, the Use/closeSession family) were already
+  discharged in the 509 baseline.
+
+Survivors match the spec's non-goals almost exactly:
+
+- **closure / cobra classes survive**: **C027** (7/7), **C216** (2/2),
+  **C257** (1/1), **C258** (1/1), **C402** (1/1) — cobra `ExactArgs`
+  postcondition through a `RunE` closure boundary, out of this wave's scope.
+- **bounds / overflow classes survive**: **C101** (2/2), **C181** (1
+  survivor), **C223** (1/1), **C224** (1/1), **C225** (1/1), **C229**
+  (1/1), **C405** (1/1), **C406** (1/1) — neither bounds nor overflow
+  checker gained interprocedural bounds propagation in this wave.
+- **partial miss worth flagging**: **C009c** (2→1). The ReadMetaPageAt half
+  (`command_surgery_meta.go:59:32`) is discharged, but the canonical DB.Begin
+  half (`compact.go:26:23`, `tx.Commit` guarded by `dst.Begin`'s
+  `err != nil`) **survives** — the `DB.Begin`/`beginRWTx`/`beginTx`
+  `err == nil ⇒ tx != nil` postcondition is not being lifted through the
+  caller's err-guard at that site even though the sibling ReadMetaPageAt
+  pattern is. Open item for the plan owner (see below).
+
+**Gate 2 read:** the ensures-inference machinery lands exactly where the
+spec predicted (the postcondition-lifting classes), leaves the declared
+non-goals (closure/cobra, bounds/overflow) untouched, and has one
+incomplete case (C009c/DB.Begin) inside its own nominal scope.
+
+### Gate 3 — new finding signatures vs the 509 baseline (report-only)
+
+Diffing the 456 current signatures against the 1006 phase-4 baseline yields
+exactly two not-in-1006 signatures; triaged against the 509 fix-wave
+baseline:
+
+| signature | in 509 baseline? | new vs 509? | verdict | reason |
+|---|---|---|---|---|
+| `cmd/bbolt/main.go:1191:6` nil-deref | no (never flagged in any prior run) | **YES** | **TP** | ignored-error `CreateBucketIfNotExists` result dereferenced (`b.FillPercent`) — the gate-1 headline; genuine reachable panic |
+| `tx.go:558:11` nil-deref | **yes** (fix-wave `writeMeta` relocation, documented in the fix-wave gate-3 section) | no | — | already in the 509 baseline, not introduced by this wave |
+
+- **New findings vs the 509 baseline: exactly 1** (`main.go:1191:6`),
+  triaged **TP**. **FP rate among new findings: 0/1 = 0%.**
+- No resurrections: the wave builds strictly on the fix-wave ancestor and
+  only *adds* non-nil facts (discharging findings) and call-result
+  obligations (creating findings only at new call-site positions). The
+  empirical diff confirms this — the sole new position is the intended
+  call-result obligation at 1191; no fix-wave-discharged position reappears.
+- The fix-wave's other introduced signature,
+  `command_surgery.go:268:55` (overflow requires), is **gone** in this run
+  (discharged by the interprocedural bounds/overflow reasoning at the call
+  edge) — a further net improvement, not a regression.
+
+### Gate 4 — performance delta (report-only, not gated)
+
+- corpus + test wall-clock (Task 9): **test 26 s / corpus 23 s** — unchanged
+  (this wave altered no test/corpus timings; Task 9 recorded green).
+- shakeout wall-clock: first run under the new checker logic **≈163 s**
+  (cold — the interprocedural changes invalidate the entire SMT query
+  cache); warm re-run **31 s** vs the fix-wave warm figure of **23-25 s**, a
+  **~+6-8 s** steady-state cost attributable to the added ensures-inference
+  and call-result-obligation passes. Well within the manual-shakeout budget;
+  no blocking-tier timing is affected (shakeout is not in the blocking gate).
+
+### Known costs and open items (for the plan owner)
+
+1. **C009c / DB.Begin partial miss** (gate 2): `compact.go:26:23`
+   (`tx.Commit` after `tx, err := dst.Begin(true); if err != nil {...}`)
+   still fires, though its ReadMetaPageAt sibling is discharged. The
+   `DB.Begin`/`beginRWTx`/`beginTx` `err == nil ⇒ result != nil` ensures is
+   apparently not inferred or not lifted through the caller's err-guard at
+   this site. This is inside the wave's nominal scope — worth a targeted
+   look at whether `Begin`'s dispatch (`beginRWTx`/`beginTx`) defeats the
+   ensures inference (multi-callee dispatch) before accepting the wave.
+2. **Closure/cobra requires-lifting residual** (gate 2, expected): C027,
+   C216, C257, C258, C402 (cobra `ExactArgs` through `RunE` closures)
+   survive — a declared non-goal (closure-capture boundary). Carry to a
+   follow-up wave if closure-capture propagation is ever prioritized.
+3. **Bounds/overflow requires-lifting residual** (gate 2, expected): C101,
+   C181, C223-C225, C229, C405, C406 survive — neither checker gained
+   interprocedural bounds propagation here; explicitly out of scope.
+4. **Acceptance recommendation**: the wave meets its headline goal (gate 1
+   restores the FillPercent detector, 0% FP among new findings, determinism
+   preserved) and cleanly discharges the postcondition-lifting requires
+   classes it targeted (−16 requires-lifting, −48 findings overall) with no
+   regressions and no new FPs. Recommend **accept**, with item 1
+   (C009c/DB.Begin) tracked as a small in-scope follow-up rather than a
+   blocker.

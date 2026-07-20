@@ -581,6 +581,19 @@ fn key_of(keys: &BTreeMap<ValueId, AddrKey>, v: ValueId) -> AddrKey {
     keys.get(&v).cloned().unwrap_or(AddrKey::Root(v))
 }
 
+/// Cap on AddrKey nesting (fix 1, review): a crafted `.gvir` chain of
+/// FieldAddr/IndexAddr instructions (`v_{i+1} = FieldAddr(v_i, 0)`)
+/// builds an AddrKey one `Box` level deeper per instruction with no
+/// natural bound. AddrKey's derived Clone/Eq/Ord (and Drop) all walk
+/// that nesting recursively; with tens of thousands of levels they
+/// stack-overflow long before any legitimate program gets remotely
+/// close — untrusted `.gvir` bytes must degrade, never crash the
+/// process. Depths are tracked in a side table (`depths`, below)
+/// alongside `keys` rather than measured by walking a key's `Box`
+/// chain — that walk would be the very recursion this cap exists to
+/// avoid.
+const MAX_ADDR_KEY_DEPTH: u32 = 64;
+
 /// DFS postorder from the entry over the cut DAG, reversed — a
 /// topological order (the DAG is acyclic by construction). Only blocks
 /// reachable from the entry appear; unreachable blocks have guards
@@ -626,6 +639,9 @@ pub(crate) fn topo_order(dag: &[Vec<u32>]) -> Vec<usize> {
 /// mutation to the shakeout's dominant FP class (mechanism 1).
 fn encode_load_forwarding(func: &Function, enc: &mut EncodedFunc) {
     let mut keys: BTreeMap<ValueId, AddrKey> = BTreeMap::new();
+    // Nesting depth of each recorded key, keyed the same as `keys`
+    // (fix 1): consulted, never derived from the key itself.
+    let mut depths: BTreeMap<ValueId, u32> = BTreeMap::new();
     let mut seen: BTreeMap<AddrKey, ValueId> = BTreeMap::new();
     for b in topo_order(&enc.dag_succs) {
         let Some(block) = func.blocks.get(b) else {
@@ -636,15 +652,38 @@ fn encode_load_forwarding(func: &Function, enc: &mut EncodedFunc) {
                 Op::Assign { dst, src } => {
                     if let Some(k) = keys.get(src).cloned() {
                         keys.insert(*dst, k);
+                        if let Some(d) = depths.get(src).copied() {
+                            depths.insert(*dst, d);
+                        }
                     }
                 }
                 Op::FieldAddr { dst, base, field } => {
-                    let bk = key_of(&keys, *base);
-                    keys.insert(*dst, AddrKey::Field(Box::new(bk), *field));
+                    let bd = depths.get(base).copied().unwrap_or(0);
+                    if bd >= MAX_ADDR_KEY_DEPTH {
+                        // Depth cap hit: degrade to a fresh root, losing
+                        // forwarding precision for this value only —
+                        // never soundness (a fresh root just never
+                        // matches a prior `seen` key). Crucially, this
+                        // branch never touches the (arbitrarily deep)
+                        // base key: no `key_of`, no clone, no recursion.
+                        keys.insert(*dst, AddrKey::Root(*dst));
+                        depths.insert(*dst, 0);
+                    } else {
+                        let bk = key_of(&keys, *base);
+                        keys.insert(*dst, AddrKey::Field(Box::new(bk), *field));
+                        depths.insert(*dst, bd + 1);
+                    }
                 }
                 Op::IndexAddr { dst, base, index } => {
-                    let bk = key_of(&keys, *base);
-                    keys.insert(*dst, AddrKey::Index(Box::new(bk), *index));
+                    let bd = depths.get(base).copied().unwrap_or(0);
+                    if bd >= MAX_ADDR_KEY_DEPTH {
+                        keys.insert(*dst, AddrKey::Root(*dst));
+                        depths.insert(*dst, 0);
+                    } else {
+                        let bk = key_of(&keys, *base);
+                        keys.insert(*dst, AddrKey::Index(Box::new(bk), *index));
+                        depths.insert(*dst, bd + 1);
+                    }
                 }
                 Op::Load { dst, addr } => {
                     let k = key_of(&keys, *addr);
@@ -1865,6 +1904,62 @@ mod tests {
         assert!(
             !enc.asserts.contains(&eq),
             "a Store must invalidate forwarding"
+        );
+    }
+
+    #[test]
+    fn addr_key_depth_capped_on_crafted_chain_terminates() {
+        // Crafted, NOT anything go/ssa would emit (a struct containing
+        // itself through a chain of `.X` fields is not constructible in
+        // real Go), but every individual `FieldAddr` here is well-formed
+        // — nothing about `.gvir`'s wire shape forbids it: a straight
+        // chain `v2 = FieldAddr(p0, 0); v3 = FieldAddr(v2, 0); ...`
+        // CHAIN_LEN instructions deep, off a single param.
+        //
+        // Pre-fix, AddrKey nesting grew one `Box` level per instruction
+        // with no bound, and `encode_load_forwarding` calls
+        // `key_of(base).clone()` on every `FieldAddr` — so processing
+        // the last instruction alone clones a CHAIN_LEN-1-deep key,
+        // recursing that deep through derived `Clone` (same story for
+        // `Ord`/`Drop`). Verified by hand (review RED evidence, not
+        // committed as a test since it corrupts the process): reverting
+        // just the depth cap below and running this same test aborts
+        // the test binary with a stack overflow well before it reaches
+        // this assertion, at this same CHAIN_LEN.
+        //
+        // CHAIN_LEN is chosen at 40k rather than a rounder, larger
+        // number (e.g. 200k, also deep enough to blow the stack
+        // pre-fix) so the test stays under the pre-existing,
+        // independent `ASSERT_CAP` (50_000, checked only *after*
+        // `encode_load_forwarding` runs — it does not protect against
+        // this bug) and demonstrates a full, successful `Ok` encoding
+        // rather than a graceful `ASSERT_CAP` bailout. Post-fix, the cap
+        // resets nesting to `AddrKey::Root` every `MAX_ADDR_KEY_DEPTH`
+        // levels (40_000 / 64 = 625 resets here), so this test's value
+        // is that `encode_func` completes at all — mirrors
+        // `fanout_convert_cycle_on_crafted_gvir_terminates`.
+        const CHAIN_LEN: u32 = 40_000;
+        let mut instrs: Vec<goverify_extract::gvir::Instruction> =
+            Vec::with_capacity(CHAIN_LEN as usize + 1);
+        let mut base = 1u32; // p0
+        for i in 0..CHAIN_LEN {
+            let dst = 2 + i;
+            instrs.push(field_addr_ins(dst, base));
+            base = dst;
+        }
+        instrs.push(ret(vec![base]));
+        let f = goverify_extract::gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 5)],
+            blocks: vec![block_p(0, instrs, vec![], vec![])],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let enc =
+            encode_func(&p, id).expect("crafted deep FieldAddr chain must not crash encode_func");
+        assert!(
+            enc.value(goverify_ir::ValueId(base)).is_some(),
+            "final chain value should still be declared"
         );
     }
 

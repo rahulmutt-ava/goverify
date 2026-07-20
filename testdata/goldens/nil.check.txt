@@ -13,6 +13,12 @@ nil.go:26:39: nil-deref: call to example.com/nil.wrapper violates its nil-deref 
       |                                       ^
     path: nil.go:26
 
+nil.go:153:16: nil-deref: call to example.com/nil.use violates its nil-deref requirement [example.com/nil.BranchDerefJoinCall]
+  153 |  return n + use(h.cached) // want: nil-deref
+      |                ^
+    path: nil.go:151 -> nil.go:149
+    with: p0 = (ptr-addr #x0000000000000000), p1 = true
+
 nil.go:103:10: nil-deref: call to example.com/nil.use violates its nil-deref requirement [example.com/nil.CallThenDeref]
   103 |  n := use(h.cached) // want: nil-deref
       |          ^

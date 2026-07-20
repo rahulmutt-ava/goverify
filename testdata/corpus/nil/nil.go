@@ -126,3 +126,29 @@ func RangeNilMap(f *freeMaps) int {
 // is real — RangeNilMap's inferred requires must still propagate, so
 // a nil argument still reports at the call site.
 func RangeNilMapCaller() int { return RangeNilMap(nil) } // want: nil-deref
+
+// --- fix-wave fix 2b: cross-block dominance ---
+
+// DerefInDominatorThenBranchCall (fix 2b, cross-block green): the deref
+// of h.cached sits in a block that strictly dominates the post-join
+// call — every path to the call passes the deref. No finding.
+func DerefInDominatorThenBranchCall(h *holder, flip bool) int {
+	n := h.cached.n
+	if flip {
+		n++
+	} else {
+		n--
+	}
+	return n + use(h.cached)
+}
+
+// BranchDerefJoinCall (fix 2b, cross-block red): the deref happens in
+// only ONE branch arm — it does not dominate the join, so the call's
+// obligation must survive.
+func BranchDerefJoinCall(h *holder, flip bool) int {
+	n := 0
+	if flip {
+		n = h.cached.n
+	}
+	return n + use(h.cached) // want: nil-deref
+}

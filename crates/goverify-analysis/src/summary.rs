@@ -109,17 +109,59 @@ pub fn instantiate_requires(callee: &Summary, arg_terms: &[Option<Term>]) -> Vec
 }
 
 fn bind(f: &Formula, arg_terms: &[Option<Term>]) -> Option<(Term, Term)> {
+    bind_with(f, arg_terms, &[])
+}
+
+/// The general binder: p<i> free vars map to arg_terms[i], r<i> free vars
+/// to result_terms[i]. Any var that is neither, or whose slot is
+/// missing/None, makes the clause unevaluable (None).
+fn bind_with(
+    f: &Formula,
+    arg_terms: &[Option<Term>],
+    result_terms: &[Option<Term>],
+) -> Option<(Term, Term)> {
     let mut map = BTreeMap::new();
     for (name, _sort) in f.term.free_vars() {
-        // Only p<i> vars can be bound at a call site; anything else
-        // (r<i>, or a checker bug) makes the clause unevaluable here.
-        let idx: u32 = name.strip_prefix('p')?.parse().ok()?;
-        let t = arg_terms.get(idx as usize)?.clone()?;
+        let t = if let Some(rest) = name.strip_prefix('p') {
+            let idx: u32 = rest.parse().ok()?;
+            arg_terms.get(idx as usize)?.clone()?
+        } else {
+            let rest = name.strip_prefix('r')?;
+            let idx: u32 = rest.parse().ok()?;
+            result_terms.get(idx as usize)?.clone()?
+        };
         map.insert(name, t);
     }
     let bound = f.term.substitute(&map).ok()?;
     let violation = Term::not(bound.clone()).ok()?;
     Some((bound, violation))
+}
+
+/// A callee ensures-clause instantiated at a call site: p<i> := the
+/// caller's arg terms, r<i> := the call's result terms (the dst for a
+/// single-value call; the Extract dsts for a tuple call). Same None
+/// contract as `instantiate_requires`.
+pub fn instantiate_ensures(
+    callee: &Summary,
+    arg_terms: &[Option<Term>],
+    result_terms: &[Option<Term>],
+) -> Vec<BoundClause> {
+    callee
+        .ensures
+        .iter()
+        .map(|c| match bind_with(&c.formula, arg_terms, result_terms) {
+            Some((b, v)) => BoundClause {
+                tag: c.tag.clone(),
+                bound: Some(b),
+                violation: Some(v),
+            },
+            None => BoundClause {
+                tag: c.tag.clone(),
+                bound: None,
+                violation: None,
+            },
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -206,5 +248,89 @@ mod tests {
         assert!(h.requires.is_empty());
         assert_eq!(h.provenance, Provenance::Havoc);
         assert_eq!(h.effects, crate::effects::Effects::top());
+    }
+
+    fn nonnil_result_clause(result: u32) -> Clause {
+        let v = IfaceVar::Result(result);
+        let r = Term::var(&iface_var_name(&v), ptr_sort());
+        Clause {
+            tag: "nil-deref".into(),
+            formula: Formula {
+                term: Term::not(ptr_is_nil(r).unwrap()).unwrap(),
+            },
+        }
+    }
+
+    fn callee_with_ensures(ensures: Vec<Clause>) -> Summary {
+        Summary {
+            ensures,
+            ..Summary::default()
+        }
+    }
+
+    #[test]
+    fn ensures_binds_result_terms() {
+        let callee = callee_with_ensures(vec![nonnil_result_clause(0)]);
+        let dst = Term::var("v7", ptr_sort());
+        let bound = instantiate_ensures(&callee, &[], &[Some(dst)]);
+        assert_eq!(bound.len(), 1);
+        let b = bound[0]
+            .bound
+            .as_ref()
+            .expect("r0 must bind to the dst term");
+        let vars = b.free_vars();
+        let free: Vec<&String> = vars.keys().collect();
+        assert_eq!(free, vec!["v7"], "bound clause is over the caller's dst");
+    }
+
+    #[test]
+    fn ensures_missing_result_term_means_unbindable() {
+        // Discarded component (`b, _ := f()`): no Extract, no term — the
+        // clause must be skipped, never mis-bound.
+        let callee = callee_with_ensures(vec![nonnil_result_clause(1)]);
+        assert_eq!(
+            instantiate_ensures(&callee, &[], &[Some(ptr_nil()), None])[0].bound,
+            None,
+            "missing result term: cannot evaluate; do not assert"
+        );
+    }
+
+    #[test]
+    fn ensures_mixed_param_and_result_vars_bind_both() {
+        // Clause over p0 and r0 (future-proofing: arg-dependent ensures).
+        let p0 = Term::var("p0", ptr_sort());
+        let r0 = Term::var("r0", ptr_sort());
+        let both = Clause {
+            tag: "nil-deref".into(),
+            formula: Formula {
+                term: Term::or(vec![
+                    Term::not(ptr_is_nil(p0).unwrap()).unwrap(),
+                    Term::not(ptr_is_nil(r0).unwrap()).unwrap(),
+                ])
+                .unwrap(),
+            },
+        };
+        let callee = callee_with_ensures(vec![both]);
+        let out = instantiate_ensures(
+            &callee,
+            &[Some(Term::var("va", ptr_sort()))],
+            &[Some(Term::var("vd", ptr_sort()))],
+        );
+        let b = out[0].bound.as_ref().expect("both vars bindable");
+        let vars = b.free_vars();
+        let mut free: Vec<&String> = vars.keys().collect();
+        free.sort();
+        assert_eq!(free, vec!["va", "vd"]);
+    }
+
+    #[test]
+    fn requires_binding_still_rejects_result_vars() {
+        // Regression guard on the existing behavior: instantiate_requires
+        // must keep refusing r<i> vars (they have no meaning pre-call).
+        let callee = callee_with(vec![nonnil_result_clause(0)]);
+        assert_eq!(
+            instantiate_requires(&callee, &[Some(ptr_nil())])[0].violation,
+            None
+        );
     }
 }

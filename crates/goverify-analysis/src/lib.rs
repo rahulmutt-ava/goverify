@@ -25,5 +25,5 @@ pub use engine::{
 pub use prepass::{Domains, value_clean};
 pub use summary::{
     BoundClause, Clause, Formula, IfaceVar, Provenance, Summary, iface_var_name,
-    instantiate_requires,
+    instantiate_ensures, instantiate_requires,
 };

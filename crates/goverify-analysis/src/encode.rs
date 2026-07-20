@@ -12,8 +12,8 @@ use goverify_ir::{
     TypeTable, UnOpKind, ValueId, ValueKind,
 };
 use goverify_solver::{
-    BvBinOp, BvCmpOp, CtorDecl, DatatypeDecl, Logic, Query, Sort, Term, ptr_datatype, ptr_nil,
-    ptr_sort,
+    BvBinOp, BvCmpOp, CtorDecl, DatatypeDecl, Logic, Query, Sort, Term, ptr_datatype, ptr_is_nil,
+    ptr_nil, ptr_sort,
 };
 
 /// Slices/strings as length-carrying opaque values: contents havoc,
@@ -692,6 +692,18 @@ fn op_def(p: &Program, func: &Function, block: usize, op: &Op, enc: &EncodedFunc
             let len = Term::dt_get(&seq_datatype(), "seq-val", "seq-len", arg).ok()?;
             Term::eq(dt, len).ok()
         }
+        // Address-of ops never produce nil (fix-wave fix 1): a Go
+        // allocation, field address, or element address is a valid non-nil
+        // address — the op faults on a bad base before a value exists, so
+        // any continuing execution holds a non-nil dst. The base's own
+        // nilability stays a separate obligation at its own site.
+        Op::Alloc { dst, .. } | Op::FieldAddr { dst, .. } | Op::IndexAddr { dst, .. } => {
+            let d = t(dst)?;
+            if d.sort() != &ptr_sort() {
+                return None;
+            }
+            Term::not(ptr_is_nil(d).ok()?).ok()
+        }
         _ => None, // Load/Store/Call/Convert/... havoc (declared, unconstrained)
     }
 }
@@ -1340,6 +1352,45 @@ mod tests {
         assert!(
             text.contains("(= v3 (_ bv1 64))"),
             "const 1 literal:\n{text}"
+        );
+    }
+
+    #[test]
+    fn address_of_ops_assert_nonnil_dst() {
+        use goverify_extract::gvir;
+        // f(p *T): v2 = FieldAddr p0 .0 — fix-wave fix 1: the dst of an
+        // address-of op is never nil; the encoding must carry that fact.
+        let f = gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 5)],
+            blocks: vec![block_p(
+                0,
+                vec![
+                    gvir::Instruction {
+                        kind: "FieldAddr".into(),
+                        register: 2,
+                        r#type: 5,
+                        operands: vec![1],
+                        sem: Some(gvir::instruction::Sem::Field(gvir::FieldSem {
+                            index: 0,
+                            name: "X".into(),
+                        })),
+                        ..Default::default()
+                    },
+                    ret(vec![2]),
+                ],
+                vec![],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let (p, id) = program_with(f);
+        let enc = encode_func(&p, id).unwrap();
+        let d = enc.value(goverify_ir::ValueId(2)).unwrap().clone();
+        let want = Term::not(goverify_solver::ptr_is_nil(d).unwrap()).unwrap();
+        assert!(
+            enc.asserts.contains(&want),
+            "FieldAddr dst must carry a non-nil assert (fix 1)"
         );
     }
 

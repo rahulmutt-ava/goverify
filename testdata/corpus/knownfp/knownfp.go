@@ -28,19 +28,12 @@ import "unsafe"
 // call, index, or arithmetic operation. Recorded as not minimally
 // reproducible (see the report's "Corpus pins" subsection).
 
-// KNOWN-FP(phase-5): FP/encoding — address-of stack-local /
-// composite-literal / slice-element / value-typed field: the flagged
-// receiver is the implicit address of an addressable Go value (`var o
-// T`, a range-loop element, an embedded value field); Go guarantees
-// such an address is never nil, but the analyzer mismodels the
-// address-of expression as an independently nilable pointer (mechanism
-// group 2, 48 classes / 111 findings; exemplars C009b, C002b).
-// baseOptions.Validate is promoted through copyOptions's embedding, so
-// calling `o.Validate()` on a stack-local `var o copyOptions` desugars
-// to `(&o.baseOptions).Validate()` — the address of an embedded value
-// field of an addressable local, mirroring bbolt's `var o
-// surgeryCopyPageOptions; o.Validate()` (surgeryCopyPageOptions embeds
-// surgeryBaseOptions).
+// FIXED (fix-wave 2026-07-20, fix 1): formerly KNOWN-FP — address-of
+// stack-local / composite-literal / slice-element / value-typed field
+// (mechanism group 2, 48 classes / 111 findings; exemplars C009b,
+// C002b). Alloc/FieldAddr/IndexAddr dsts now carry a non-nil fact, so
+// calling the promoted (&o.baseOptions).Validate() on a stack-local
+// no longer reports. Kept as the green regression case.
 type baseOptions struct{ path string }
 
 func (o *baseOptions) Validate() error {
@@ -54,7 +47,7 @@ type copyOptions struct{ baseOptions }
 
 func BuildSurgeryOptions() error {
 	var o copyOptions
-	return o.Validate() // want: nil-deref
+	return o.Validate()
 }
 
 var errPathRequired = &constructError{}

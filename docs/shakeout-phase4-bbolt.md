@@ -783,13 +783,11 @@ are recorded below instead.
 
 ## Fix-wave re-run (2026-07-20)
 
-Status: gate check 2 initially triggered a hard-stop (task-9 report,
-`.superpowers/sdd/task-9-report.md`); a follow-up per-commit bisection
-investigation (`.superpowers/sdd/task-9-investigation.md`, gitignored —
-its evidence is reproduced inline below since it cannot be
-cross-referenced from a committed doc) resolved all three open questions.
-This section records the re-run, the four gate outcomes as adjudicated
-after that investigation, and the wave's honest net effect.
+Status: gate check 2 initially triggered a hard-stop; verified by a
+follow-up per-commit bisection investigation, whose conclusions are
+reproduced inline below (they resolved all three open questions). This
+section records the re-run, the four gate outcomes as adjudicated after
+that investigation, and the wave's honest net effect.
 
 ### Run parameters
 
@@ -834,9 +832,11 @@ touched by this wave.
 - **FP/encoding overall (mechanisms 1-5 combined): 434 → 167 findings
   (61.5% reduction)**, 185 → 101 classes fully at zero.
 - **Mechanism 5 (nil-map range, fix 5) — the one mechanism with a
-  pre-documented partial result**: C038's 8 original findings → 4 remain
-  (hashmap.go:237:29, 255:29, 271:27, shared.go:224:24 — SCC-widening
-  residual, Task 7, binding, not re-litigated here).
+  pre-documented partial result**: mechanism 5's 8 baseline findings
+  (3 classes: C038 5, C362 1, C186 2) → 4 remain, all in C038 (5 → 4;
+  C362 and C186 fully clean). The 4 residual C038 positions
+  (hashmap.go:237:29, 255:29, 271:27, shared.go:224:24) are the
+  SCC-widening residual, Task 7, binding, not re-litigated here.
 - A fully exhaustive per-position reclassification into mechanisms 1/2/3/4
   vs. 6 for all 434 baseline findings was not redone from scratch for this
   task (that is itself the "83-class residual coverage decision" scope
@@ -896,7 +896,7 @@ touched by this wave.
 - **Full survivor-class enumeration** (84 classes, by tag; bounds/overflow
   survivors are trivially expected since neither checker was touched by
   this wave):
-  - nil-deref (73, excl. C038): C001, C002b, C007a, C008a, C009b, C012,
+  - nil-deref (72, excl. C038): C001, C002b, C007a, C008a, C009b, C012,
     C014a, C017a, C022a, C030, C033, C039b, C055, C057, C060a, C061, C071,
     C088, C090b, C095, C105, C106b, C109, C110, C115, C116a, C118b, C126,
     C132, C140, C146, C153, C154, C155, C156, C163, C164, C172, C174,
@@ -954,9 +954,10 @@ dominating earlier deref, deeper subject unaffected), and the 6th
   none of these, so the true first-failure site has always been
   inexpressible as a local obligation (a pre-existing phase-4 gap, not
   introduced by this wave). Baseline detection instead came entirely from
-  *downstream* re-derefs of the same `b` — `main.go:1202:20` (`b.Put`,
-  triaged **C190 / FP/encoding**) and the nested variants at `1239:41`/
-  `1254:20` (triaged **C031a / FP/requires-lifting**). Post-fix-2b, the
+  *downstream* re-derefs of the same `b` — `main.go:1202:20` and the
+  nested `1254:20` (both `b.Put`, triaged **C190 / FP/encoding**) and the
+  nested `1239:41` (`top.CreateBucketIfNotExists`, triaged **C031a /
+  FP/requires-lifting**). Post-fix-2b, the
   store at 1191 strictly dominates the loop body containing 1202, so
   fix 2b's `¬is_nil(b)` dominance fact discharges `b.Put`'s receiver
   requirement too — locally sound (reaching 1202 means 1191's store

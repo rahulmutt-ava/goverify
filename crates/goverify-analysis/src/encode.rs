@@ -287,7 +287,7 @@ pub fn encode_func_with(
     // everything else keeps its declared-but-unconstrained (havoc) dst.
     encode_ops(p, func, &mut enc);
     encode_load_forwarding(func, &mut enc);
-    encode_call_ensures(p, func, summary_of, &mut enc);
+    encode_call_ensures(func, summary_of, &mut enc);
     if enc.asserts.len() > ASSERT_CAP {
         return Err(format!(
             "{}: encoding exceeds {ASSERT_CAP} assertions; skipped",
@@ -726,12 +726,23 @@ fn encode_load_forwarding(func: &Function, enc: &mut EncodedFunc) {
     }
 }
 
+/// Largest `Extract.index` `call_result_terms` will materialize a
+/// result slot for, mirroring `MAX_ADDR_KEY_DEPTH` / `canonical_value`'s
+/// depth caps: `lower.rs` copies `Extract.index` verbatim from untrusted
+/// `.gvir`, so a crafted `Extract { index: u32::MAX }` would otherwise
+/// drive `out.resize(u32::MAX + 1)` → multi-gigabyte allocation → OOM
+/// abort. Real Go tuples never approach this; indices past the cap are
+/// skipped, leaving that r<i> unbindable — weaker, never wrong. Untrusted
+/// bytes must degrade, never crash the process.
+const MAX_CALL_RESULT_INDEX: u32 = 256;
+
 /// The r<i> binding targets for a call's results: a single-value call
 /// binds r0 to the dst's own term; a tuple call binds r<i> to the term
 /// of the first `Extract { tuple: dst, index: i }` dst in instruction
 /// order (deterministic; SSA emits at most one per index — crafted
 /// .gvir with duplicates just picks the first). A component with no
-/// Extract (`b, _ := …`) or no term stays None.
+/// Extract (`b, _ := …`), no term, or an index past
+/// `MAX_CALL_RESULT_INDEX` stays None.
 fn call_result_terms(
     func: &Function,
     dst: Option<ValueId>,
@@ -756,6 +767,12 @@ fn call_result_terms(
             if *tuple != d {
                 continue;
             }
+            // Cap the raw untrusted index before it reaches `resize`
+            // (see `MAX_CALL_RESULT_INDEX`): an over-cap index is skipped,
+            // leaving that r<i> unbindable rather than OOM-aborting.
+            if *index > MAX_CALL_RESULT_INDEX {
+                continue;
+            }
             let i = *index as usize;
             if out.len() <= i {
                 out.resize(i + 1, None);
@@ -772,12 +789,10 @@ fn call_result_terms(
 /// Inferred summary, gated on the call's block guard. Havoc-provenance
 /// summaries are never consulted for facts.
 fn encode_call_ensures(
-    p: &Program,
     func: &Function,
     summary_of: &dyn Fn(FuncId) -> crate::summary::Summary,
     enc: &mut EncodedFunc,
 ) {
-    let _ = p;
     for (bi, b) in func.blocks.iter().enumerate() {
         for ins in &b.instrs {
             let Op::Call {
@@ -2803,6 +2818,129 @@ mod tests {
             discharge(&q),
             goverify_solver::SatResult::Sat,
             "a Havoc-provenance summary's ensures must never be asserted"
+        );
+    }
+
+    /// A crafted `.gvir` sets `Extract.index` to any u32 (`lower.rs` copies
+    /// it verbatim). Before the cap, `call_result_terms` ran
+    /// `out.resize(index + 1, None)` on that raw index, so an index near
+    /// `u32::MAX` allocated multiple gigabytes → OOM abort, violating
+    /// degrade-never-die. This exercises a tuple call with two Extracts —
+    /// a legitimate index 0 and an adversarial `1 << 20` — and requires
+    /// `call_result_terms`/`encode_func_with` to return normally with a
+    /// SANE result: index 0 still binds, the over-cap index is dropped
+    /// (`out.len()` stays at the cap, not `1 << 20 + 1`). `1 << 20` stands
+    /// in for the `u32::MAX` case, which is unsafe to actually run — it
+    /// would OOM this process were the resize still uncapped.
+    #[test]
+    fn crafted_extract_index_is_capped_not_resized() {
+        use goverify_extract::gvir;
+        use goverify_extract::gvir::instruction::Sem;
+        let mut call = gvir::Instruction {
+            kind: "Call".into(),
+            register: 2,
+            r#type: 0, // tuple dst: no scalar sort, so the Extract path runs
+            operands: vec![0],
+            ..Default::default()
+        };
+        call.sem = Some(Sem::Call(gvir::CallSem {
+            static_callee: "t.Mk".into(),
+            ..Default::default()
+        }));
+        let extract = |reg: u32, index: u32| gvir::Instruction {
+            kind: "Extract".into(),
+            register: reg,
+            r#type: 2, // *T, so the dst gets a term
+            operands: vec![2],
+            sem: Some(Sem::Extract(gvir::ExtractSem { index })),
+            ..Default::default()
+        };
+        let package = gvir::Package {
+            import_path: "t".into(),
+            types: vec![
+                gvir::Type {
+                    id: 1,
+                    repr: "T".into(),
+                    kind: gvir::TypeKind::Struct as i32,
+                    ..Default::default()
+                },
+                gvir::Type {
+                    id: 2,
+                    repr: "*T".into(),
+                    kind: gvir::TypeKind::Pointer as i32,
+                    elem: 1,
+                    ..Default::default()
+                },
+            ],
+            functions: vec![
+                gvir::Function {
+                    id: "t.Mk".into(),
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![gvir::Instruction {
+                            kind: "Return".into(),
+                            ..Default::default()
+                        }],
+                        succs: vec![],
+                        preds: vec![],
+                    }],
+                    ..Default::default()
+                },
+                gvir::Function {
+                    id: "t.Caller".into(),
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![
+                            call,
+                            extract(3, 0),
+                            extract(4, 1 << 20),
+                            gvir::Instruction {
+                                kind: "Return".into(),
+                                ..Default::default()
+                            },
+                        ],
+                        succs: vec![],
+                        preds: vec![],
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let p = goverify_ir::Program::from_packages(vec![package]);
+        let mk = p.lookup_func("t.Mk").unwrap();
+        let caller = p.lookup_func("t.Caller").unwrap();
+
+        let r0 = Term::var("r0", ptr_sort());
+        let mk_summary = crate::summary::Summary {
+            ensures: vec![crate::summary::Clause {
+                tag: "nil-deref".into(),
+                formula: crate::summary::Formula {
+                    term: Term::not(ptr_is_nil(r0).unwrap()).unwrap(),
+                },
+            }],
+            ..crate::summary::Summary::default()
+        };
+        let summary_of = move |f: goverify_ir::FuncId| {
+            if f == mk {
+                mk_summary.clone()
+            } else {
+                crate::summary::Summary::default()
+            }
+        };
+
+        // Must return, not OOM-abort, on the crafted over-cap index.
+        let enc = encode_func_with(&p, caller, &summary_of).unwrap();
+        let func = p.func(caller).unwrap();
+        let terms = call_result_terms(func, Some(goverify_ir::ValueId(2)), &enc);
+        assert!(
+            terms.len() <= MAX_CALL_RESULT_INDEX as usize + 1,
+            "over-cap Extract index must be skipped, not resized: got len {}",
+            terms.len()
+        );
+        assert!(
+            terms.first().is_some_and(Option::is_some),
+            "the legitimate index-0 result must still bind"
         );
     }
 }

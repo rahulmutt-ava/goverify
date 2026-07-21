@@ -24,8 +24,9 @@ wave:
 4. **Hygiene** — spec §6 clause-order wording; de-flake the chatty-solver
    timing test; stale manifest-loop groundness comment in `nil.rs`.
 
-Branch `summaries/followups` off local main (77b602f). Sandbox policy
-unchanged: commits unsigned, re-sign before pushing.
+Branch `summaries/followups` off local main (tip at branch time; the
+merged summaries wave ends at 77b602f). Sandbox policy unchanged:
+commits unsigned, re-sign before pushing.
 
 **Structure: investigation-first.** Both analysis items get a dedicated
 root-cause task with a minimal RED repro written before any fix, ending in
@@ -192,7 +193,9 @@ attributable to this fix.
   implemented order. Doc-only.
 - **De-flake chatty-solver timing test** (goverify-solver,
   load-sensitive): replace the wall-clock-sensitive assertion with a
-  generous bound or a logical-event assertion. No behavior change.
+  logical-event assertion (count/order of solver interactions); fall
+  back to a generous wall-clock bound only if the behavior under test
+  is inherently temporal. No production-code change.
 - **Stale manifest-loop groundness comment** in `nil.rs`: rewrite the
   comment that predates canonicalization. Comment-only.
 

@@ -10,11 +10,16 @@ to local main at 77b602f; gate addendum in `docs/shakeout-phase4-bbolt.md`)
 Clear the plan-owner follow-up queue left by the interprocedural-summaries
 wave:
 
-1. **C009c / DB.Begin partial miss** — `compact.go:26:23` (`tx.Commit()`
-   after `tx, err := dst.Begin(true); if err != nil {...}`) still fires;
-   the `err == nil ⇒ result != nil` ensures is not carried through
-   `Begin`'s dispatch to `beginRWTx`/`beginTx`. Detection gap; highest
-   value; goes first.
+1. **C009c / DB.Begin partial miss** — `compact.go:26:23` still fires
+   while its class sibling (`command_surgery_meta.go:59:32`) was
+   discharged by the wave. **Site correction (found during planning,
+   TSV row 834):** the finding is in `Compact$2` — the `walk` closure —
+   where `tx` is captured by reference from `Compact` and reassigned
+   inside the closure (`tx, err = dst.Begin(true)`). The gate report's
+   "multi-callee dispatch" mechanism is therefore only one hypothesis;
+   the capture-cell load (the declared closure-capture non-goal) is the
+   other. Residual FP the wave's discharge machinery was expected to
+   clear; goes first.
 2. **C221 FP resurrection** — the wave re-internalized the `uint16(start)`
    overflow as a manifest FP at `internal/surgeon/surgeon.go:78:20` and
    dropped fix-3's narrower call-site requires at
@@ -62,56 +67,70 @@ behavior; each fix task still writes its own RED repro first (TDD).
 
 ## 3. C009c — investigation and fix
 
-### The discharge chain
+### The site, corrected
 
-For `compact.go:26:23` to go quiet, four links must hold:
+The surviving finding is in `Compact$2`, the closure `Compact` passes to
+`walk`. Inside it, `tx.Commit()` (line 26) dereferences the **captured**
+`tx` before the closure's own `tx, err = dst.Begin(true)` reassignment
+(line 31). The value loaded at line 26 is either the enclosing
+`Compact`'s guarded `Begin` result or a previous closure invocation's
+guarded reassignment — safe, but only provable through the capture
+cell. The wave's discharged sibling (`command_surgery_meta.go:59:32`)
+had no capture in play.
 
-1. `beginTx`/`beginRWTx` each get an inferred
-   `err == nil ⇒ result non-nil` ensures.
-2. `DB.Begin` — a pure dispatch wrapper whose return sites forward its
-   callees' tuples — gets the same ensures. **Suspect link**, with two
-   distinct failure modes visible in `infer_ensures`
-   (`crates/goverify-checkers/src/nil.rs:173`):
-   - If the forwarded tuple is not exploded into per-component `Extract`s
-     in the IR, the arity check (`vals.len() != results.len()`) drops
-     **all** candidates for `Begin`.
-   - If it *is* exploded, the error component is a non-literal value, so
-     the Go-idiom rule makes the correlation vacuously provable — meaning
-     the break is downstream, not here.
-3. The caller-side obligation at `compact.go:26` fires only if `Begin`'s
-   Inferred summary carries a `nil-deref` ensures naming `r<idx>`
-   (`nil.rs:307-322`).
-4. The caller's encoding must assert `Begin`'s ensures at the call site so
-   the `err != nil` guard discharges the query.
+### Competing hypotheses (investigation decides)
+
+- **H1 (gate report)**: `DB.Begin`'s dispatch to `beginRWTx`/`beginTx`
+  (named results + deferred logger closure, so return sites are loads
+  of named-result cells, not literal nils) defeats `infer_ensures`
+  (`crates/goverify-checkers/src/nil.rs:173`) — either the arity check
+  on forwarded returns, or the correlation template. Testable directly:
+  does `Begin`'s Inferred summary carry the `[r0, r1]` correlation
+  clause?
+- **H2 (site-driven)**: `Begin`'s ensures are fine; the blocker is the
+  deref subject being a load from the closure's capture cell (FreeVar),
+  which is havoc — the **declared closure-capture non-goal**. The
+  caller-side obligation filter (`nil.rs:307-322`) and requires-lifting
+  both need a subject expressible over params or a summary-constrained
+  call result; a capture-cell load is neither.
 
 ### Investigation protocol
 
-- Write a minimal corpus function pair mirroring the shape: wrapper
-  dispatching to two callees, forwarded tuple returns, guarded caller.
-  Confirm it reproduces RED (finding fires).
-- Walk links 1→4 on that repro with unit-level probes driven through the
-  engine with the real solver — the debug CLI's StubSolver cannot observe
-  checker state (task-9 constraint), so full check runs / engine-level
-  tests are the instrument.
-- The report names the broken link and the mechanism, with evidence.
+- Probe H1 first (cheap): engine-level unit test on a `Begin`-shaped
+  fixture (dispatch wrapper, named results, deferred closure reading
+  `err`) inspecting `summaries[f].ensures` — the `ensures_corpus`
+  harness pattern. If the correlation clause is missing, H1 is live;
+  fix per decision point below.
+- Probe H2: corpus case with a closure capturing and reassigning a
+  guarded call result, mirroring `Compact$2`. Confirm RED.
+- The report names the broken link and mechanism, with evidence.
 
 ### Decision point (resolved by investigation, carried in the plan)
 
-- **Link 2, arity**: infer wrapper ensures by instantiating callee
-  ensures through forwarded-tuple returns — meet over return sites (for
-  `Begin`, the intersection of both callees' clauses).
-- **Link 2, correlation logic**: targeted repair inside `infer_ensures`.
-- **Link 3/4**: encode-side fix in the obligation filter or the call-site
-  ensures assertion.
+- **H1 confirmed, arity/forwarding**: infer wrapper ensures by
+  instantiating callee ensures through forwarded returns — meet over
+  return sites (for `Begin`, the intersection of both callees'
+  clauses). Fix, flip repro GREEN.
+- **H1 confirmed, correlation logic**: targeted repair inside
+  `infer_ensures`.
+- **H2 confirmed (closure capture)**: this member of C009c belongs to
+  the closure-capture family — a declared non-goal. **No code fix**
+  (stop condition, mirroring the fix-wave's C038 re-attribution):
+  document the re-attribution in the shakeout doc and pin the closure
+  repro as a KNOWN-FP corpus case so the boundary is tripwired.
+- Both H1 and H2 partially true: fix the H1 component (it affects
+  every dispatch wrapper, not just `Begin`), re-attribute the residual.
 
-Every candidate fix touches finding-suppressing paths. The bar: RED→GREEN
-repro, plus gate G3's no-unexplained-departures check on the shakeout diff
-(a fix must not silently discharge findings beyond its target).
+Any code fix touches finding-suppressing paths. The bar: RED→GREEN
+repro, plus gate G3's no-unexplained-departures check on the shakeout
+diff (a fix must not silently discharge findings beyond its target).
 
 ### Success criteria
 
-Repro flips GREEN; `compact.go:26:23` absent from the shakeout; no
-unexplained departures vs the 461 baseline.
+Per the investigation verdict: either `compact.go:26:23` absent from
+the shakeout with the repro GREEN (H1-fixable), or a documented
+re-attribution to the closure-capture family with a KNOWN-FP pin
+(H2). Either way: no unexplained departures vs the 461 baseline.
 
 ## 4. C221 — investigation and fix
 
@@ -133,8 +152,20 @@ The finding is an FP either way — `start` is guarded to
   classification — if the overflow checker's manifest-vs-liftable split
   now sees `start` as params-only/expressible where it previously wasn't,
   the finding re-internalizes exactly this way.
-- **Second**: F2's `encode_props` extension to the summary-bearing domain
-  altered what is provable at the call site.
+- **Second**: task 6's switch of `bounds.rs` to `encode_func_with`
+  changed a discharge result in `infer_requires` (the requires clause
+  vanishing from `ClearPageElements`' summary explains both deltas at
+  once: `pre` loses the bound, so the manifest obligation fires; call
+  sites have nothing to propagate, so `268:55` disappears).
+
+Planning exploration already established the *encoding* facts the
+decision point needs: integers encode as **bitvectors** (`int_repr` →
+`Sort::BitVec(w)`, encode.rs:46-62,108-125), so `Count()`'s `uint16`
+result carries the ≤ 65535 bound intrinsically in its sort; the gap is
+that int→int `Op::Convert` is **unmodeled** (encode.rs:1031-1053 has
+only the uintptr-provenance pointer arm; everything else havocs), so
+the widening `uint16 → int` severs the bound before it reaches
+`elementCnt`.
 
 ### Investigation protocol
 
@@ -149,14 +180,22 @@ The finding is an FP either way — `start` is guarded to
 
 ### Decision point: discharge outright vs restore requires form
 
-With the mechanism in hand, assess **outright discharge** first: if
-type-width bounds on call results of intrinsic-width integer returns
-(`Count() → uint16` ⇒ result ≤ 65535) are already encoded or cheap to
-encode, the FP disappears at both sites — best precision. If that
-requires anything resembling general interprocedural bounds propagation
-(an explicit non-goal), **fall back to restoring the requires form**
-(fix-3 parity: fire only at the unbounded call site). The plan carries
-both branches; the investigation report picks one with evidence.
+With the regression mechanism in hand, assess **outright discharge**
+first: model widening int→int converts as a **range assert on the
+dst** (`0 ≤ dst ≤ 65535` for a `uint16` source, sign-adjusted for
+signed sources) — a local arm in the encoder's op-constraint match, no
+`Term` API change (the solver term language has no zext/sext nodes, so
+the sound under-constraint is the range, not value equality), and no
+interprocedural machinery. With it, the guard `start < elementCnt`
+plus `elementCnt = int(p.Count()) ≤ 65535` makes the truncation
+violation Unsat at the manifest site, and `infer_requires`'
+Sat-reachability check then keeps the call-site requires from ever
+being minted — discharged at both sites. If the investigation finds
+this insufficient (or the regression mechanism demands its own repair
+to keep other findings stable), **fall back to restoring the requires
+form** (fix-3 parity: fire only at the unbounded call site). The plan
+carries both branches; the investigation report picks one with
+evidence.
 
 ### Success criteria
 
@@ -205,7 +244,10 @@ Blocking gate (`mise run lint` + `test` incl. corpus determinism +
 `secrets` + `audit`) plus a full bbolt shakeout with an addendum in
 `docs/shakeout-phase4-bbolt.md`, same format as prior waves:
 
-- **G1**: `compact.go:26:23` discharged (C009c).
+- **G1**: C009c resolved per the investigation verdict — either
+  `compact.go:26:23` discharged, or re-attributed to the
+  closure-capture family with a KNOWN-FP corpus pin and a shakeout-doc
+  note (plus any H1 wrapper-ensures fix landed on its own merits).
 - **G2**: C221 resolved per the investigation's decision — signature gone,
   or relocated to the call-site requires.
 - **G3**: full diff vs the 461 baseline — every departure and arrival

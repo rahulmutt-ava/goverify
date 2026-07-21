@@ -245,16 +245,21 @@ pub fn analyze_full(
         for f in p.func_ids() {
             // Spec §8 ("oversized function → skip with diagnostic"): every
             // checker encodes `f` internally and bails silently on an
-            // `encode_func` error (e.g. a function past the assertion cap),
-            // so no finding — and no reason why — ever surfaces. Encode
-            // once here (findings pass only, so the fixpoint's cost is
-            // untouched) and record ONE diagnostic per function when it
+            // `encode_func_with` error (e.g. a function past the assertion
+            // cap), so no finding — and no reason why — ever surfaces.
+            // Probe with the SAME `encode_func_with(.., &summary_of)` the
+            // checkers use, not bare `encode_func`: a function under the cap
+            // without summaries but over it once callee ensures are asserted
+            // would otherwise get zero findings AND zero diagnostic,
+            // defeating the one-diagnostic-per-failed-function contract.
+            // Encode once here (findings pass only, so the fixpoint's cost
+            // is untouched) and record ONE diagnostic per function when it
             // fails; the checkers still degrade to zero findings for it.
             // Bodyless/external functions never reach a checker's encoder,
             // so skip them. Deterministic: this loop is the single-threaded
             // ascending-`FuncId` findings scan.
             if p.func(f).is_some()
-                && let Err(e) = crate::encode::encode_func(p, f)
+                && let Err(e) = crate::encode::encode_func_with(p, f, &summary_of)
             {
                 findings_diagnostics.push(e);
             }

@@ -13,13 +13,23 @@
 //! count, Call as a deliberately-unresolvable havoc, Load/Store through
 //! a guaranteed pointer param) plus a terminator matching its successor
 //! count (Jump/If/Return).
+//!
+//! The generator ALSO emits tuple-returning static calls destructured by
+//! `Extract`s at hostile indices (above the encoder's cap, up to
+//! `u32::MAX`), and every property is asserted a second time over
+//! `encode_func_with` fed an Inferred ensures summary
+//! (`inferred_ensures_summary`) — the summary-bearing domain (spec §7).
+//! That domain drives `call_result_terms` over the hostile indices, so
+//! this suite is the net for the unbounded-`resize` OOM (Finding 1).
 
 use proptest::prelude::*;
 
-use goverify_analysis::encode_func;
+use goverify_analysis::{
+    Clause, Formula, IfaceVar, Provenance, Summary, encode_func, encode_func_with, iface_var_name,
+};
 use goverify_extract::gvir;
-use goverify_ir::Program;
-use goverify_solver::{SatResult, SolverLimits, TextSolver, Z3Native};
+use goverify_ir::{FuncId, Program};
+use goverify_solver::{SatResult, SolverLimits, Term, TextSolver, Z3Native, ptr_is_nil, ptr_sort};
 
 // ---- fixed type table -----------------------------------------------
 //
@@ -255,6 +265,61 @@ fn arb_instr_recipe() -> impl Strategy<Value = InstrRecipe> {
     ]
 }
 
+// ---- summary-bearing surface (spec §7) --------------------------------
+
+/// A tuple-returning static call plus the `Extract`s that destructure it.
+/// Paired with an Inferred ensures summary (`inferred_ensures_summary`),
+/// `encode_func_with` runs `call_result_terms` over these `Extract`
+/// indices — `extract_idxs` deliberately spans hostile values (above the
+/// encoder's `MAX_CALL_RESULT_INDEX = 256` cap, up to `u32::MAX`), the
+/// exact shape whose unbounded `resize` was Finding 1's OOM.
+#[derive(Clone, Debug)]
+struct TupleCallRecipe {
+    callee_idx: usize,
+    extract_idxs: Vec<u32>,
+}
+
+/// Extract indices weighted toward legitimate small tuple positions but
+/// regularly sampling adversarial values: one past the analyzer's cap,
+/// and two large indices whose pre-cap `resize` allocated gigabytes.
+fn arb_extract_index() -> impl Strategy<Value = u32> {
+    prop_oneof![
+        4 => 0u32..8,
+        1 => Just(257u32),
+        1 => Just(1u32 << 28),
+        1 => Just(u32::MAX),
+    ]
+}
+
+fn arb_tuple_call() -> impl Strategy<Value = Option<TupleCallRecipe>> {
+    let inner = (0usize..3, prop::collection::vec(arb_extract_index(), 0..=3)).prop_map(
+        |(callee_idx, extract_idxs)| TupleCallRecipe {
+            callee_idx,
+            extract_idxs,
+        },
+    );
+    prop::option::of(inner)
+}
+
+/// An Inferred summary asserting `¬is_nil(r0)` — a ptr-sorted r-var
+/// ensures. Returned for every callee so `encode_func_with` exercises the
+/// summary-bearing path: the encoder consults it for each static call and
+/// drives `call_result_terms` over the tuple `Extract`s. Havoc provenance
+/// would be ignored, so Inferred is required.
+fn inferred_ensures_summary() -> Summary {
+    let r0 = Term::var(&iface_var_name(&IfaceVar::Result(0)), ptr_sort());
+    Summary {
+        ensures: vec![Clause {
+            tag: "nil-deref".into(),
+            formula: Formula {
+                term: Term::not(ptr_is_nil(r0).unwrap()).unwrap(),
+            },
+        }],
+        provenance: Provenance::Inferred,
+        ..Summary::default()
+    }
+}
+
 fn build_instr(
     recipe: &InstrRecipe,
     alloc: &mut u32,
@@ -415,6 +480,7 @@ fn build_package(
     instr_recipes: Vec<Vec<InstrRecipe>>,
     cond_idxs: Vec<u32>,
     param_type_idxs: Vec<usize>,
+    tuple_calls: Vec<Option<TupleCallRecipe>>,
 ) -> gvir::Package {
     // CFG as an edge set first: clip out-of-range targets, dedup — then
     // preds is DERIVED from succs by inversion, so the two never disagree.
@@ -479,6 +545,41 @@ fn build_package(
         for recipe in &instr_recipes[b] {
             instrs.push(build_instr(recipe, &mut alloc, &mut pools, preds_len));
         }
+        // Summary-bearing surface: a tuple-returning static call to a
+        // bodyless callee (stays `Callee::Static`, so `summary_of` is
+        // consulted) plus `Extract`s at hostile indices. The call's dst
+        // is `r#type: 0` — no scalar sort — so `call_result_terms` takes
+        // the Extract path; the Extract dsts are `*T` so index-0
+        // destructuring binds the ptr-sorted r0 ensures.
+        if let Some(tc) = &tuple_calls[b] {
+            let names = ["p.G", "p.H", "unknown.Callee"];
+            let name = names[tc.callee_idx % names.len()];
+            let a0 = pick(&pools.ints[0], 0);
+            let tuple_dst = next_id(&mut alloc);
+            instrs.push(gvir::Instruction {
+                kind: "Call".into(),
+                register: tuple_dst,
+                r#type: 0,
+                operands: vec![0, a0],
+                sem: Some(gvir::instruction::Sem::Call(gvir::CallSem {
+                    static_callee: name.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            for &index in &tc.extract_idxs {
+                let ed = next_id(&mut alloc);
+                pools.ptrs.push(ed);
+                instrs.push(gvir::Instruction {
+                    kind: "Extract".into(),
+                    register: ed,
+                    r#type: PTR_TYPE,
+                    operands: vec![tuple_dst],
+                    sem: Some(gvir::instruction::Sem::Extract(gvir::ExtractSem { index })),
+                    ..Default::default()
+                });
+            }
+        }
         match succs[b].len() {
             0 => instrs.push(gvir::Instruction {
                 kind: "Return".into(),
@@ -531,8 +632,9 @@ fn arb_program() -> impl Strategy<Value = gvir::Package> {
             prop::collection::vec(prop::collection::vec(arb_instr_recipe(), 0..=6), nblocks);
         let cond_idxs = prop::collection::vec(any::<u32>(), nblocks);
         let param_types = prop::collection::vec(0usize..PARAM_TYPES.len(), 0..=3);
-        (succs, recipes, cond_idxs, param_types)
-            .prop_map(move |(s, r, c, p)| build_package(nblocks, s, r, c, p))
+        let tuple_calls = prop::collection::vec(arb_tuple_call(), nblocks);
+        (succs, recipes, cond_idxs, param_types, tuple_calls)
+            .prop_map(move |(s, r, c, p, t)| build_package(nblocks, s, r, c, p, t))
     })
 }
 
@@ -542,6 +644,7 @@ proptest! {
     #[test]
     fn encode_never_panics_and_is_deterministic(prog in arb_program()) {
         let p = Program::from_packages(vec![prog]);
+        let summary_of = |_f: FuncId| inferred_ensures_summary();
         for f in p.func_ids() {
             if p.func(f).is_none() { continue; }
             let a = encode_func(&p, f);
@@ -558,6 +661,24 @@ proptest! {
                 (Err(a), Err(b)) => prop_assert_eq!(a, b),
                 _ => prop_assert!(false, "determinism: Ok/Err disagree"),
             }
+            // Summary-bearing domain (spec §7): the same never-panic +
+            // determinism guarantees must hold when callee ensures are
+            // asserted, including over the hostile Extract indices — the
+            // net for Finding 1's unbounded `resize`.
+            let sa = encode_func_with(&p, f, &summary_of);
+            let sb = encode_func_with(&p, f, &summary_of);
+            match (sa, sb) {
+                (Ok(a), Ok(b)) => {
+                    for bi in 0..a.guards.len() {
+                        prop_assert_eq!(
+                            a.reach_query(bi, vec![]).canonical_text(),
+                            b.reach_query(bi, vec![]).canonical_text()
+                        );
+                    }
+                }
+                (Err(a), Err(b)) => prop_assert_eq!(a, b),
+                _ => prop_assert!(false, "determinism: Ok/Err disagree (summary-bearing)"),
+            }
         }
     }
 
@@ -567,6 +688,7 @@ proptest! {
         // Z3Native and require SOME verdict (never a crash). Cap: first
         // 4 blocks per function.
         let p = Program::from_packages(vec![prog]);
+        let summary_of = |_f: FuncId| inferred_ensures_summary();
         let mut solver = Z3Native::new(SolverLimits { timeout_ms: 2_000, mem_mb: 256 });
         for f in p.func_ids() {
             if p.func(f).is_none() { continue; }
@@ -577,6 +699,18 @@ proptest! {
                 prop_assert!(
                     matches!(res.result, SatResult::Sat | SatResult::Unsat | SatResult::Unknown),
                     "block {bi} produced no verdict:\n{text}"
+                );
+            }
+            // Same well-formedness guarantee over the summary-bearing
+            // encoding (spec §7): asserted ensures must never yield an
+            // unsolvable query.
+            let Ok(enc) = encode_func_with(&p, f, &summary_of) else { continue };
+            for bi in 0..enc.guards.len().min(4) {
+                let text = enc.reach_query(bi, vec![]).canonical_text();
+                let res = solver.solve_text(&text);
+                prop_assert!(
+                    matches!(res.result, SatResult::Sat | SatResult::Unsat | SatResult::Unknown),
+                    "summary-bearing block {bi} produced no verdict:\n{text}"
                 );
             }
         }

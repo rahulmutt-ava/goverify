@@ -65,4 +65,16 @@ fn ensures_inference_over_corpus() {
         "MayNil returns (nil, nil): no nil-deref ensures may validate: {:?}",
         ensures_vars(&p, &a, "example.com/ensures.MayNil")
     );
+    assert!(
+        ensures_vars(&p, &a, "example.com/ensures.NewTVia")
+            .contains(&vec!["r0".to_string(), "r1".to_string()]),
+        "NewTVia: forwarding wrapper must inherit the (T, error) correlation: {:?}",
+        ensures_vars(&p, &a, "example.com/ensures.NewTVia")
+    );
+    assert!(
+        ensures_vars(&p, &a, "example.com/ensures.NewTNamed")
+            .contains(&vec!["r0".to_string(), "r1".to_string()]),
+        "NewTNamed: named-results+defer wrapper must inherit the correlation: {:?}",
+        ensures_vars(&p, &a, "example.com/ensures.NewTNamed")
+    );
 }

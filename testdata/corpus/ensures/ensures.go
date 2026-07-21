@@ -39,3 +39,35 @@ func MayNil(b bool) (*T, error) {
 	}
 	return &T{}, nil
 }
+
+// newA is a second NewT-shaped constructor so the dispatch wrapper
+// below has two distinct callees (the DB.Begin shape).
+func newA(fail bool) (*T, error) {
+	if fail {
+		return nil, errOp
+	}
+	return &T{}, nil
+}
+
+// NewTVia is a bare forwarding dispatch wrapper: each return site
+// forwards a callee's whole tuple (`return f(...)`), which SSA lowers
+// as a single tuple-valued Return operand. Probes whether wrapper
+// ensures survive tuple forwarding (C009c hypothesis H1, arity form).
+func NewTVia(fail, alt bool) (*T, error) {
+	if alt {
+		return newA(fail)
+	}
+	return NewT(fail)
+}
+
+// NewTNamed is the real DB.Begin shape: NAMED results plus a deferred
+// closure reading err, which forces SSA to materialize named-result
+// cells (returns become stores + a component-wise Return of loads).
+// Probes the second H1 form.
+func NewTNamed(fail bool) (t *T, err error) {
+	defer func() { _ = err }()
+	if fail {
+		return newA(fail)
+	}
+	return NewT(fail)
+}

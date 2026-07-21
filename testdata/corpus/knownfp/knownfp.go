@@ -435,3 +435,29 @@ func PageAt(buf []byte, off uintptr) uint32 {
 	p := (*page)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + off)) // want: bounds
 	return p.Count()
 }
+
+// KNOWN-FP(closure-capture): FP/requires-lifting — the deref subject
+// inside the closure is a load from the capture cell, sequenced before
+// the closure's own guarded reassignment; no in-function fact
+// constrains it (bbolt exemplar C009c, compact.go:26:23 / Compact$2).
+// Declared non-goal since the fix-wave; this pin tripwires the
+// boundary. Verdict pending task-1 investigation — if the closure
+// analyzes differently than bbolt's, rewrite this header to match
+// observed behavior. Reuses beginTx/txn/commitTx above (the Compact
+// exemplar's own callee/type/accessor) rather than a fresh
+// NewT2-shaped constructor, per this file's existing-helpers-first
+// convention.
+func CaptureLoop(fail bool) int {
+	t, err := beginTx(fail, false)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	f := func() {
+		n += commitTx(t) // want: nil-deref
+		t, _ = beginTx(false, false)
+	}
+	f()
+	f()
+	return n
+}

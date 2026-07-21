@@ -436,17 +436,28 @@ func PageAt(buf []byte, off uintptr) uint32 {
 	return p.Count()
 }
 
-// KNOWN-FP(closure-capture): FP/requires-lifting — the deref subject
-// inside the closure is a load from the capture cell, sequenced before
-// the closure's own guarded reassignment; no in-function fact
-// constrains it (bbolt exemplar C009c, compact.go:26:23 / Compact$2).
-// Declared non-goal since the fix-wave; this pin tripwires the
-// boundary. Verdict pending task-1 investigation — if the closure
-// analyzes differently than bbolt's, rewrite this header to match
-// observed behavior. Reuses beginTx/txn/commitTx above (the Compact
-// exemplar's own callee/type/accessor) rather than a fresh
-// NewT2-shaped constructor, per this file's existing-helpers-first
-// convention.
+// KNOWN-FP(closure-capture): FP/requires-lifting — CONFIRMED (task-1
+// investigation, 2026-07-21). The closure's `t` is a capture cell: SSA
+// lowers it to an alloc with a `load`/`store` pair, and the deref site
+// (`commitTx(t)`) is a `load` of that cell sequenced, in the closure's
+// own CFG, strictly BEFORE the closure's own guarded `store` from the
+// reassignment (`t, _ = beginTx(...)`) — the load's block dominates and
+// branches into the store's block, never the reverse, so no fact from
+// the store can ever reach the load within the same invocation. Every
+// value the load could see instead comes from the enclosing function's
+// original bind (outside this closure entirely) or a prior invocation —
+// neither is representable by this function's own encoding. Traced
+// directly on the real bbolt exemplar: `Compact$2`'s `tx.Commit()` at
+// compact.go:26:23 loads its capture cell `v7` in block `b1`, which
+// precedes (as the sole predecessor edge) the guarded `store` to `v7` in
+// `b5`; byte-for-byte the same shape as this repro. Re-attributed:
+// C009c's surviving member is NOT part of the postcondition-lifting
+// family the summaries wave targeted — it belongs with the
+// closure/cobra capture-lifting family (C027 et al.), and is a declared
+// non-goal for that reason. This pin tripwires that boundary. Reuses
+// beginTx/txn/commitTx above (the Compact exemplar's own
+// callee/type/accessor) rather than a fresh NewT2-shaped constructor,
+// per this file's existing-helpers-first convention.
 func CaptureLoop(fail bool) int {
 	t, err := beginTx(fail, false)
 	if err != nil {

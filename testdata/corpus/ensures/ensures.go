@@ -51,8 +51,11 @@ func newA(fail bool) (*T, error) {
 
 // NewTVia is a bare forwarding dispatch wrapper: each return site
 // forwards a callee's whole tuple (`return f(...)`), which SSA lowers
-// as a single tuple-valued Return operand. Probes whether wrapper
-// ensures survive tuple forwarding (C009c hypothesis H1, arity form).
+// via per-component `Extract`s ahead of a component-wise `Return` — not
+// a single tuple-valued Return operand (confirmed by direct IR
+// inspection, task-1 investigation). Pins that wrapper ensures DO
+// survive tuple forwarding (C009c hypothesis H1, arity form: refuted —
+// this probe is a green regression guard, not a RED tripwire).
 func NewTVia(fail, alt bool) (*T, error) {
 	if alt {
 		return newA(fail)
@@ -62,8 +65,9 @@ func NewTVia(fail, alt bool) (*T, error) {
 
 // NewTNamed is the real DB.Begin shape: NAMED results plus a deferred
 // closure reading err, which forces SSA to materialize named-result
-// cells (returns become stores + a component-wise Return of loads).
-// Probes the second H1 form.
+// cells (returns become stores + a component-wise load-per-component
+// Return, same as NewTVia's shape). Pins the second H1 form: also
+// refuted, also green.
 func NewTNamed(fail bool) (t *T, err error) {
 	defer func() { _ = err }()
 	if fail {

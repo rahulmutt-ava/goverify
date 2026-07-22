@@ -536,3 +536,55 @@ func CaptureLoop(fail bool) int {
 	f()
 	return n
 }
+
+// wave-2 (spec §5): manifest-position C221 repro under the
+// dual-checker interaction that produced the original FP. The
+// summaries-wave C221 mechanism was NilChecker ensures (from an
+// err-guarded constructor call) threading into the bounds encoding of
+// the SAME function via encode_func_with — reproducible only with
+// both checkers registered, which is why the task-3 repro in
+// bounds_corpus (BoundsChecker alone) had to fire at a caller
+// position instead. Here count8's uint16 result bounds n through
+// int(), so the guarded uint16(start) at the manifest position must
+// stay DISCHARGED by 4A's widening-convert range model even with
+// newPage8's nil-deref ensures in the encoding. GREEN pin: no want
+// comment — any arrival fails the suite's set-equality.
+type page8 struct{ count uint16 }
+
+var errPage8 = &constructError{}
+
+func newPage8(fail bool) (*page8, error) {
+	if fail {
+		return nil, errPage8
+	}
+	return &page8{count: 42}, nil
+}
+
+func count8(p *page8) uint16 { return p.count }
+
+func ClearPage8Elements(start int, fail bool) uint16 {
+	p, err := newPage8(fail)
+	if err != nil {
+		return 0
+	}
+	n := int(count8(p))
+	if start < 0 || start >= n {
+		return 0
+	}
+	return uint16(start)
+}
+
+// CallClearPage8 is the deterministic 4A-regression tripwire for the
+// pin above. Today guard + 4A's uint16-sourced bound discharge the
+// uint16(start) obligation LOCALLY (Unsat), so ClearPage8Elements gets
+// no lifted overflow requires and this call is silent. If 4A's range
+// model regresses, that obligation goes Sat, requires-lifting hoists
+// it onto ClearPage8Elements (params-only rule, see UnboundedElemOffset
+// above), and this unbounded-arg call site fires an overflow arrival
+// HERE — the suite's set-equality trips. The manifest line itself can
+// never report while Infer succeeds (lifting masks it); its only
+// arrival channel is the near-timeout requires-drop flake (the real
+// C221 mechanism, mitigated by the wave-2 retry tier).
+func CallClearPage8(fail bool) uint16 {
+	return ClearPage8Elements(unboundedN, fail)
+}

@@ -101,6 +101,13 @@ consistent with a genuinely load/timing-sensitive query, not a
 contradiction to explain away and not a flaw in either investigation's
 method.
 
+**For Task 7's gate evaluation:** at current HEAD (`2c24ad5`), every run
+I made — any cache state, any timeout from 100ms up to 5000ms — showed
+the pre-regression `268:55` signature and never `78:20` (see the table
+above). The `78:20` FP is currently **latent/flaky at HEAD, not
+hard-present** — a gate run today is likely, though not guaranteed, to
+see the clean signature even before Task 4's fix lands.
+
 ### External corroboration found (not produced by me)
 
 - `.superpowers/sdd/task-10-report.md` — this wave's own gated shakeout
@@ -147,9 +154,21 @@ disconfirmed as an independent contributor.
   `check`'s CLI wires an asymmetric timeout: 100ms for
   requires-inference queries, 250ms for findings/obligation queries
   (`crates/goverify-cli/src/main.rs`, `solver_timeout_ms`/
-  `obligation_timeout_ms` defaults). Once big enough, this query
-  sometimes exceeds the 100ms budget and returns `SatResult::Unknown`
-  instead of `Sat`.
+  `obligation_timeout_ms` defaults).
+- **What's established vs. inferred here** (correction from the task
+  reviewer, since my first draft stated this as directly observed): the
+  `sat` answer and the added query cost are established facts. That
+  this specific query "sometimes exceeds the 100ms budget and returns
+  `SatResult::Unknown` instead of `Sat`" is the best-supported
+  *inference* from the evidence — every one of my own fresh-cache runs,
+  at every commit including `9994c53` itself, landed on `268:55`; only
+  the prior wave's single independent cold shakeout run (`b94581a`,
+  `task-10-report.md`) is attested evidence of `78:20` from a genuinely
+  fresh computation. My data is equally consistent with a live
+  near-100ms race on some runs *or* with a prior timeout's `Unknown`
+  having been cached and reused ("cache-of-a-prior-timeout") — both
+  point at the same underlying near-the-budget phenomenon, but I never
+  personally caught the query mid-flight timing out.
 - `checker.rs`'s own doc comment mandates `Unknown` must never
   manufacture a requires clause (sound bug-finder policy) — so on
   Unknown, `infer_requires` silently drops the "overflow" clause for
@@ -160,14 +179,21 @@ disconfirmed as an independent contributor.
   contains the self-masking `¬violation` for this function/tag, so the
   same local site's own manifest obligation is no longer masked and
   fires at `surgeon.go:78:20` instead.
-- Interacts with (does not cause) an independent, pre-existing gap:
-  `Op::Convert`'s widening arm has no defining equality anywhere in
-  `encode.rs`'s `op_def` (confirmed by reading the whole match), so
-  `Count()`'s intrinsic `BitVec(16)` (`≤ 65535`) bound never reaches the
-  widened `elementCnt`. That's why the query is genuinely Sat (not
-  provably Unsat) in the first place — which is exactly what makes it
-  delicate enough to tip into Unknown once `encode_call_ensures` adds
-  cost.
+- Interacts with (does not cause) an independent, pre-existing gap.
+  **Correction (task reviewer):** my first draft wrongly claimed
+  `op_def` has no `Op::Convert` case at all — there **is** one,
+  `encode.rs:1031-1039`, the uintptr→pointer provenance arm from the fix
+  wave. What's actually true, and what this argument rests on: that arm
+  only matches a pointer-sorted dst: the `int → int` widening
+  conversion never matches its guard and falls through to the match's
+  catch-all, which havocs (`encode.rs:1052`: "Convert havocs except the
+  uintptr-provenance arm above"). So `Count()`'s intrinsic `BitVec(16)`
+  (`≤ 65535`) bound never reaches the widened `elementCnt` — Task 4A
+  should **extend the existing `Op::Convert` arm** with an
+  int-widening sub-case, not add a second, unreachable arm. That's why
+  the query is genuinely Sat (not provably Unsat) in the first place —
+  which is exactly what makes it delicate enough to tip into Unknown
+  once `encode_call_ensures` adds cost.
 
 Full quoted diff/lines are in `task-3-investigation.md`.
 
@@ -252,9 +278,14 @@ tests/nil_corpus.rs: 2 passed, 0 failed
 ## Step 4: Decision
 
 **Task 4 branch selected: 4A (convert-model discharge)**, because the
-regression is a `Sat`-vs-`Unknown` timing/complexity artifact around a
-query that is only reachable/Sat in the first place due to the
-independent, pre-existing `Op::Convert` widening gap. Asserting a range
+regression is best explained by a `Sat`-vs-`Unknown` timing/complexity
+artifact (the "exceeds 100ms → Unknown" step specifically is the
+best-supported inference, not a directly reproduced observation — see
+Step 2's evidence breakdown) around a query that is only reachable/Sat
+in the first place due to the independent, pre-existing gap in
+`Op::Convert`'s widening sub-case (the arm itself exists,
+`encode.rs:1031-1039`, but only handles uintptr→pointer provenance;
+`int`→`int` widening falls through to havoc). Asserting a range
 bound on the widened dst (per the design spec §4: `0 ≤ dst ≤ 65535` for
 a `uint16` source) makes the manifest site's own query provably Unsat —
 not just faster, actually unreachable — fixing the FP outright and
@@ -347,3 +378,43 @@ the brief.
   Task 4 wants a corpus case exercising the manifest position
   specifically (would need a `knownfp_corpus`-style test, which
   registers both checkers).
+
+## Fix note (post-approval correction pass)
+
+The task reviewer approved the investigation but flagged two Important
+inaccuracies and one Minor gap in the original text of both
+`.superpowers/sdd/task-3-investigation.md` and this report. Corrected
+both files:
+
+1. **False claim about `Op::Convert`.** The original text said
+   `encode.rs`'s `op_def` match "has no `Op::Convert` case at all." That
+   is wrong — there is an `Op::Convert` arm at `encode.rs:1031-1039`
+   (the uintptr→pointer provenance arm from the fix wave). The correct,
+   narrower claim the argument actually rests on: that arm only matches
+   a pointer-sorted dst, so the `int`→`int` widening conversion this bug
+   is about never matches its guard and falls through to the catch-all
+   havoc (`encode.rs:1052`). Reworded in both files, and added an
+   explicit note that Task 4A must **extend the existing `Op::Convert`
+   arm** with an int-widening sub-case rather than add a second, dead
+   arm.
+2. **Softened the timeout-causation wording.** Both files previously
+   stated the "exceeds 100ms → `Unknown`" step as an established fact.
+   My own fresh-cache runs at every commit I tried (including `9994c53`
+   itself) landed on `268:55`; only the prior wave's one independent
+   cold run is attested evidence of a fresh `78:20`. Reworded both
+   files to present this step as the best-supported inference (the
+   `sat`-via-unbounded-`z3` check and the measurable added query cost
+   from `encode_call_ensures` remain established facts; the specific
+   "crosses the 100ms line" mechanism is now explicitly labeled
+   inferred, not witnessed, and I noted "cache-of-a-prior-timeout" as an
+   equally-consistent alternative reading of the same data).
+3. **Minor addition.** Added an explicit one-line callout in both files
+   (probe-table area) that at current HEAD (`2c24ad5`), every run I made
+   — any cache state, any timeout 100ms-5000ms — showed `268:55` and
+   never `78:20`: the FP is latent/flaky at HEAD, not hard-present,
+   which matters for Task 7's gate evaluation.
+
+No test-affecting files touched — doc-only correction to the two
+gitignored `.superpowers/sdd/*.md` files already tracked via
+`git add -f`. `git status` before this commit showed only those two
+files modified.

@@ -56,6 +56,13 @@ prior task's own "cold" run independently caught `78:20` at `b94581a`
 while my repeated fresh-cache retests of that exact commit consistently
 show `268:55`. Both are real observations; see mechanism for why.
 
+**For Task 7's gate evaluation:** at current HEAD (`2c24ad5`), *every*
+run I made — any cache state, any timeout from 100ms up to 5000ms —
+showed the pre-regression `268:55` signature and never `78:20` (see the
+probe table's last row). The `78:20` FP is currently **latent/flaky at
+HEAD, not hard-present** — a gate run today is likely, though not
+guaranteed, to see the clean signature even before Task 4's fix lands.
+
 ## Mechanism (Step 2)
 
 ### Culprit diff — `crates/goverify-checkers/src/bounds.rs`
@@ -134,12 +141,41 @@ reachable in isolation). `check`'s CLI wires an **asymmetric timeout**
 
 Adding `encode_call_ensures`'s assertions makes this specific query
 harder (more constants/clauses to reason about) without changing its
-true answer. Under the **100ms requires-inference budget**, a query
-that used to resolve fast and Sat now sometimes resolves within budget
-(→ `268:55`, what I mostly observe) and sometimes doesn't (→
-`SatResult::Unknown`, → `78:20`, what the prior wave's cold shakeout run
-and my first two bisection probes caught). `checker.rs`'s own doc
-comment states the policy this collides with (checker.rs:56-64):
+true answer. **What follows is the best-supported inference from the
+evidence I have, not a directly reproduced observation** — I want to be
+precise about which link in this chain is established fact vs. the
+most-plausible explanation:
+
+- **Established (structural argument + direct check):** the query is
+  genuinely `sat` (verified against an unbounded external `z3`), and
+  `encode_call_ensures` measurably adds assertions to it that weren't
+  there under plain `encode_func`. This part doesn't depend on timing
+  at all — it's true regardless of machine load.
+- **Established (repeated observation):** every one of *my own*
+  fresh-cache runs, at every commit I tried including `9994c53` itself,
+  landed on `268:55`. Only the prior wave's *one* independent cold
+  shakeout run (at `b94581a`, recorded in `task-10-report.md`) is
+  attested evidence of `78:20` arising from a genuinely fresh
+  computation — I never personally reproduced a live, in-session
+  Sat→Unknown flip I could point to and say "there, it just happened."
+- **Inferred, not reproduced:** that the mechanism connecting these is
+  specifically "the **100ms requires-inference budget** is occasionally
+  exceeded, flipping `SatResult::Sat` to `SatResult::Unknown`." This is
+  the natural reading given `check`'s CLI wires an asymmetric,
+  tightly-budgeted timeout for exactly this query class (below), and
+  it's the only mechanism I can find in the code that would make the
+  *same* query answer differently across runs with no source change —
+  but I did not myself catch the query mid-flight and observe a timeout;
+  my evidence is also consistent with a *prior* timeout having been
+  cached and reused ("cache-of-a-prior-timeout") rather than a fresh
+  live near-100ms race on every affected run — both explanations point
+  at the same underlying near-the-budget phenomenon, so I can't fully
+  rule either reading out from the data alone. Treat the specific
+  "exceeds 100ms → Unknown" step as the most-plausible inference, not a
+  directly witnessed fact.
+
+`checker.rs`'s own doc comment states the policy this collides with
+(checker.rs:56-64):
 
 > "a checker must only emit a requires-clause when the corresponding
 > violation path is confirmed `Sat` — `Unknown` must never manufacture
@@ -163,21 +199,38 @@ fails to establish for `ClearPageElements`:
 
 Both deltas (`268:55` vanishing, `78:20` appearing) are the *same* root
 cause — the vanished `infer_requires` clause — exactly as the brief's
-hint anticipated; the "why" is a resource-limit (Unknown) artifact of
-`encode_call_ensures`'s added query cost, not a genuine Sat→Unsat
-logical flip (which a correct new fact could never cause, since a true,
+hint anticipated; the best-supported explanation for "why" is a
+resource-limit (`Unknown`-verdict) artifact of `encode_call_ensures`'s
+added query cost (see the itemized evidence breakdown above — this is
+the inferred link, not a directly witnessed one), and it is **not** a
+genuine Sat→Unsat logical flip (that part *is* established: a correct,
+independent new fact could never cause a Sat→Unsat flip, since a true,
 independent conjunct cannot make an otherwise-Sat formula Unsat — I
 verified the raw query is `sat` via a completely unbounded external
-solver run).
+solver run). So whatever the exact live/cached-timeout split, the
+verdict genuinely differing across runs of identical source is only
+explicable as some form of resource-limit sensitivity, not a logic bug.
 
 ### The independent, pre-existing gap this interacts with
 
 `elementCnt := int(p.Count())` — `Count()` returns `uint16`, so its
 result's SMT sort is intrinsically `BitVec(16)` (`≤ 65535` for free).
-But `Op::Convert`'s widening arm has **no defining equality** —
-`encode.rs`'s `op_def` match has no `Op::Convert` case at all (confirmed
-by reading it end-to-end), so `elementCnt`'s wider `BitVec(64)` term is
-fully havoc'd, unrelated to `Count()`'s narrow result. This gap is
+**Correction (task reviewer, post-commit):** an earlier version of this
+report claimed `op_def`'s match has no `Op::Convert` case at all — that
+is wrong. There **is** an `Op::Convert` arm, `encode.rs:1031-1039`, the
+uintptr→pointer provenance arm from the fix wave (asserts the dst
+non-nil when the src has uintptr provenance and the dst is
+pointer-sorted). What's actually true, and what the rest of this
+argument rests on, is narrower: that arm only ever fires for a
+*pointer*-sorted dst (`d.sort() != &ptr_sort()` bails early) — the
+`int → int` widening conversion this bug is about never matches its
+guard, so it falls through to the match's catch-all, which havocs
+(`encode.rs:1052`, comment: "Convert havocs except the uintptr-provenance
+arm above"). So `elementCnt`'s wider `BitVec(64)` term is fully havoc'd,
+unrelated to `Count()`'s narrow result — **for Task 4A this means
+extending the existing `Op::Convert` arm with an int-widening sub-case,
+not adding a second, fresh (and unreachable/duplicate-match) `Op::Convert`
+arm.** This gap is
 **not** the regression itself (it predates task 6 and is present at
 `a0e1b28` too — task 5 also never fires `78:20`) — it's what makes the
 underlying query genuinely `Sat` (the overflow really is reachable
@@ -254,11 +307,17 @@ corpus scale.
 ## Decision (Step 4)
 
 > **Task 4 branch selected: 4A (convert-model discharge)**, because the
-> regression traces to a `Sat`-vs-`Unknown` timing/complexity artifact
+> regression is best explained by a `Sat`-vs-`Unknown` timing/complexity
+> artifact (the specific "exceeds the 100ms budget" step is the
+> best-supported inference from the evidence, not something I directly
+> caught happening — see the Mechanism section's evidence breakdown)
 > around a query that is only reachable/Sat in the first place due to
-> an independent, pre-existing gap (`Op::Convert` widening never asserts
-> a defining equality, so `Count()`'s intrinsic `≤ 65535` bound never
-> reaches `elementCnt`). Asserting a range bound on the widened dst
+> an independent, pre-existing gap (`Op::Convert`'s widening sub-case
+> never asserts a defining equality — the arm itself exists,
+> `encode.rs:1031-1039`, but only handles uintptr→pointer provenance; the
+> `int`→`int` widening case falls through to the catch-all havoc, so
+> `Count()`'s intrinsic `≤ 65535` bound never reaches `elementCnt`).
+> Asserting a range bound on the widened dst
 > (`0 ≤ dst ≤ 65535` for a `uint16` source, per the design spec §4)
 > makes the manifest site's own query **provably Unsat** — not just
 > fast, actually unreachable — which both fixes the FP outright (bbolt's

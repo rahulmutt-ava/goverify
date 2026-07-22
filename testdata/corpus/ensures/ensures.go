@@ -53,9 +53,18 @@ func newA(fail bool) (*T, error) {
 // forwards a callee's whole tuple (`return f(...)`), which SSA lowers
 // via per-component `Extract`s ahead of a component-wise `Return` — not
 // a single tuple-valued Return operand (confirmed by direct IR
-// inspection, task-1 investigation). Pins that wrapper ensures DO
-// survive tuple forwarding (C009c hypothesis H1, arity form: refuted —
-// this probe is a green regression guard, not a RED tripwire).
+// inspection, task-1 investigation). The ensures template-2 Go-idiom
+// rule accepts ANY non-literal error component at a return site, and
+// an Extract is non-literal, so wrappers of idiomatic callees (newA,
+// NewT: never (nil, nil)) keep the (T, error) correlation WITHOUT any
+// consultation of the callee's summary (C009c hypothesis H1, arity
+// form: refuted — this probe is a green regression guard, not a RED
+// tripwire). Consequence: a wrapper of a NON-idiomatic callee (one
+// that can return (nil, nil), e.g. MayNil) would receive this same
+// correlation clause even though its callee can't support it — a
+// pre-existing declared under-approximation of the Go-idiom rule,
+// inherited from the summaries wave (tripwire pin queued as
+// follow-up).
 func NewTVia(fail, alt bool) (*T, error) {
 	if alt {
 		return newA(fail)
@@ -66,8 +75,11 @@ func NewTVia(fail, alt bool) (*T, error) {
 // NewTNamed is the real DB.Begin shape: NAMED results plus a deferred
 // closure reading err, which forces SSA to materialize named-result
 // cells (returns become stores + a component-wise load-per-component
-// Return, same as NewTVia's shape). Pins the second H1 form: also
-// refuted, also green.
+// Return, same as NewTVia's shape). Same mechanism as NewTVia: the
+// Go-idiom site rule accepts extract-shaped (here, load-of-cell-
+// shaped) error components, so this wrapper of idiomatic callees keeps
+// the correlation too. Pins the second H1 form: also refuted, also
+// green.
 func NewTNamed(fail bool) (t *T, err error) {
 	defer func() { _ = err }()
 	if fail {

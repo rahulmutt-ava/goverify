@@ -459,8 +459,11 @@ func PageAt(buf []byte, off uintptr) uint32 {
 // the real bbolt exemplar: `Compact$2`'s `tx.Commit()` at
 // compact.go:26:23 loads its capture cell `v7` in block `b1`, which has
 // the guarded `store` to `v7` in `b5` as one of its CFG successors, and
-// `b5` never branches back to `b1`; byte-for-byte the same shape as this
-// repro. Re-attributed:
+// `b5` never branches back to `b1`; the same load-before-store shape as
+// this repro (the repro's closure is straight-line, while Compact$2's is
+// a traced multi-block CFG, but the essential invariant — the store can
+// never reach the load in the same invocation — holds in both).
+// Re-attributed:
 // C009c's surviving member is NOT part of the postcondition-lifting
 // family the summaries wave targeted — it belongs with the
 // closure/cobra capture-lifting family (C027 et al.), and is a declared

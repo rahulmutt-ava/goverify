@@ -68,13 +68,17 @@ fn ensures_inference_over_corpus() {
     assert!(
         ensures_vars(&p, &a, "example.com/ensures.NewTVia")
             .contains(&vec!["r0".to_string(), "r1".to_string()]),
-        "NewTVia: forwarding wrapper must inherit the (T, error) correlation: {:?}",
+        "NewTVia: the Go-idiom site rule accepts extract-shaped error \
+         components, so this forwarding wrapper of idiomatic callees \
+         keeps the (T, error) correlation: {:?}",
         ensures_vars(&p, &a, "example.com/ensures.NewTVia")
     );
     assert!(
         ensures_vars(&p, &a, "example.com/ensures.NewTNamed")
             .contains(&vec!["r0".to_string(), "r1".to_string()]),
-        "NewTNamed: named-results+defer wrapper must inherit the correlation: {:?}",
+        "NewTNamed: the Go-idiom site rule accepts extract-shaped error \
+         components, so this named-results+defer wrapper of idiomatic \
+         callees keeps the correlation too: {:?}",
         ensures_vars(&p, &a, "example.com/ensures.NewTNamed")
     );
     assert_eq!(

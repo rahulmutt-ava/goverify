@@ -68,8 +68,9 @@ func GoodNarrow() int8 {
 
 // count is an opaque uint16 source: its call result is havoc, but its
 // SORT is BitVec(16), so ≤65535 is intrinsic — the widening int()
-// conversion is what severs the bound today (C221 exemplar,
-// surgeon.go:78:20 / ClearPageElements).
+// conversion formerly severed the bound; task 4A's range model now
+// carries it through the conversion (C221 exemplar, surgeon.go:78:20 /
+// ClearPageElements).
 func count() uint16 { return 42 }
 
 func ClearElems(start int) uint16 {
@@ -89,9 +90,11 @@ func ClearElems(start int) uint16 {
 // chain, where it would just self-mask and never actually discharge.
 type clearOpts struct{ start int }
 
-// One unbounded and one bounded caller: under the requires-form
-// fallback (task 4B) only the unbounded one may fire; under the
-// convert-model discharge (task 4A) both stay silent.
+// One unbounded and one bounded caller: both stay silent — the
+// convert-model discharge (task 4A) landed and carries the bound
+// through `int(count())` regardless of the caller's argument (under
+// the requires-form fallback (task 4B), only the unbounded one may
+// fire).
 func ClearElemsUnbounded(o clearOpts) uint16 { return ClearElems(o.start) }
 
 func ClearElemsBounded() uint16 { return ClearElems(3) }

@@ -9,6 +9,7 @@ mod discharge;
 mod printer;
 mod process;
 mod reader;
+mod retry;
 mod sort;
 mod term;
 #[cfg(any(test, feature = "testgen"))]
@@ -20,6 +21,7 @@ pub use discharge::discharge_query;
 pub use printer::{Logic, Query};
 pub use process::SmtLib2Process;
 pub use reader::{ReadError, SExpr, parse_query, parse_response, parse_sexpr};
+pub use retry::{RetryBackend, escalation_count};
 pub use sort::{CtorDecl, DatatypeDecl, Sort, SortError, ptr_datatype, ptr_sort};
 pub use term::Term; // Term is now THE typed term; the AstTerm alias is gone.
 pub use term::{BvBinOp, BvCmpOp, ptr_is_nil, ptr_nil};
@@ -83,6 +85,14 @@ pub trait TextSolver: Send {
     fn identity(&self) -> String;
     fn limits(&self) -> SolverLimits;
     fn solve_text(&mut self, canonical: &str) -> QueryOutcome;
+
+    /// Escalated-tier backend for retry-on-Unknown (wave-2 spec §2):
+    /// `discharge_query` re-issues an Unknown query once against this
+    /// backend, whose own limits key its own cache entries. None (the
+    /// default) = no retry — every plain backend and test fake.
+    fn escalation(&mut self) -> Option<&mut dyn TextSolver> {
+        None
+    }
 }
 
 /// Answers Unknown to everything (⇒ no report). Implements both solver

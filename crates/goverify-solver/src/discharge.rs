@@ -15,6 +15,25 @@ pub fn discharge_query(
     cache: Option<&QueryCache>,
     emit_dir: Option<&Path>,
 ) -> QueryOutcome {
+    let out = discharge_one(q, backend, cache, emit_dir);
+    if out.result == SatResult::Unknown
+        && let Some(esc) = backend.escalation()
+    {
+        // Exactly one escalation: discharge_one never re-consults
+        // escalation(), so nested RetryBackends still retry once.
+        // emit_dir is None — the canonical bytes were already written.
+        crate::retry::note_escalation();
+        return discharge_one(q, esc, cache, None);
+    }
+    out
+}
+
+fn discharge_one(
+    q: &Query,
+    backend: &mut dyn TextSolver,
+    cache: Option<&QueryCache>,
+    emit_dir: Option<&Path>,
+) -> QueryOutcome {
     let text = q.canonical_text();
     let limits = backend.limits();
     if let Some(dir) = emit_dir {
@@ -151,5 +170,128 @@ mod tests {
         static CALLS: AtomicU32 = AtomicU32::new(0);
         let out = discharge_query(&q(true), &mut Counting(&CALLS), None, None);
         assert_eq!(out.result, SatResult::Sat);
+    }
+
+    /// One scripted tier: fixed answer, counts calls, distinct limits.
+    struct Tier {
+        limits: SolverLimits,
+        answer: SatResult,
+        calls: &'static AtomicU32,
+    }
+
+    impl TextSolver for Tier {
+        fn identity(&self) -> String {
+            "tier-fake".into()
+        }
+        fn limits(&self) -> SolverLimits {
+            self.limits
+        }
+        fn solve_text(&mut self, _c: &str) -> QueryOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            QueryOutcome {
+                result: self.answer,
+                model: None,
+            }
+        }
+    }
+
+    fn tier(timeout_ms: u32, answer: SatResult, calls: &'static AtomicU32) -> Box<Tier> {
+        Box::new(Tier {
+            limits: SolverLimits {
+                timeout_ms,
+                mem_mb: 1024,
+            },
+            answer,
+            calls,
+        })
+    }
+
+    #[test]
+    fn unknown_escalates_once_and_escalated_result_wins() {
+        static BASE: AtomicU32 = AtomicU32::new(0);
+        static ESC: AtomicU32 = AtomicU32::new(0);
+        let before = crate::escalation_count();
+        let mut b = crate::RetryBackend::new(
+            tier(100, SatResult::Unknown, &BASE),
+            tier(1000, SatResult::Unsat, &ESC),
+        );
+        let out = discharge_query(&q(true), &mut b, None, None);
+        assert_eq!(out.result, SatResult::Unsat, "escalated result wins");
+        assert_eq!(BASE.load(Ordering::SeqCst), 1, "base tier ran once");
+        assert_eq!(ESC.load(Ordering::SeqCst), 1, "escalated tier ran once");
+        assert!(
+            crate::escalation_count() > before,
+            "escalation counter must advance"
+        );
+    }
+
+    #[test]
+    fn definitive_base_answer_never_escalates() {
+        static BASE: AtomicU32 = AtomicU32::new(0);
+        static ESC: AtomicU32 = AtomicU32::new(0);
+        let mut b = crate::RetryBackend::new(
+            tier(100, SatResult::Unsat, &BASE),
+            tier(1000, SatResult::Unsat, &ESC),
+        );
+        let out = discharge_query(&q(true), &mut b, None, None);
+        assert_eq!(out.result, SatResult::Unsat);
+        assert_eq!(ESC.load(Ordering::SeqCst), 0, "no wasted escalated query");
+    }
+
+    #[test]
+    fn unknown_at_both_tiers_stays_unknown() {
+        static BASE: AtomicU32 = AtomicU32::new(0);
+        static ESC: AtomicU32 = AtomicU32::new(0);
+        let mut b = crate::RetryBackend::new(
+            tier(100, SatResult::Unknown, &BASE),
+            tier(1000, SatResult::Unknown, &ESC),
+        );
+        let out = discharge_query(&q(true), &mut b, None, None);
+        assert_eq!(
+            out.result,
+            SatResult::Unknown,
+            "bug-finder semantics: still silent"
+        );
+        assert_eq!(
+            ESC.load(Ordering::SeqCst),
+            1,
+            "exactly one escalation, no ladder"
+        );
+    }
+
+    /// The C221-era trap, repaired: each tier caches under its own
+    /// limits-bearing key, so a cached Unknown@base still triggers the
+    /// escalation, and a cached Unsat@escalated resolves it with ZERO
+    /// solver calls on the second run.
+    #[test]
+    fn retry_composes_with_cache_per_tier() {
+        static BASE1: AtomicU32 = AtomicU32::new(0);
+        static ESC1: AtomicU32 = AtomicU32::new(0);
+        static BASE2: AtomicU32 = AtomicU32::new(0);
+        static ESC2: AtomicU32 = AtomicU32::new(0);
+        let dir = tempfile::tempdir().unwrap();
+        let cache = goverify_cache::QueryCache::open(dir.path().to_path_buf());
+        let mut b1 = crate::RetryBackend::new(
+            tier(100, SatResult::Unknown, &BASE1),
+            tier(1000, SatResult::Unsat, &ESC1),
+        );
+        let first = discharge_query(&q(true), &mut b1, Some(&cache), None);
+        assert_eq!(first.result, SatResult::Unsat);
+        let mut b2 = crate::RetryBackend::new(
+            tier(100, SatResult::Unknown, &BASE2),
+            tier(1000, SatResult::Unsat, &ESC2),
+        );
+        let second = discharge_query(&q(true), &mut b2, Some(&cache), None);
+        assert_eq!(second.result, SatResult::Unsat, "resolved from cache");
+        assert_eq!(
+            BASE2.load(Ordering::SeqCst),
+            0,
+            "base tier answered by cache"
+        );
+        assert_eq!(
+            ESC2.load(Ordering::SeqCst),
+            0,
+            "escalated tier answered by cache"
+        );
     }
 }

@@ -242,6 +242,37 @@ fn load_program(args: &DebugArgs) -> Result<goverify_ir::Program, Box<dyn std::e
     Ok(program)
 }
 
+/// Retry-tier escalation (wave-2 spec §2): an Unknown at the base
+/// timeout is re-issued once at 10x (100ms -> 1s for Infer at the
+/// defaults). Applied uniformly to both backend roles; if the shakeout
+/// gate shows unacceptable wall-clock cost, restricting to Infer here
+/// is the pre-agreed fallback.
+const RETRY_FACTOR: u32 = 10;
+
+fn escalated(lim: goverify_solver::SolverLimits) -> goverify_solver::SolverLimits {
+    goverify_solver::SolverLimits {
+        timeout_ms: lim.timeout_ms.saturating_mul(RETRY_FACTOR),
+        ..lim
+    }
+}
+
+fn retry_backend(
+    cmd: &Option<String>,
+    lim: goverify_solver::SolverLimits,
+) -> Box<dyn goverify_solver::TextSolver> {
+    let esc = escalated(lim);
+    match cmd {
+        Some(c) => Box::new(goverify_solver::RetryBackend::new(
+            Box::new(goverify_solver::SmtLib2Process::new(c, lim)),
+            Box::new(goverify_solver::SmtLib2Process::new(c, esc)),
+        )),
+        None => Box::new(goverify_solver::RetryBackend::new(
+            Box::new(goverify_solver::Z3Native::new(lim)),
+            Box::new(goverify_solver::Z3Native::new(esc)),
+        )),
+    }
+}
+
 /// `debug findings` (phase-3 tracer, this task's end-to-end milestone):
 /// extract/load, run the checkers through `analyze_full`, print every
 /// `Sat`-confirmed finding.
@@ -271,16 +302,15 @@ fn run_findings(fa: FindingsArgs) -> Result<(), Box<dyn std::error::Error>> {
     // (Task 11) differentiates Infer vs Findings.
     let mk: Box<
         dyn Fn(goverify_analysis::BackendRole) -> Box<dyn goverify_solver::TextSolver> + Sync,
-    > = match cmd {
-        Some(c) => {
-            Box::new(move |_role| Box::new(goverify_solver::SmtLib2Process::new(&c, limits)))
-        }
-        None => Box::new(move |_role| Box::new(goverify_solver::Z3Native::new(limits))),
-    };
+    > = Box::new(move |_role| retry_backend(&cmd, limits));
     let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&goverify_checkers::NilChecker];
     let a = goverify_analysis::analyze_full(&program, &cfg, &checkers, &*mk);
     for d in &a.diagnostics {
         eprintln!("goverify: {d}");
+    }
+    let esc = goverify_solver::escalation_count();
+    if esc > 0 {
+        eprintln!("goverify: solver: {esc} queries escalated to the retry tier");
     }
     print!("{}", goverify_analysis::dump_findings(&a, None));
     Ok(())
@@ -317,10 +347,7 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             goverify_analysis::BackendRole::Infer => infer,
             goverify_analysis::BackendRole::Findings => oblig,
         };
-        match &cmd {
-            Some(c) => Box::new(goverify_solver::SmtLib2Process::new(c, lim)),
-            None => Box::new(goverify_solver::Z3Native::new(lim)),
-        }
+        retry_backend(&cmd, lim)
     });
     let cfg = goverify_analysis::EngineConfig {
         opts: goverify_analysis::Options::default(),
@@ -334,6 +361,10 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let a = goverify_analysis::analyze_full(&program, &cfg, &checkers, &*mk);
     for d in &a.diagnostics {
         eprintln!("goverify: {d}");
+    }
+    let esc = goverify_solver::escalation_count();
+    if esc > 0 {
+        eprintln!("goverify: solver: {esc} queries escalated to the retry tier");
     }
     // Scope findings to the analyzed module: extraction walks the whole
     // import closure (stdlib + deps), so `a.findings` covers far more than

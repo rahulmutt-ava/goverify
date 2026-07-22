@@ -88,6 +88,20 @@ func NewTNamed(fail bool) (t *T, err error) {
 	return NewT(fail)
 }
 
+// MayNilVia is the laundering-boundary tripwire queued by the
+// summaries follow-up wave (wave-2 spec §4): a bare forwarding wrapper
+// of a NON-idiomatic callee. MayNil can return (nil, nil), so no sound
+// (T, error) correlation exists for this wrapper — but the Go-idiom
+// rule accepts the extract-shaped error component without consulting
+// MayNil's summary and mints the clause anyway (same mechanism as
+// NewTVia above, KNOWN false-discharge boundary, threat-model.md).
+// The corpus pin asserts the laundered clause IS emitted, so any
+// change to the Go-idiom rule flips the pin visibly instead of
+// silently moving the soundness boundary.
+func MayNilVia(b bool) (*T, error) {
+	return MayNil(b)
+}
+
 // Rec2's recursion is irrelevant to its result: the single return
 // site yields a fresh allocation, so the unconditional ensures must
 // be inferred even though Rec2 forms a recursive SCC — pins the

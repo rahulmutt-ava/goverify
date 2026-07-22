@@ -97,3 +97,24 @@ fn ensures_inference_over_corpus() {
         ensures_vars(&p, &a, "example.com/ensures.AsIface")
     );
 }
+
+/// KNOWN laundering boundary (wave-2 spec §4, threat-model.md): the
+/// Go-idiom rule accepts any non-literal error component at a return
+/// site WITHOUT consulting the callee's summary, so a bare forwarding
+/// wrapper of a non-idiomatic callee (MayNil can return (nil, nil))
+/// receives the (T, error) correlation its callee cannot support — a
+/// false-discharge (missed-bug) source. This tripwire pins TODAY'S
+/// behavior: if it starts failing, the Go-idiom rule changed — update
+/// threat-model.md and the ensures.go comments, then flip this pin
+/// deliberately.
+#[test]
+fn maynilvia_laundering_boundary_tripwire() {
+    let (p, a) = analysis();
+    assert!(
+        ensures_vars(&p, &a, "example.com/ensures.MayNilVia")
+            .contains(&vec!["r0".to_string(), "r1".to_string()]),
+        "MayNilVia: the Go-idiom rule launders the correlation through \
+         wrappers of non-idiomatic callees (KNOWN boundary): {:?}",
+        ensures_vars(&p, &a, "example.com/ensures.MayNilVia")
+    );
+}

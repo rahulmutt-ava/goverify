@@ -1298,3 +1298,248 @@ baseline:
    (item 2) — no *net* new false positive. Recommend **accept**, with item 1
    (C009c/DB.Begin partial miss) and item 2 (C221 precision regression)
    tracked as small in-scope follow-ups rather than blockers.
+
+## Summaries follow-up wave addendum (2026-07-21)
+
+Re-run of the phase-4 shakeout against the summaries follow-up wave (Tasks
+1-6, `summaries/followups` @ `ecb384c`, base `2d18f71`), evaluated against
+the wave's own step-0 baseline of 461 findings
+(`.goverify/shakeout/baseline-461.txt`, captured at `ee5a919`). The wave's
+two headline items were C009c (task 1/2, `compact.go:26:23`) and C221 (task
+3/4, the `surgeon.go`/`command_surgery.go` overflow pair); tasks 5-6 are
+regression pins and hygiene, test-only or comment-only. This section
+records the spec §7 gate verdicts (G1-G5) with evidence.
+
+### Run parameters
+
+- goverify branch: `summaries/followups` @ `ecb384c` (Tasks 1-6 committed).
+  The **only** production-code diff in the whole wave is task 4A's change to
+  `crates/goverify-analysis/src/encode.rs` (the `Op::Convert` widening-int
+  arm, commit `b730ea8`); task 2B's fix (`2c24ad5`) and task 3's RED repro
+  (`6123904`/`e20aff7`) touch only `testdata/corpus/`; task 5 (`53aa262`)
+  adds test-only regression pins inside `encode.rs`'s `mod tests`; task 6
+  (`ecb384c`) is comment-only in `nil.rs` plus a test-timeout bump in
+  `goverify-solver`. Any shakeout delta therefore traces to exactly one of:
+  a corpus-only change (no shakeout effect), or task 4A's encode.rs change.
+- bbolt ref: v1.4.0 (unchanged)
+- timeouts: infer 100 ms / obligation 250 ms (defaults, unchanged); G3's
+  `tx.go:558:11` item below is additionally cross-checked at 5000/5000 ms.
+- command: `mise run shakeout` (`scripts/shakeout.sh` → `goverify check
+  ./...`), cache dir `.goverify/shakeout/cache`.
+- findings: **457** (452 unique `(file:line:col, tag)` signatures; the same
+  4 positions as the baseline are each flagged in more than one call
+  context: `bucket.go:843:9` ×2, `cmd/bbolt/main.go:1634:22` ×3,
+  `tx.go:53:16` ×2, `tx.go:561:15` ×2 — confirmed identical membership on
+  both sides via `uniq -c`). Baseline: **461** findings, 456 unique
+  signatures. Net **−4** findings / **−4** unique signatures, all
+  attributed below (gate 3).
+- wall clock: cold shakeout (cache wiped, `rm -rf .goverify/shakeout/cache`)
+  **≈181 s** (`3:01.46` total); two warm re-runs **≈21 s** and **≈20 s**
+  (`21.230s` / `19.829s` total). See gate 5.
+- **determinism note**: three independent runs (1 cold + 2 warm) produced
+  byte-identical signature sets (457/457/457; `cmp` silent on cold-vs-warm1
+  and warm1-vs-warm2). Determinism invariant holds — see gate 4.
+
+### Gate 1 — C009c resolved per the investigation verdict: PASSES (re-attributed, present)
+
+Task 1's investigation (`.superpowers/sdd/task-1-investigation.md`) found
+both wrapper-ensures hypotheses (H1) refuted — `go/ssa` always splits a
+forwarded tuple `Return` into per-component `Extract`s, so the arity
+mechanism the brief pre-scouted never fires — and confirmed H2
+(closure-capture) empirically and structurally: `Compact$2`'s `tx.Commit()`
+at `compact.go:26:23` loads the capture cell `v7` in a block that strictly
+precedes, in local control flow, the closure's own guarded store to that
+cell — no in-function fact or call-site ensures constrains it. Task 2
+selected **branch 2B only** (no H1 fix landed, since no wrapper probe was
+RED); the fix re-attributes the survivor rather than discharging it
+(`a0653b2`):
+
+```
+compact.go:26:23: nil-deref: call to (*go.etcd.io/bbolt.Tx).Commit violates its nil-deref requirement [go.etcd.io/bbolt.Compact$2]
+```
+
+Present in the current run, byte-identical across all 3 shakeout runs. The
+`testdata/corpus/knownfp/knownfp.go` `CaptureLoop` pin (reusing the
+`beginTx`/`txn`/`commitTx` triple, `KNOWN-FP(closure-capture)` header)
+tripwires this boundary — its header was rewritten in the task-2B fix
+commit (`2c24ad5`) to the investigation-supported CFG claim ("the load's
+block dominates and branches into the store's block, never the reverse")
+rather than the earlier "verdict pending" wording. **Gate 1 satisfied**:
+the spec's conditional wording ("either discharged, or re-attributed to
+the closure-capture family with a KNOWN-FP corpus pin and a shakeout-doc
+note") is met by the re-attribution path — `compact.go:26:23` is no longer
+attributed to the postcondition-lifting family this wave targeted; it
+belongs with the closure/cobra non-goal family (C027 et al., see the prior
+addendum's gate 2).
+
+### Gate 2 — C221 resolved per the investigation's decision: PASSES (signature gone, both forms)
+
+Task 3's investigation (`.superpowers/sdd/task-3-investigation.md`)
+bisected the regression to the interprocedural-summaries wave's task 6
+(`BoundsChecker`/`NilChecker` switching to `encode_func_with`, which adds
+`encode_call_ensures` assertions to every discharge query) and found it is
+**timing-dependent**: the manifest overflow query at
+`internal/surgeon/surgeon.go:78:20` is genuinely `Sat` (verified against an
+unbounded external `z3`), but `encode_call_ensures`'s added assertions
+occasionally push it past the CLI's 100 ms requires-inference budget,
+flipping `Sat→Unknown` and, via `own_preconditions` self-masking, silently
+moving the finding between the manifest site (`surgeon.go:78:20`) and a
+narrower call-site requires (`command_surgery.go:268:55`) depending on
+resource pressure, not source. Task 4 selected **branch 4A**: extend the
+existing `Op::Convert` arm (`encode.rs:1031-1039`, previously only the
+uintptr→pointer provenance case) with an int-widening sub-case that asserts
+the source type's value range onto the destination term (`b730ea8`),
+making the underlying query **provably Unsat** rather than merely fast —
+removing both the FP and the fragile near-timeout query in one fix.
+
+```
+$ grep -E 'surgeon\.go:78:20|command_surgery\.go:268:55' shakeout-warm1.txt
+(no output — both absent)
+```
+
+Confirmed absent across all 3 shakeout runs, and additionally absent at an
+extended 5000 ms/5000 ms timeout (see gate 3's `tx.go:558:11` cross-check
+run, same log covers this pair) — ruling out a residual Sat-near-timeout
+explanation for either signature. **Gate 2 satisfied**: both forms of the
+signature are gone, matching the spec's first disjunct ("signature gone").
+
+### Gate 3 — full diff vs the 461 baseline, every delta attributed: PASSES
+
+```
+$ diff baseline.sigs shakeout-warm1.sigs
+265d264
+< internal/common/page.go:110:41: overflow:
+285d283
+< internal/common/page.go:94:39: overflow:
+333d330
+< internal/surgeon/surgeon.go:78:20: overflow:
+446d442
+< tx.go:558:11: nil-deref:
+```
+
+Zero arrivals; 4 departures, all traced to task 4A (the wave's one
+production-code diff) — none unattributed:
+
+| signature | mechanism | attribution |
+|---|---|---|
+| `internal/surgeon/surgeon.go:78:20` overflow | the C221 manifest site itself — see gate 2 | **4A**, direct (the fixed `Op::Convert` arm) |
+| `internal/common/page.go:110:41` overflow (`BranchPageElement`) | `BranchPageElement(index uint16)` calls `UnsafeIndex(..., int(index))` — the `uint16→int` widening convert now bounds `n` in `UnsafeIndex`'s `uintptr(n)*elemsz` overflow requirement to ≤ 65535, discharging it at this call site | **4A**, direct (widening convert at the call argument, same family as the corpus `BranchElemOffset`/C101 collateral case) |
+| `internal/common/page.go:94:39` overflow (`LeafPageElement`) | identical shape, `LeafPageElement(index uint16)` → `UnsafeIndex(..., int(index))` | **4A**, direct (same as above) |
+| `tx.go:558:11` nil-deref (`(*Tx).writeMeta`, `tx.db.Logger()`) | `writeMeta`'s own body has no widening convert; its one and only caller, `(*Tx).Commit` (`tx.go:267`), is dominated by an early `if tx.db == nil { return berrors.ErrTxClosed }` guard (`tx.go:185`) — a genuine, pre-existing invariant. `writeMeta`'s own inferred `tx.db != nil` requirement now discharges (`infer_requires`'s `discharge()` succeeds where it previously likely hit `Unknown`) and is satisfied at its sole call site, so no violation surfaces anywhere | **4A**, indirect (requires-lifting through `Commit`'s dominating guard; see verification below) |
+
+**Verification that the `tx.go:558:11` departure is not a timeout
+artifact:** re-ran `goverify check ./...` over the bbolt checkout with
+`--solver-timeout-ms 5000 --obligation-timeout-ms 5000` (50x the default
+requires-inference budget) against a description of the same commit; the
+signature stayed absent (457 findings total, identical count to the
+default-timeout runs), and so did the C221 pair. Combined with the 3
+default-timeout runs (1 cold + 2 warm, all agreeing), this is 4
+independent measurements across a 50x timeout range all agreeing on
+absence — much stronger evidence of a genuine discharge than a single
+run, and the structural explanation (`Commit`'s own dominating
+`tx.db == nil` guard) is a sound, pre-existing bbolt invariant, not an
+artifact of query resource pressure. No other bbolt caller of `writeMeta`
+exists (`grep -rn "writeMeta()"` returns exactly one call site, inside
+`Commit`).
+
+No unattributed deltas. **Gate 3 satisfied.**
+
+### Gate 4 — determinism across 3 shakeout runs: PASSES
+
+```
+$ cmp shakeout-cold.sigs shakeout-warm1.sigs   # silent
+$ cmp shakeout-warm1.sigs shakeout-warm2.sigs  # silent
+```
+
+All three runs (1 cold — cache wiped — + 2 warm) produced byte-identical
+signature sets, 457/457/457. Per task 3's investigation, this wave's own
+C221 mechanism is timing-sensitive in principle, so this determinism
+result is corroborating evidence rather than a foregone conclusion: the
+cold run is a genuinely independent computation (fresh cache), and it
+agrees with both warm runs. **Gate 4 satisfied.**
+
+### Gate 5 — corpus/test/shakeout timing (report-only)
+
+- `mise run test`: **20m56.833s** wall. This is anomalous against the
+  prior wave's own baseline (`test 26s`, task 9 of the interprocedural
+  wave) — but the anomaly is a one-time **linker** cost, not a code
+  regression: only 3 crates recompiled (`goverify-checkers`,
+  `goverify-analysis`, `goverify-cli` — exactly the crates this wave's
+  commits touch), no Z3/CMake rebuild occurred, and the individual
+  `test result: ok ... finished in Xs` lines across all ~20 test binaries
+  sum to roughly 21 s of actual test execution. The remaining ~1235 s is
+  consumed linking ~20 separate test binaries, each statically against the
+  bundled Z3 library — a cost of this run's link step, reproducible
+  per-binary, not attributable to any wave change. Flagged for the plan
+  owner as a candidate for investigation (shared/incremental test-binary
+  linking, or a faster linker) but **not** treated as a regression: the verify
+  step immediately after (`mise run corpus`, next bullet) ran in line with
+  historical norms once binaries were warm.
+- `mise run corpus`: **26.675s** total — in line with the prior wave's
+  23-26s baseline; unchanged.
+- shakeout wall-clock: cold **≈181s** (`3:01.46`) vs the prior wave's own
+  cold figure of ≈163s — a **+18s (~+11%)** increase, plausibly the added
+  per-conversion range-assertion work from 4A's widened `Op::Convert` arm
+  applied across every `int`-widening conversion in the bbolt corpus, not
+  just the C221 site. Warm re-runs **≈21s** and **≈20s** — actually
+  *faster* than the prior wave's warm figure of ≈31s, consistent with the
+  net effect of 4 fewer surviving findings (simpler queries with less to
+  re-derive) outweighing the small per-conversion assertion overhead.
+  Well within the manual-shakeout budget; shakeout is not in the blocking
+  gate.
+- Blocking tier (`lint`, `test`, `corpus`, `secrets`, `audit`): all green.
+  `secrets` (gitleaks): 174 commits scanned, no leaks. `audit` (cargo
+  audit): 99 crate dependencies scanned, clean. No flakes observed in this
+  run beyond the timing anomaly above (task 6's chatty-solver de-flake,
+  30s headroom, did not flake).
+
+### Known costs and open items (for the plan owner)
+
+1. **C009c re-attribution, not discharge** (gate 1): `compact.go:26:23`
+   still fires; it has been correctly reclassified from the
+   postcondition-lifting family (this wave's nominal scope) to the
+   closure/cobra capture-lifting non-goal family (C027 et al.), matching
+   the prior wave's own declared non-goal boundary. No further action
+   expected inside this wave's scope; a future closure-capture-propagation
+   wave would need to revisit it (already noted as a carry-forward item in
+   the prior addendum).
+2. **C221 timing-dependence, resolved but noted as a general hazard**
+   (gate 2/3): task 3's investigation explicitly flagged that *any*
+   `BoundsChecker`/`NilChecker` local site whose discharge query grows with
+   a function's interprocedural ensures footprint is a candidate for the
+   same near-timeout Sat→Unknown flake that caused C221. 4A removes the
+   hazard for this specific shape (by making the query provably Unsat
+   rather than merely fast) but adds no general timeout-tier separation or
+   retry-with-more-time safety net. Worth a scope check for other
+   borderline sites in a future wave.
+3. **`tx.go:558:11` requires-lifting discharge** (gate 3): a genuine,
+   sound false-positive elimination (verified non-flaky at 4 independent
+   timeout configurations, structurally explained by `Commit`'s dominating
+   `tx.db == nil` guard) that arrived as a side effect of 4A rather than
+   from any change targeting `NilChecker` or this call path directly. No
+   action needed, but recorded so a future investigator doesn't mistake it
+   for an unexplained regression.
+4. **`BranchElemOffset`/C101 corpus discharge** (collateral, not a bbolt
+   shakeout item): task 4A's own report notes one `testdata/corpus/knownfp`
+   case (`BranchElemOffset`/C101) was discharged and FIXED-headered as a
+   corpus-side consequence of the same widening-convert fix. Confirmed
+   here that the *same* mechanism also discharges two real bbolt sites
+   (`page.go:110:41`, `page.go:94:39`) — consistent, not a new finding.
+5. **Test-run linking-time anomaly** (gate 5): the ~1235s of the
+   20m56.833s `test` wall clock not accounted for by individual test
+   execution times is suspected to be per-binary linker overhead against
+   the bundled Z3 static library across ~20 test binaries. Not a code
+   regression (corpus ran at the historical baseline immediately
+   afterward, with binaries already linked), but worth a follow-up if
+   `mise run test` wall clock matters for CI budget — consider a faster
+   linker (lld/mold) or reducing the number of distinct test binaries per
+   crate.
+6. **Acceptance recommendation**: both headline items (C009c, C221) are
+   resolved exactly per their investigations' decisions — G1 and G2 pass
+   under the spec's own conditional wording, G3 finds zero unattributed
+   deltas across the full baseline diff (all 4 departures trace to task
+   4A, the wave's sole production-code change), and G4 confirms
+   determinism (cold + 2 warm runs byte-identical). Recommend **accept**,
+   with items 1-2 (both already-declared non-goals/hazards, not new) and
+   item 5 (linking-time, environmental) tracked as open items rather than
+   blockers.

@@ -423,6 +423,57 @@ func BranchElemOffset(base uintptr, idx uint16) uintptr {
 	return elemOffset(base, 16, int(idx))
 }
 
+// task-3 investigation (2026-07-22): PLAN DEVIATION, silent pin — the
+// wave-2 plan predicted this exact shape would produce a call-site
+// "overflow" finding (elemOffset's summary has an overflow requirement
+// on unconstrained `n`). It does not, and it never did, at any commit
+// before or after task 4A: `n` here is a BARE PARAMETER of
+// UnboundedElemOffset, so the call-site obligation against elemOffset's
+// `n`-requirement is expressible purely over UnboundedElemOffset's own
+// params (`params_only`) and Sat (n truly unconstrained) —
+// BoundsChecker's requires-lifting (`shared::propagate_requires`,
+// invoked from `infer_requires`, bounds.rs:490-501) lifts it onto
+// UnboundedElemOffset's OWN inferred requires instead of leaving it as a
+// live call-site obligation. Verified directly (temporary probe test):
+// UnboundedElemOffset's inferred summary carries exactly one
+// overflow-tagged clause, `¬(p1<0)`, over its own p1 (=n). No corpus
+// function calls UnboundedElemOffset, so that lifted requirement is
+// never discharged anywhere — silent everywhere, by SOUND design. This
+// is NOT a 4A discharge: there is no `Op::Convert` anywhere in this
+// function's body (n is already `int`; the only Convert in the family
+// is `uintptr(n)` inside elemOffset's OWN body, on elemOffset's OWN
+// param), so 4A's widening-Convert range model never touches this
+// fixture at all. See .superpowers/sdd/task-3-investigation.md for the
+// full evidence (mechanism citations, RED/GREEN probe outputs).
+//
+// Deliberately kept without a want-pin comment on the call below: under
+// the suite's set-equality check, any finding ever arriving at that call
+// trips the suite immediately. If that happens, requires-lifting's
+// boundary moved — investigate before pinning the new behavior; do not
+// just add a pin for it.
+func UnboundedElemOffset(base uintptr, n int) uintptr {
+	return elemOffset(base, 16, n)
+}
+
+// task-3 investigation (2026-07-22): the corrected, POSITIVE-polarity
+// counterpart to UnboundedElemOffset above (wave-2 spec §4 item 2 — "this
+// pin proves 4A didn't discharge real overflows"). `unboundedN` is a
+// package-level var: a memory load, not a parameter, so the value
+// reaching elemOffset's `n` is NOT expressible over GlobalElemOffset's
+// own params (`params_only` fails) — the call-site "overflow" obligation
+// against elemOffset's requirement CANNOT be lifted, and must survive to
+// the findings pass and be REPORTED. There is no guard on `unboundedN`
+// anywhere, so the violation is genuinely reachable. This is the fixture
+// that actually exercises 4A's widening-`Op::Convert` range model on a
+// case it must NOT discharge: there is no Convert here either (same
+// reasoning as above), so 4A has nothing to assert and nothing to
+// suppress — the obligation must fire on its own.
+var unboundedN int
+
+func GlobalElemOffset(base uintptr) uintptr {
+	return elemOffset(base, 16, unboundedN) // want: overflow
+}
+
 // fix-wave fix 3 (green): the nil-deref manifestation of mechanism
 // group 3 — a method with an inferred non-nil-receiver requirement is
 // called on a pointer minted from uintptr arithmetic (bbolt C001's

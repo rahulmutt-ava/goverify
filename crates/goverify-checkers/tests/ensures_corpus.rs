@@ -77,4 +77,19 @@ fn ensures_inference_over_corpus() {
         "NewTNamed: named-results+defer wrapper must inherit the correlation: {:?}",
         ensures_vars(&p, &a, "example.com/ensures.NewTNamed")
     );
+    assert_eq!(
+        ensures_vars(&p, &a, "example.com/ensures.Rec2"),
+        vec![vec!["r0".to_string()]],
+        "Rec2: recursion-independent unconditional ensures must survive the SCC fixpoint"
+    );
+    assert!(
+        ensures_vars(&p, &a, "example.com/ensures.Rec").is_empty(),
+        "Rec: a self-forwarding recursion must not bootstrap its own ensures: {:?}",
+        ensures_vars(&p, &a, "example.com/ensures.Rec")
+    );
+    assert!(
+        ensures_vars(&p, &a, "example.com/ensures.AsIface").is_empty(),
+        "AsIface: typed-nil-prone interface result must stay clause-free: {:?}",
+        ensures_vars(&p, &a, "example.com/ensures.AsIface")
+    );
 }

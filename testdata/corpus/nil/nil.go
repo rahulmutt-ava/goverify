@@ -214,3 +214,22 @@ func chained(p *T) int {
 }
 
 func BadChained() int { return chained(nil) } // want: nil-deref
+
+// --- interprocedural summaries: recursive-callee ensures discharge ---
+
+// recFresh's recursion is irrelevant to its result: the single return
+// site yields a fresh allocation, so the unconditional ensures must
+// be inferred even though recFresh forms a recursive SCC (twin of the
+// ensures-corpus Rec2 probe, exercised here through a real caller).
+func recFresh(n int) *T {
+	if n > 0 {
+		_ = recFresh(n - 1)
+	}
+	return &T{}
+}
+
+// UseRecFresh: deref of a recursive callee's constrained result: obligation raised
+// (r0 constrained by the inferred unconditional ensures), discharged
+// by the same clause. Silent = the recursive clause is actually
+// CONSUMED at a call site, not just emitted into the summary.
+func UseRecFresh() int { return recFresh(1).X }

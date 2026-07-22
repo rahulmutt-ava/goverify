@@ -75,3 +75,46 @@ func NewTNamed(fail bool) (t *T, err error) {
 	}
 	return NewT(fail)
 }
+
+// Rec2's recursion is irrelevant to its result: the single return
+// site yields a fresh allocation, so the unconditional ensures must
+// be inferred even though Rec2 forms a recursive SCC — pins the
+// simultaneous-fixpoint soundness examined in the summaries wave's
+// final review (self-consultation via the in-flight summary).
+func Rec2(n int) *T {
+	if n > 0 {
+		_ = Rec2(n - 1)
+	}
+	return &T{}
+}
+
+// Rec forwards its own recursive result: the optimistic fixpoint
+// starts it clause-free and nothing independent ever proves the
+// candidate, so the converged summary must STAY clause-free — the
+// inference must not bootstrap a self-justifying ensures.
+func Rec(n int) *T {
+	if n == 0 {
+		return &T{}
+	}
+	return Rec(n - 1)
+}
+
+type Iface interface{ M() }
+
+type impl struct{ x int }
+
+func (i *impl) M() {}
+
+// AsIface returns a typed-nil-prone interface: on the fail path the
+// wrapped *impl is nil while the interface value itself is a
+// MakeInterface product. Inference must NOT claim ¬is_nil(r0) —
+// interfaces are Ptr-sorted since the summaries wave, and this pins
+// the boundary against the Go-idiom under-approximation silently
+// widening to interface results.
+func AsIface(fail bool) Iface {
+	var p *impl
+	if !fail {
+		p = &impl{}
+	}
+	return p
+}

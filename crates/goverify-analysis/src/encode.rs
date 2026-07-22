@@ -2803,6 +2803,133 @@ mod tests {
         );
     }
 
+    /// Same fixture shape as `call_ensures_constrain_single_result`, but the
+    /// caller now takes a `*T` param passed as the call's own argument, and
+    /// the callee's ensures clause relates p0 to r0:
+    /// `¬is_nil(p0) ⇒ ¬is_nil(r0)`. Exercises `bind_with`'s `p<i>` branch
+    /// (summary.rs:124-134) end-to-end — a dead capability today (no
+    /// checker emits p-vars), flagged unverified in the summaries wave's
+    /// task-4 review.
+    #[test]
+    fn call_ensures_bind_param_vars_to_arguments() {
+        use goverify_extract::gvir;
+        use goverify_extract::gvir::instruction::Sem;
+        let mut call = gvir::Instruction {
+            kind: "Call".into(),
+            register: 2,
+            r#type: 2, // *T
+            // Non-invoke SSA operand layout is [callee, args…] (lower.rs
+            // skips operand[0] for a static callee) — operand[1] carries
+            // the real argument, ValueId(1) (the caller's param).
+            operands: vec![0, 1],
+            ..Default::default()
+        };
+        call.sem = Some(Sem::Call(gvir::CallSem {
+            static_callee: "t.Mk".into(),
+            ..Default::default()
+        }));
+        let package = gvir::Package {
+            import_path: "t".into(),
+            types: vec![
+                gvir::Type {
+                    id: 1,
+                    repr: "T".into(),
+                    kind: gvir::TypeKind::Struct as i32,
+                    ..Default::default()
+                },
+                gvir::Type {
+                    id: 2,
+                    repr: "*T".into(),
+                    kind: gvir::TypeKind::Pointer as i32,
+                    elem: 1,
+                    ..Default::default()
+                },
+            ],
+            functions: vec![
+                gvir::Function {
+                    id: "t.Mk".into(),
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![gvir::Instruction {
+                            kind: "Return".into(),
+                            ..Default::default()
+                        }],
+                        succs: vec![],
+                        preds: vec![],
+                    }],
+                    ..Default::default()
+                },
+                gvir::Function {
+                    id: "t.Caller".into(),
+                    params: vec![param(1, 2)],
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![
+                            call,
+                            gvir::Instruction {
+                                kind: "Return".into(),
+                                ..Default::default()
+                            },
+                        ],
+                        succs: vec![],
+                        preds: vec![],
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let p = goverify_ir::Program::from_packages(vec![package]);
+        let mk = p.lookup_func("t.Mk").unwrap();
+        let caller = p.lookup_func("t.Caller").unwrap();
+
+        let p0 = Term::var("p0", ptr_sort());
+        let r0 = Term::var("r0", ptr_sort());
+        let clause_term = Term::or(vec![
+            ptr_is_nil(p0).unwrap(),
+            Term::not(ptr_is_nil(r0).unwrap()).unwrap(),
+        ])
+        .unwrap();
+        let mk_summary = crate::summary::Summary {
+            ensures: vec![crate::summary::Clause {
+                tag: "nil-deref".into(),
+                formula: crate::summary::Formula { term: clause_term },
+            }],
+            ..crate::summary::Summary::default()
+        };
+        let summary_of = move |f: goverify_ir::FuncId| {
+            if f == mk {
+                mk_summary.clone()
+            } else {
+                crate::summary::Summary::default()
+            }
+        };
+
+        let mut solver = goverify_solver::Z3Native::new(goverify_solver::SolverLimits {
+            timeout_ms: 5_000,
+            mem_mb: 1024,
+        });
+        let mut discharge = |q: &goverify_solver::Query| {
+            goverify_solver::discharge_query(q, &mut solver, None, None).result
+        };
+
+        let with = encode_func_with(&p, caller, &summary_of).unwrap();
+        let param = with.value(goverify_ir::ValueId(1)).unwrap().clone();
+        let dst = with.value(goverify_ir::ValueId(2)).unwrap().clone();
+        let q = with.reach_query(
+            0,
+            vec![
+                Term::not(ptr_is_nil(param).unwrap()).unwrap(),
+                ptr_is_nil(dst).unwrap(),
+            ],
+        );
+        assert_eq!(
+            discharge(&q),
+            goverify_solver::SatResult::Unsat,
+            "p<i>-bearing ensures must bind p0 to the call ARGUMENT and r0 to the dst"
+        );
+    }
+
     /// Same fixture as `call_ensures_constrain_single_result`, but the
     /// callee summary carries `Provenance::Havoc` ensures: the encoder
     /// must never consult a havoc'd summary for facts, so the assertion

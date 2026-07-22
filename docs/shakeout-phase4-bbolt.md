@@ -1417,32 +1417,46 @@ $ diff baseline.sigs shakeout-warm1.sigs
 < tx.go:558:11: nil-deref:
 ```
 
-Zero arrivals; 4 departures, all traced to task 4A (the wave's one
-production-code diff) — none unattributed:
+Zero arrivals; 4 departures. 3 are traced directly to task 4A (the wave's
+one production-code diff); the 4th is traced to the task-3-documented
+timing-flaky query family (pre-existing, not newly caused by 4A) with its
+FP-ness independently confirmed — none unattributed:
 
 | signature | mechanism | attribution |
 |---|---|---|
 | `internal/surgeon/surgeon.go:78:20` overflow | the C221 manifest site itself — see gate 2 | **4A**, direct (the fixed `Op::Convert` arm) |
 | `internal/common/page.go:110:41` overflow (`BranchPageElement`) | `BranchPageElement(index uint16)` calls `UnsafeIndex(..., int(index))` — the `uint16→int` widening convert now bounds `n` in `UnsafeIndex`'s `uintptr(n)*elemsz` overflow requirement to ≤ 65535, discharging it at this call site | **4A**, direct (widening convert at the call argument, same family as the corpus `BranchElemOffset`/C101 collateral case) |
 | `internal/common/page.go:94:39` overflow (`LeafPageElement`) | identical shape, `LeafPageElement(index uint16)` → `UnsafeIndex(..., int(index))` | **4A**, direct (same as above) |
-| `tx.go:558:11` nil-deref (`(*Tx).writeMeta`, `tx.db.Logger()`) | `writeMeta`'s own body has no widening convert; its one and only caller, `(*Tx).Commit` (`tx.go:267`), is dominated by an early `if tx.db == nil { return berrors.ErrTxClosed }` guard (`tx.go:185`) — a genuine, pre-existing invariant. `writeMeta`'s own inferred `tx.db != nil` requirement now discharges (`infer_requires`'s `discharge()` succeeds where it previously likely hit `Unknown`) and is satisfied at its sole call site, so no violation surfaces anywhere | **4A**, indirect (requires-lifting through `Commit`'s dominating guard; see verification below) |
+| `tx.go:558:11` nil-deref (`(*Tx).writeMeta`, `tx.db.Logger()`) | `writeMeta`'s own body has **no** widening convert — its two `int64(...)` conversions (`p.Id()`'s `Pgid`(uint64,64)→int64(64) and `tx.db.pageSize`'s `int`(64)→int64(64)) are both same-width and fall through 4A's `wd <= ws` early-return, so 4A's range constraints demonstrably never reach this query | member of task-3's documented **timing-flaky `NilChecker` query family**, stably absent at HEAD (4 runs + the 50x-timeout check below); FP-ness independently verified via the dominating guard (`tx.go:267` caller `Commit`, `tx.go:185` guard `if tx.db == nil { return berrors.ErrTxClosed }` — pre-existing in the baseline too, so it explains the finding's FP-ness but not *why* it departed); **causal tie to 4A unproven** |
 
-**Verification that the `tx.go:558:11` departure is not a timeout
-artifact:** re-ran `goverify check ./...` over the bbolt checkout with
+**Verification for the `tx.go:558:11` row — what is and isn't
+established:** re-ran `goverify check ./...` over the bbolt checkout with
 `--solver-timeout-ms 5000 --obligation-timeout-ms 5000` (50x the default
-requires-inference budget) against a description of the same commit; the
+requires-inference budget), all at the current (post-4A) HEAD; the
 signature stayed absent (457 findings total, identical count to the
 default-timeout runs), and so did the C221 pair. Combined with the 3
-default-timeout runs (1 cold + 2 warm, all agreeing), this is 4
-independent measurements across a 50x timeout range all agreeing on
-absence — much stronger evidence of a genuine discharge than a single
-run, and the structural explanation (`Commit`'s own dominating
-`tx.db == nil` guard) is a sound, pre-existing bbolt invariant, not an
-artifact of query resource pressure. No other bbolt caller of `writeMeta`
+default-timeout runs at HEAD (1 cold + 2 warm, all agreeing), this is 4
+independent measurements — all at post-4A HEAD — agreeing the signature is
+**stably absent now**. This, plus the dominating `Commit`/`tx.db == nil`
+guard (pre-existing, present in the baseline too), together establish that
+the finding is a genuine FP wherever it is or isn't reported. What this
+evidence does **not** establish is causation: the pre-4A baseline capture
+was never re-run under the same probing (cold + warm + 50x-timeout) to
+confirm the finding was *stably present* there rather than itself an
+artifact of the same near-timeout `Sat`/`Unknown` sensitivity task 3
+documented for `BoundsChecker`/`NilChecker` queries generally. Since
+`writeMeta`'s own encoding contains no widening convert (checked above),
+4A's mechanism cannot be the direct cause; the most defensible reading is
+that this signature belongs to the same pre-existing timing-flaky query
+family task 3 already flagged as a general hazard, and this run happened
+to land on the (correct) absent side. No other bbolt caller of `writeMeta`
 exists (`grep -rn "writeMeta()"` returns exactly one call site, inside
 `Commit`).
 
-No unattributed deltas. **Gate 3 satisfied.**
+No unattributed deltas — 3 rows attributed to 4A directly, 1 row
+attributed to the pre-existing task-3 timing-flakiness family (stably
+absent at HEAD, FP-ness independently confirmed, causal tie to 4A
+unproven). **Gate 3 satisfied.**
 
 ### Gate 4 — determinism across 3 shakeout runs: PASSES
 
@@ -1456,7 +1470,17 @@ signature sets, 457/457/457. Per task 3's investigation, this wave's own
 C221 mechanism is timing-sensitive in principle, so this determinism
 result is corroborating evidence rather than a foregone conclusion: the
 cold run is a genuinely independent computation (fresh cache), and it
-agrees with both warm runs. **Gate 4 satisfied.**
+agrees with both warm runs.
+
+**Witness caveat** (per the prior addendum's own wording, above): solver
+counterexample witnesses (`with:` lines, and occasional `path:` detail)
+are known cosmetic nondeterminism, outside the `(file:line:col, tag)`
+signature every gate check and the bucketer's own class-key are keyed on —
+this is exactly why the determinism check above `cmp`s the extracted
+signature files (`cut -d' ' -f1-2`, sorted) rather than the raw report
+text; a raw-text `cmp` would not have been meaningful.
+
+**Gate 4 satisfied.**
 
 ### Gate 5 — corpus/test/shakeout timing (report-only)
 
@@ -1474,7 +1498,13 @@ agrees with both warm runs. **Gate 4 satisfied.**
   owner as a candidate for investigation (shared/incremental test-binary
   linking, or a faster linker) but **not** treated as a regression: the verify
   step immediately after (`mise run corpus`, next bullet) ran in line with
-  historical norms once binaries were warm.
+  historical norms once binaries were warm. **Note this attribution is
+  inferred, not directly measured**: no per-binary link timing was
+  captured; the inference rests on (a) the per-test `finished in Xs` lines
+  summing to ~21s against a ~1257s total, and (b) `corpus` landing back at
+  the historical ~26s baseline immediately afterward with binaries already
+  warm. A future run wanting a confirmed root cause should capture
+  `-Z timings` or per-binary wall clocks directly.
 - `mise run corpus`: **26.675s** total — in line with the prior wave's
   23-26s baseline; unchanged.
 - shakeout wall-clock: cold **≈181s** (`3:01.46`) vs the prior wave's own
@@ -1512,13 +1542,19 @@ agrees with both warm runs. **Gate 4 satisfied.**
    rather than merely fast) but adds no general timeout-tier separation or
    retry-with-more-time safety net. Worth a scope check for other
    borderline sites in a future wave.
-3. **`tx.go:558:11` requires-lifting discharge** (gate 3): a genuine,
-   sound false-positive elimination (verified non-flaky at 4 independent
-   timeout configurations, structurally explained by `Commit`'s dominating
-   `tx.db == nil` guard) that arrived as a side effect of 4A rather than
-   from any change targeting `NilChecker` or this call path directly. No
-   action needed, but recorded so a future investigator doesn't mistake it
-   for an unexplained regression.
+3. **`tx.go:558:11`, a task-3 timing-flaky-family member, stably absent at
+   HEAD** (gate 3): a genuine false positive (structurally explained by
+   `Commit`'s dominating `tx.db == nil` guard, which is pre-existing and
+   present in the baseline too) that is stably absent across 4 runs at
+   HEAD (cold + 2 warm + a 50x-timeout check) but whose departure is
+   **not** traced to 4A — `writeMeta`'s own encoding has no widening
+   convert, so 4A's mechanism cannot directly reach this query. The
+   pre-4A baseline was never re-probed under the same cold/warm/timeout
+   regimen, so whether this signature was ever *stably* present before
+   4A (vs. itself a timing artifact at capture time) is unconfirmed.
+   Recorded as an open item rather than an attributed fix; a future
+   investigator wanting to close this should re-run the same 4-probe
+   regimen against the pre-4A commit (`53aa262`'s parent or earlier).
 4. **`BranchElemOffset`/C101 corpus discharge** (collateral, not a bbolt
    shakeout item): task 4A's own report notes one `testdata/corpus/knownfp`
    case (`BranchElemOffset`/C101) was discharged and FIXED-headered as a
@@ -1536,10 +1572,15 @@ agrees with both warm runs. **Gate 4 satisfied.**
    crate.
 6. **Acceptance recommendation**: both headline items (C009c, C221) are
    resolved exactly per their investigations' decisions — G1 and G2 pass
-   under the spec's own conditional wording, G3 finds zero unattributed
-   deltas across the full baseline diff (all 4 departures trace to task
-   4A, the wave's sole production-code change), and G4 confirms
-   determinism (cold + 2 warm runs byte-identical). Recommend **accept**,
-   with items 1-2 (both already-declared non-goals/hazards, not new) and
-   item 5 (linking-time, environmental) tracked as open items rather than
-   blockers.
+   under the spec's own conditional wording, G3 finds zero *unattributed*
+   deltas across the full baseline diff (3 of 4 departures trace directly
+   to task 4A, the wave's sole production-code change; the 4th,
+   `tx.go:558:11`, is attributed to the pre-existing task-3
+   timing-flakiness family — stably absent at HEAD and independently
+   confirmed FP, but without a proven causal tie to 4A), and G4 confirms
+   determinism (cold + 2 warm runs byte-identical, modulo the known
+   cosmetic witness nondeterminism). Recommend **accept**, with items 1-2
+   (already-declared non-goals/hazards, not new), item 3 (the
+   `tx.go:558:11` open attribution question), and item 5 (linking-time,
+   environmental, inferred not directly measured) tracked as open items
+   rather than blockers.

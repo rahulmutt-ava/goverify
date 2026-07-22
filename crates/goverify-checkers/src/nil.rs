@@ -279,17 +279,19 @@ impl Checker for NilChecker {
             crate::shared::checked_deref_assumptions(&sites, &enc, &idom, bi, ii)
         };
 
-        // Local manifest sites: subject term ground (const nil reached
-        // through modeled ops) or params-only (then preconditions decide).
+        // Local manifest sites: the subject is CANONICALIZED through
+        // same-function Assign/ChangeType chains first (`canonical_value`,
+        // depth-capped), then classified: ground (const nil reached
+        // through modeled ops) or params-only (preconditions decide).
         // A `Const` value's own encoded term is never free-vars-empty —
-        // `encode_func` ties it down with a separate `v<id> = <lit>`
+        // `encode_func_with` ties it down with a separate `v<id> = <lit>`
         // assert rather than inlining the literal (`declare_value`) — so
-        // groundness is read off the IR's own `ValueKind`, not the term.
-        // Matched narrowly to `ConstVal::Nil` (not any `Const(_)`): a
-        // pointer-typed value tagged `Const` with a mismatched constant
-        // (malformed/fuzzed .gvir) gets no defining assert from
-        // `declare_value`, so treating it as ground would manufacture a
-        // finding off a genuinely free variable.
+        // groundness is read off the canonical value's `ValueKind`, not
+        // the term. Matched narrowly to `ConstVal::Nil` (not any
+        // `Const(_)`): a pointer-typed value tagged `Const` with a
+        // mismatched constant (malformed/fuzzed .gvir) gets no defining
+        // assert from `declare_value`, so treating it as ground would
+        // manufacture a finding off a genuinely free variable.
         for (bi, ii, subject, pos) in &sites {
             let canon = crate::shared::canonical_value(func, *subject);
             let Some(subj) = enc.value(canon).cloned() else {

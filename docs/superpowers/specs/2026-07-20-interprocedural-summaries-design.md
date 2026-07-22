@@ -226,8 +226,8 @@ and this canonicalization share the same resolver; it is written once.
 ## 6. Determinism, soundness, degradation, performance
 
 - **Determinism.** Ensures are a pure function of deterministic
-  encodings and callee summaries; clause order is template-order ×
-  result-index (no map iteration); the encoder asserts clauses in
+  encodings and callee summaries; clause order is result-index ×
+  template-order (no map iteration); the encoder asserts clauses in
   summary `Vec` order; the findings pass runs on finalized summaries
   only. The corpus determinism suite is the enforcement, as always.
 - **Soundness direction.** An asserted ensures is only ever a proven

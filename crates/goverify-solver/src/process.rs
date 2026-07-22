@@ -256,7 +256,12 @@ mod tests {
         let mut proc = SmtLib2Process::new(
             script.path().to_str().expect("utf8 temp path"),
             SolverLimits {
-                timeout_ms: 2_000,
+                // Generous headroom: the assertion is drain-vs-deadline
+                // CORRECTNESS (a drained `sat` must never downgrade to
+                // Unknown), not latency. 2 s flaked under CI load; a
+                // regression (undrained pipe → deadline hit) still fails
+                // fast enough at 30 s.
+                timeout_ms: 30_000,
                 mem_mb: 1024,
             },
         );

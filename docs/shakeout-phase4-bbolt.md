@@ -1926,7 +1926,8 @@ Corrections to statements made above (no verdict changes):
    `ensures_corpus` suite to the `corpus` mise task (item 3, landed
    first in this wave's task order specifically so later pins would run
    under it) — a new suite added to the task, not retry-tier overhead.
-   The retry tier is exercised via `RetryBackend`, which only the CLI's
-   `run_findings` construction site builds; engine/checker/corpus test
-   call sites construct plain backends directly (Task 6), so the corpus
-   task's suites do not exercise the retry tier at all.
+   The retry tier's contribution to corpus wall-clock is de-minimis:
+   both CLI entry points (`run_findings` and `run_check`) construct
+   `RetryBackend`, and the corpus task's `debug_integration` suite does
+   drive it, but its queries resolve at the base tier with no goldens
+   moved (Task 6, step 6), so no escalations occur there.

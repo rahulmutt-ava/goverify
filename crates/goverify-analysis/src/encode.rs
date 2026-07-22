@@ -41,11 +41,28 @@ pub fn seq_datatype() -> DatatypeDecl {
     }
 }
 
+/// Follows the `Named -> underlying` chain to the first non-Named
+/// TypeId. Cycle guard (wave-2 spec §3): a crafted `.gvir` can contain
+/// a Named cycle, and any chain longer than the type table necessarily
+/// revisits an id — cap the walk at the table size and return None on
+/// overrun. Callers already treat None as unresolvable (havoc/skip),
+/// so hostile input degrades exactly like any other unencodable type
+/// instead of overflowing the stack.
+pub(crate) fn resolve_named(types: &TypeTable, t: TypeId) -> Option<TypeId> {
+    let mut cur = t;
+    for _ in 0..=types.len() {
+        match types.kind(cur) {
+            TypeKind::Named { underlying, .. } => cur = *underlying,
+            _ => return Some(cur),
+        }
+    }
+    None
+}
+
 /// (width, signed) for integer basic types; None for anything else
 /// (floats/complex are NOT ints — phase-3 final-review I1).
 pub fn int_repr(types: &TypeTable, t: TypeId) -> Option<(u32, bool)> {
-    match types.kind(t) {
-        TypeKind::Named { underlying, .. } => int_repr(types, *underlying),
+    match types.kind(resolve_named(types, t)?) {
         TypeKind::Basic { name } => match name.as_str() {
             "int" | "int64" => Some((64, true)),
             "int32" | "rune" => Some((32, true)),
@@ -63,8 +80,7 @@ pub fn int_repr(types: &TypeTable, t: TypeId) -> Option<(u32, bool)> {
 
 /// Basic-type name after peeling Named wrappers; None for non-basic.
 fn basic_name(types: &TypeTable, t: TypeId) -> Option<&str> {
-    match types.kind(t) {
-        TypeKind::Named { underlying, .. } => basic_name(types, *underlying),
+    match types.kind(resolve_named(types, t)?) {
         TypeKind::Basic { name } => Some(name),
         _ => None,
     }
@@ -82,8 +98,7 @@ fn basic_name(types: &TypeTable, t: TypeId) -> Option<&str> {
 /// — `None` for anything else (a genuine Seq value's length lives in
 /// its own `seq-len`/`seq-cap` term instead).
 pub fn array_len(types: &TypeTable, ty: TypeId) -> Option<u64> {
-    match types.kind(ty) {
-        TypeKind::Named { underlying, .. } => array_len(types, *underlying),
+    match types.kind(resolve_named(types, ty)?) {
         TypeKind::Array { len, .. } => Some(*len),
         TypeKind::Pointer { elem } => array_len_direct(types, *elem),
         _ => None,
@@ -95,8 +110,7 @@ pub fn array_len(types: &TypeTable, ty: TypeId) -> Option<u64> {
 /// pointer (`**[N]T` doesn't back an addressable `[N]T` the way `*[N]T`
 /// does).
 fn array_len_direct(types: &TypeTable, ty: TypeId) -> Option<u64> {
-    match types.kind(ty) {
-        TypeKind::Named { underlying, .. } => array_len_direct(types, *underlying),
+    match types.kind(resolve_named(types, ty)?) {
         TypeKind::Array { len, .. } => Some(*len),
         _ => None,
     }
@@ -106,11 +120,11 @@ fn array_len_direct(types: &TypeTable, ty: TypeId) -> Option<u64> {
 /// (no term). `int`/`uint`/`uintptr` are 64-bit (64-bit targets only in
 /// v1 — documented degrade).
 pub fn sort_of(types: &TypeTable, t: TypeId) -> Option<Sort> {
+    let t = resolve_named(types, t)?;
     if let Some((w, _)) = int_repr(types, t) {
         return Some(Sort::BitVec(w));
     }
     match types.kind(t) {
-        TypeKind::Named { underlying, .. } => sort_of(types, *underlying),
         TypeKind::Basic { name } if name == "bool" => Some(Sort::Bool),
         TypeKind::Basic { name } if name == "string" => Some(seq_datatype().sort()),
         TypeKind::Pointer { .. } => Some(ptr_sort()),
@@ -1471,6 +1485,57 @@ mod tests {
             None,
             "I1 lesson: floats are not ints"
         );
+    }
+
+    /// Crafted `.gvir` Named cycles (self-loop and a 2-cycle) must
+    /// degrade to unresolvable (None) in every type resolver, never
+    /// recurse to a stack overflow (wave-2 spec §3; parsers of bytes
+    /// the analyzer didn't write reject, never panic). RED for this
+    /// test is by construction (pre-fix code has no recursion exit on
+    /// these inputs) — running it pre-fix aborts the harness.
+    #[test]
+    fn named_cycle_degrades_to_unresolvable() {
+        use goverify_extract::gvir;
+        let package = gvir::Package {
+            import_path: "t".into(),
+            types: vec![
+                // Self-cycle: underlying (`elem`) = own id.
+                gvir::Type {
+                    id: 1,
+                    repr: "t.Self".into(),
+                    kind: gvir::TypeKind::Named as i32,
+                    name: "t.Self".into(),
+                    elem: 1,
+                    ..Default::default()
+                },
+                // 2-cycle: A -> B -> A.
+                gvir::Type {
+                    id: 2,
+                    repr: "t.A".into(),
+                    kind: gvir::TypeKind::Named as i32,
+                    name: "t.A".into(),
+                    elem: 3,
+                    ..Default::default()
+                },
+                gvir::Type {
+                    id: 3,
+                    repr: "t.B".into(),
+                    kind: gvir::TypeKind::Named as i32,
+                    name: "t.B".into(),
+                    elem: 2,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let p = Program::from_packages(vec![package]);
+        let ty = p.types();
+        for name in ["t.Self", "t.A", "t.B"] {
+            let id = lookup(&p, name);
+            assert_eq!(int_repr(ty, id), None, "int_repr({name})");
+            assert_eq!(array_len(ty, id), None, "array_len({name})");
+            assert_eq!(sort_of(ty, id), None, "sort_of({name})");
+        }
     }
 
     #[test]

@@ -75,6 +75,17 @@ impl TypeTable {
         self.reprs.get(id.0 as usize).map_or("<unknown>", |s| s)
     }
 
+    /// Number of interned types. `resolve_named`'s cycle cap (encode.rs)
+    /// needs the table size: any Named chain longer than the table
+    /// necessarily revisits an id.
+    pub fn len(&self) -> usize {
+        self.kinds.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
+    }
+
     /// The shared Unknown type (index 0 is reserved for it).
     pub fn unknown(&mut self) -> TypeId {
         self.intern("<unknown>")

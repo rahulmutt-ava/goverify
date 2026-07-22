@@ -583,8 +583,10 @@ func ClearPage8Elements(start int, fail bool) uint16 {
 // above), and this unbounded-arg call site fires an overflow arrival
 // HERE — the suite's set-equality trips. The manifest line itself can
 // never report while Infer succeeds (lifting masks it); its only
-// arrival channel is the near-timeout requires-drop flake (the real
-// C221 mechanism, mitigated by the wave-2 retry tier).
+// known arrival channel is the near-timeout requires-drop hazard —
+// the prior wave's best-supported (inferred, never deterministically
+// reproduced) explanation for the historical C221 FP — which the
+// wave-2 retry tier targets.
 func CallClearPage8(fail bool) uint16 {
 	return ClearPage8Elements(unboundedN, fail)
 }

@@ -65,3 +65,33 @@ func GoodNarrow() int8 {
 	x := 100
 	return int8(x)
 }
+
+// count is an opaque uint16 source: its call result is havoc, but its
+// SORT is BitVec(16), so ≤65535 is intrinsic — the widening int()
+// conversion is what severs the bound today (C221 exemplar,
+// surgeon.go:78:20 / ClearPageElements).
+func count() uint16 { return 42 }
+
+func ClearElems(start int) uint16 {
+	n := int(count())
+	if start < 0 || start >= n {
+		return 0
+	}
+	return uint16(start)
+}
+
+// clearOpts mirrors bbolt's surgeryClearPageElementsOptions: the real
+// command_surgery.go:268 call site passes cfg.startElementIdx, a STRUCT
+// FIELD (CLI-flag-populated), not a bare forwarded parameter — params_only
+// fails on the field-access value at this call site, so requires-clause
+// propagation stops here (a genuine call-site obligation) instead of
+// lifting the precondition further up an unguarded parameter-forwarding
+// chain, where it would just self-mask and never actually discharge.
+type clearOpts struct{ start int }
+
+// One unbounded and one bounded caller: under the requires-form
+// fallback (task 4B) only the unbounded one may fire; under the
+// convert-model discharge (task 4A) both stay silent.
+func ClearElemsUnbounded(o clearOpts) uint16 { return ClearElems(o.start) }
+
+func ClearElemsBounded() uint16 { return ClearElems(3) }

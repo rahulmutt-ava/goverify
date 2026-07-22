@@ -1584,3 +1584,269 @@ text; a raw-text `cmp` would not have been meaningful.
    `tx.go:558:11` open attribution question), and item 5 (linking-time,
    environmental, inferred not directly measured) tracked as open items
    rather than blockers.
+
+## Follow-ups wave 2 addendum (2026-07-23)
+
+Re-run of the phase-4 shakeout against follow-ups wave 2 (Tasks 1-6,
+`followups/wave2` @ `e8d3985`, base `c138c3b`), evaluated against the
+wave's own step-0 baseline (`.goverify/shakeout/baseline-457.txt`,
+captured at Task 1). The wave's one behavioural headline is the
+**retry-on-Unknown escalation tier** (Task 6, `e8d3985`); its other
+production-code change is the **cycle-guarded `resolve_named`** (Task 4,
+`b0ab086`). Tasks 1/2/3/5 are corpus/test-only regression pins plus a
+comment hedge. This section records the spec §7 gate verdicts (G1-G5)
+with evidence, and folds in the closed-out Task 7 causal verdict and the
+Task 8 measured build-time verdict.
+
+### Run parameters
+
+- goverify branch: `followups/wave2` @ `e8d3985` (Tasks 1-6 committed:
+  `dfc4b33` → `86f96e3` → `9a8d40e` → `b0ab086` → `580e1aa` → `4d9d852`
+  → `e8d3985`). Only **two** commits change production code that
+  shakeout can exercise: Task 6's retry tier (`e8d3985`,
+  `crates/goverify-solver` discharge path + CLI construction, per-tier
+  cached) and Task 4's cycle guard (`b0ab086`, `encode.rs`
+  `resolve_named`). The cycle guard fires only on crafted `Named`-type
+  cycles; no bbolt source contains such a shape, so it is expected to
+  contribute **zero** shakeout delta (confirmed in G3). Tasks 1/2/3/5
+  touch only `testdata/corpus/` / the mise `corpus` task / a solver
+  comment — no shakeout effect by construction.
+- bbolt ref: v1.4.0 (unchanged from the prior two addenda).
+- timeouts: base tier infer 100 ms / obligation 250 ms (defaults);
+  Task 6's retry tier re-issues base-tier `Unknown` queries at the
+  `RETRY_FACTOR` (10×) timeout (1000 ms / 2500 ms) before giving up.
+- command: `mise run shakeout` (`scripts/shakeout.sh` → `goverify check
+  ./...`), cache dir `.goverify/shakeout/cache`.
+- **Baseline correction (457 → 458).** The baseline file is named
+  `baseline-457.txt` for plan path-stability, but it actually holds
+  **458** finding-header lines (`grep -cE
+  '^[a-zA-Z0-9_./-]+\.go:[0-9]+:[0-9]+:'` = 458; the raw file is ~2700
+  lines because shakeout output is verbose multi-line — `wc -l` is not
+  the finding count). The prior wave's "457" was an undercount produced
+  by a run in which the timing-flaky `tx.go:558:11` FP happened to be
+  absent; Task 1's signature-diff verified the true baseline as prior
+  `baseline-461` minus exactly the three known 4A discharges
+  (`page.go:110:41`, `page.go:94:39`, `surgeon.go:78:20`), zero arrivals,
+  with `tx.go:558:11` **present**. All G1/G3 diffs below are against this
+  **458-finding** set.
+- findings this wave: **457** (byte-identical across all 3 runs). Net
+  **−1** vs the 458-baseline — the single departure attributed in G3.
+- **Environment / EDR caveat (applies to every wall-clock below).** All
+  measurements were taken 2026-07-23, after a SentinelOne (EDR)
+  exec-verdict stall incident that was active earlier the same evening
+  and recovered ~00:30 (documented in Tasks 7 and 8). By the time these
+  gates ran the machine was healthy: the freshly-built release binary's
+  first exec measured **0.26 s** (a re-wedge would have been minutes),
+  and no step hung. The EDR stall mechanism affects only the *exec* of
+  new/uncached binaries; in-process solver timing is unaffected in
+  principle. Wall-clocks are therefore reported as clean but carry this
+  caveat. The same incident also offers a **plausible (not proven)**
+  retroactive explanation for the prior addendum's historical 20m56s
+  `mise run test` anomaly (see G5 / Task 8).
+
+### Gate 1 — C009c (`compact.go:26:23`) still present per its re-attribution: PASSES
+
+The prior wave re-attributed `compact.go:26:23` from the
+postcondition-lifting family to the closure/cobra capture-lifting
+non-goal family and pinned it with a `KNOWN-FP(closure-capture)` corpus
+tripwire; nothing in wave 2 targets that family. It remains present, as
+required:
+
+```
+$ grep -n 'compact.go:26:23' .goverify/shakeout/wave2-cold.txt
+2177:compact.go:26:23: nil-deref: call to (*go.etcd.io/bbolt.Tx).Commit
+     violates its nil-deref requirement [go.etcd.io/bbolt.Compact$2]
+```
+
+Present and byte-identical across all 3 runs. **Gate 1 satisfied** — the
+signature is stable at its re-attributed disposition; no regression.
+
+### Gate 2 — C221 pair (`surgeon.go:78:20`, `command_surgery.go:268:55`) both absent: PASSES
+
+Both forms of the C221 overflow signature — the manifest-position finding
+and its caller-position sibling — stay discharged (the prior wave's 4A
+fix, now guarded on the manifest side by Task 5's green pin + caller
+tripwire):
+
+```
+$ grep -c 'surgeon.go:78:20'          .goverify/shakeout/wave2-cold.txt   # 0
+$ grep -c 'command_surgery.go:268:55' .goverify/shakeout/wave2-cold.txt   # 0
+```
+
+Both absent across all 3 runs. **Gate 2 satisfied** (spec's "signature
+gone" disjunct, both forms).
+
+### Gate 3 — full diff vs the 458-baseline, every delta attributed: PASSES
+
+```
+$ comm -23 base.sigs cold.sigs   # departures (in baseline, not in cold)
+tx.go:558:11: nil-deref: nil dereference in (*go.etcd.io/bbolt.Tx).writeMeta
+              [(*go.etcd.io/bbolt.Tx).writeMeta]
+$ comm -13 base.sigs cold.sigs   # arrivals (in cold, not in baseline)
+(none)
+```
+
+Exactly **one departure, zero arrivals** (458 − 1 = 457). Attribution:
+
+| signature | mechanism | attribution |
+|---|---|---|
+| `tx.go:558:11` nil-deref (`(*Tx).writeMeta`) | a near-timeout base-tier query in the `writeMeta` region that returned `Unknown` at the 100/250 ms base tier and, when re-issued by **Task 6's retry tier** at 1000/2500 ms, resolved definitively — discharging the FP. It was one of the escalated queries (254 escalated this cold run). | **retry tier (Task 6)** recovering a near-timeout query; the underlying instability is the pre-existing timing-flaky family, **not** caused by 4A (see Task 7 verdict below) |
+
+The **cycle guard (Task 4)** and **all corpus/test pins (Tasks 2, 3, 5)**
+contributed **zero** deltas, exactly as predicted — the only movement in
+the entire 458→457 diff is the one retry-attributed discharge. No
+unattributed delta. **Gate 3 satisfied.**
+
+**Task 7 closes the `tx.go:558:11` causal question.** The prior addendum
+left this signature's attribution open ("member of a timing-flaky family;
+causal tie to 4A unproven"). Task 7's wave-2 re-probe **answers it**:
+verdict **`timing-flaky-pre-4A`**. Three cold-cache runs of the *pre-4A*
+commit itself (worktree @ `e20aff7`, no retry tier) showed
+`tx.go:558:11` ABSENT / PRESENT / PRESENT — it flickers (2/3, not stable
+3/3) on a commit that predates 4A, which rules 4A out as the cause
+outright: a change cannot be responsible for an instability that already
+existed before it landed. The prior addendum's "causal tie to 4A
+unproven" family label is therefore **confirmed as: never tied to 4A**.
+Task 7 further observed that the pre-4A flicker spans at least **three
+independent finding families** (the `writeMeta` cluster dropping as a
+block; the `(*Tx).Commit`-requires obligation flipping between call-site
+and in-function manifestation positions; and the C221 manifest↔caller
+position flip) — direct empirical confirmation of the near-timeout Infer
+instability that two prior waves only inferred indirectly. At HEAD, the
+retry tier collapses all of this to the single deterministic
+`tx.go:558:11` discharge observed here; the other four findings in the
+same `writeMeta` cluster (`tx.go:561:15` ×2, `564:48`, `565:70`) remain
+present — only the one near-timeout site was recovered, not the whole
+cluster.
+
+### Gate 4 — determinism across 3 shakeout runs: PASSES
+
+```
+$ cmp wave2-cold.txt  wave2-warm1.txt   # silent (byte-identical)
+$ cmp wave2-warm1.txt wave2-warm2.txt   # silent (byte-identical)
+```
+
+All three runs (1 cold — cache wiped with `rm -rf
+.goverify/shakeout/cache` — + 2 warm) produced **byte-identical** output,
+457/457/457 findings; a signature-level `comm` (sorted finding-header
+lines) is likewise identical across all three.
+
+**Honesty caveat (carried from the prior addenda).** Only the **cold**
+run is a genuinely independent computation (fresh cache). The two warm
+runs **replay the cache** — they are cache-reuse evidence that the cached
+verdicts are stable, **not** independent reproductions of the solve. So
+HEAD-side stability of the `tx.go:558:11` discharge rests on one
+independent cold solve plus two cache replays, all agreeing — the
+strongest signal available in a single session, but not a repeated-cold
+stability proof. Wall-clock timeouts bound determinism statistically, not
+absolutely; the pre-existing near-timeout family (Task 7) is the known
+residual hazard, and the retry tier narrows but does not formally
+eliminate it.
+
+**Escalation-count variance is expected and does not break determinism.**
+The `goverify: solver: N queries escalated to the retry tier` line read
+**254** (cold), **251** (warm1), **251** (warm2). The escalation *count*
+is timing-sensitive — it counts base-tier queries that crossed the
+near-timeout boundary into `Unknown` — so a ~3-query run-to-run wobble is
+the timing noise made visible. What matters is that the **findings** are
+byte-identical regardless: the retry tier converges to the same verdict
+for a query whether or not that query needed escalation on a given run.
+Escalation count non-deterministic, findings deterministic — the
+intended behaviour. **Gate 4 satisfied.**
+
+### Gate 5 — corpus/test/shakeout timing (report-only)
+
+All figures 2026-07-23 on the recovered (healthy) machine; carry the EDR
+caveat above.
+
+- `mise run corpus`: **31.20 s** (exit 0, 10 suites green, 0 failures) —
+  in line with the prior wave's ~26 s baseline.
+- `mise run test` (`cargo test --workspace --all-features`, includes the
+  corpus determinism suites): **42.15 s** (exit 0, 32 test binaries
+  green, 0 failures). This is the headline G5 corroboration of Task 8:
+  the prior addendum's **20m56s** `test` anomaly **did not recur** — a
+  full workspace test run on a healthy machine is ~42 s, three orders of
+  magnitude below the historical figure.
+- shakeout wall-clock: cold (cache wiped) **206.74 s**; warm **26.14 s**
+  and **25.87 s**. (Task 7's degraded-window HEAD cold run measured
+  348.16 s at 397 escalations; this healthy-machine cold run is 206.74 s
+  at 254 escalations — the lower escalation count and faster wall-clock
+  are both consistent with fewer queries hitting the near-timeout
+  boundary on an unloaded machine. Neither figure is a clean
+  retry-overhead measurement in isolation; both carry the machine-state
+  caveat.)
+- escalation counts per run: **254 / 251 / 251** (cold / warm1 / warm2).
+- Blocking tier all green: `lint` exit 0 (`cargo fmt --check`, `clippy
+  -D warnings`, `buf lint`, `gofmt`+`go vet`); `test` exit 0 (42.15 s,
+  above); `secrets` (gitleaks) exit 0 — 186 commits scanned, no leaks;
+  `audit` (cargo audit) exit 0 — 99 crate dependencies scanned, clean.
+
+**Task 8 measured build-time verdict (folded in): `refuted`.** Task 8
+measured the historical 20m56s (1256 s) `mise run test` anomaly directly:
+a full `cargo clean` + cold `cargo test --no-run --all-features` build
+took **111.53 s**, of which the `z3-sys` build-script (CMake compile of
+the vendored Z3 4.16.0 C++ library) was **102.3 s (92%)** — a
+**one-time** cost that runs once per clean build, **not** a per-test-binary
+linker step; every individual test-binary unit was 2-3 s. A warm re-link
+(touch a leaf lib.rs, relink the whole downstream chain + all ~19 test
+binaries) took **4.75 s**. The "linker-bound (z3-sys static link per
+test binary)" theory is therefore **refuted**: no per-test-binary cost
+scales anywhere near the anomaly, the worst single unit is ~12× short of
+1256 s, and this wave's own 42.15 s `test` run confirms the steady-state
+cost. The historical 20m56s figure is re-attributed to **transient
+machine/environment conditions** — most plausibly the same EDR
+first-exec stall (40-60 min per newly-created executable) that this
+wave's Task 7 documented independently the prior night — recorded as a
+**follow-up queue item** (no config/profile tweak is supported by the
+measured numbers). Stop citing "linker-bound" as settled.
+
+### Finding-count headline
+
+**458 → 457** (net −1). The single departure is the retry tier (Task 6)
+discharging the `tx.go:558:11` near-timeout `writeMeta` FP; Task 7's
+`timing-flaky-pre-4A` verdict establishes that FP was a pre-existing
+near-timeout flake never tied to 4A. Zero arrivals, zero deltas from the
+cycle guard or any pin.
+
+### Gate summary
+
+| Gate | Verdict | Evidence |
+|---|---|---|
+| G1 | **PASS** | `compact.go:26:23` present (re-attributed C009c), stable ×3 |
+| G2 | **PASS** | `surgeon.go:78:20` + `command_surgery.go:268:55` both absent ×3 |
+| G3 | **PASS** | 458→457: 1 departure (`tx.go:558:11`, retry-recovered), 0 arrivals; cycle guard + all pins zero-delta |
+| G4 | **PASS** | 3 runs byte-identical (457/457/457); warm = cache-reuse evidence, not independent repro |
+| G5 | report-only | corpus 31.20 s, test 42.15 s, shakeout 206.74 / 26.14 / 25.87 s, escalations 254/251/251; blocking tier green; Task 8 anomaly refuted |
+
+### Known costs and open items (for the plan owner)
+
+1. **`tx.go:558:11` causal question — now closed** (was open item 3 in
+   the prior addendum): Task 7's `timing-flaky-pre-4A` verdict answers it.
+   The signature is a pre-existing near-timeout FP that flickered on the
+   pre-4A commit itself; it is not tied to 4A. The retry tier (Task 6)
+   now discharges it deterministically across this session's 3 runs (1
+   independent cold + 2 cache replays). Residual: the underlying
+   near-timeout family is narrowed, not formally eliminated — the retry
+   tier gives a definite verdict *when* the base tier hits `Unknown`, but
+   a future site whose retry-tier query also times out would re-flicker.
+   Kept as a general hazard note, not a blocker.
+2. **Escalation count is non-deterministic by design** (G4): 254/251/251
+   across the 3 runs. This is expected (it counts timing-sensitive
+   near-timeout `Unknown`s) and does not affect finding determinism.
+   Anyone reading the stderr line as a stability signal should key on the
+   findings, not the escalation count.
+3. **Test-build anomaly — refuted, re-attributed** (was open item 5 in
+   the prior addendum): the 20m56s figure is **not** linker/z3-bound
+   (Task 8: cold build 111.53 s, z3 CMake build-script 102.3 s one-time,
+   warm re-link 4.75 s; this wave's `test` 42.15 s). Re-attribute to
+   transient machine/EDR conditions; queue item, no fix. Stop citing
+   "linker-bound".
+4. **Acceptance recommendation**: all five gates pass under the spec's
+   wording — G1/G2 stable at their prior-wave dispositions, G3 finds
+   zero unattributed deltas (the sole departure is the retry tier
+   recovering a pre-existing timing-flaky FP, causal question now closed
+   by Task 7), G4 confirms byte-identical determinism (modulo the honest
+   cache-replay caveat on the warm runs and the non-deterministic
+   escalation counter), G5 timings all healthy with the Task 8 anomaly
+   refuted. Recommend **accept**; items 1-3 are closed/expected/queued,
+   none a blocker.

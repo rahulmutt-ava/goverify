@@ -1021,15 +1021,51 @@ fn op_def(p: &Program, func: &Function, block: usize, op: &Op, enc: &EncodedFunc
             }
             Term::not(ptr_is_nil(dt).ok()?).ok()
         }
-        // A pointer minted from uintptr arithmetic is never nil (fix-wave
-        // fix 3): unsafe.Pointer(uintptr(base)+off) idioms compute offsets
-        // from live bases, and producing exactly nil would need deliberate
-        // 64-bit wraparound — documented under-approximation (threat model,
-        // "deliberate under-approximations"). A plain pointer→unsafe.Pointer
-        // →pointer pun keeps its nilability: its provenance is a pointer,
-        // not uintptr.
+        // Convert: two independent sub-cases share this match arm — int
+        // widening (asserts a source-range bound on the dst) and the
+        // uintptr-provenance pointer case (asserts non-nil); see each
+        // sub-case's own comment below. Narrowing/same-width int converts
+        // and non-uintptr-derived pointer converts fall through to the
+        // catch-all havoc.
         Op::Convert { dst, src } => {
             let d = t(dst)?;
+            // int → int WIDENING: the dst holds the src's exact value,
+            // but the term language has no zext/sext node, so assert
+            // the sound projection — the src TYPE's value range at the
+            // dst width. (Sign-extension preserves signed order, so a
+            // signed source's range is signed-compared regardless of
+            // the dst's own signedness; an unsigned source zero-
+            // extends, so Ule against 2^ws−1 suffices.) Narrowing and
+            // same-width converts stay havoc: their range adds nothing
+            // beyond the dst sort's intrinsic width. `int_repr` only
+            // ever returns width in {8,16,32,64}, so `ws-1` and `wd`
+            // stay well under u128's 128-bit shift range regardless of
+            // crafted `.gvir` input — no shift-amount overflow possible.
+            if let (Some((ws, ss)), Some((wd, _))) = (
+                int_repr(p.types(), func.value(*src).ty),
+                int_repr(p.types(), func.value(*dst).ty),
+            ) {
+                if wd <= ws {
+                    return None;
+                }
+                return if ss {
+                    let max = (1u128 << (ws - 1)) - 1;
+                    let min = (1u128 << wd) - (1u128 << (ws - 1));
+                    let lo = Term::bv_cmp(BvCmpOp::Sle, Term::bv_lit(wd, min), d.clone()).ok()?;
+                    let hi = Term::bv_cmp(BvCmpOp::Sle, d, Term::bv_lit(wd, max)).ok()?;
+                    Term::and(vec![lo, hi]).ok()
+                } else {
+                    let max = (1u128 << ws) - 1;
+                    Term::bv_cmp(BvCmpOp::Ule, d, Term::bv_lit(wd, max)).ok()
+                };
+            }
+            // A pointer minted from uintptr arithmetic is never nil (fix-wave
+            // fix 3): unsafe.Pointer(uintptr(base)+off) idioms compute offsets
+            // from live bases, and producing exactly nil would need deliberate
+            // 64-bit wraparound — documented under-approximation (threat model,
+            // "deliberate under-approximations"). A plain pointer→unsafe.Pointer
+            // →pointer pun keeps its nilability: its provenance is a pointer,
+            // not uintptr. (Unchanged from the pre-4A arm.)
             if d.sort() != &ptr_sort()
                 || !uintptr_provenance(p, func, *src, 0, &mut BTreeSet::new())
             {
@@ -1050,7 +1086,7 @@ fn op_def(p: &Program, func: &Function, block: usize, op: &Op, enc: &EncodedFunc
             Term::not(ptr_is_nil(d).ok()?).ok()
         }
         _ => None, // Load/Store/Call/... havoc (declared, unconstrained); Convert havocs
-                   // except the uintptr-provenance arm above
+                   // except the uintptr-provenance and int-widening arms above
     }
 }
 
@@ -1966,6 +2002,63 @@ mod tests {
         assert!(
             !enc.asserts.contains(&unwanted),
             "crafted fan-out/self-loop cycle must degrade to no provenance, not hang (review fix)"
+        );
+    }
+
+    /// Standalone package (NOT `std_type_list`/`program_with`, which have
+    /// no `uint16` entry): id 1 = uint16, id 2 = int, both `TypeKind::Basic`.
+    /// `f(p0 uint16): v2 = Convert p0 -> int`, bare `Return`.
+    fn build_widening_convert_fixture() -> Program {
+        use goverify_extract::gvir;
+        let basic = |id: u32, name: &str| gvir::Type {
+            id,
+            repr: name.into(),
+            kind: gvir::TypeKind::Basic as i32,
+            name: name.into(),
+            ..Default::default()
+        };
+        let f = gvir::Function {
+            id: "t.F".into(),
+            params: vec![param(1, 1)], // uint16
+            blocks: vec![block_p(
+                0,
+                vec![convert_ins(2, 2, 1), ret(vec![2])],
+                vec![],
+                vec![],
+            )],
+            ..Default::default()
+        };
+        let package = gvir::Package {
+            import_path: "t".into(),
+            types: vec![basic(1, "uint16"), basic(2, "int")],
+            functions: vec![f],
+            ..Default::default()
+        };
+        Program::from_packages(vec![package])
+    }
+
+    #[test]
+    fn widening_convert_bounds_dst_by_source_range() {
+        // f(p0 uint16): v2 = Convert p0 -> int(64).
+        // The dst must be provably ≤ 65535: reach ∧ (v2 >u 65535) Unsat.
+        let p = build_widening_convert_fixture();
+        let f = p.lookup_func("t.F").unwrap();
+        let enc = encode_func(&p, f).unwrap();
+        let dst = enc.value(goverify_ir::ValueId(2)).unwrap().clone();
+        // No `BvCmpOp::Ugt` in the enum (Ult/Ule/Slt/Sle only) — express
+        // `dst >u 65535` as `65535 <u dst` (Ult with swapped operands).
+        let over = Term::bv_cmp(BvCmpOp::Ult, Term::bv_lit(64, 65_535), dst).unwrap();
+        let mut solver = goverify_solver::Z3Native::new(goverify_solver::SolverLimits {
+            timeout_ms: 5_000,
+            mem_mb: 1024,
+        });
+        let mut discharge = |q: &goverify_solver::Query| {
+            goverify_solver::discharge_query(q, &mut solver, None, None).result
+        };
+        assert_eq!(
+            discharge(&enc.reach_query(0, vec![over])),
+            goverify_solver::SatResult::Unsat,
+            "widening from uint16 must bound the dst by 65535"
         );
     }
 

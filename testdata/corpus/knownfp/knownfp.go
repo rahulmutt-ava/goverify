@@ -396,23 +396,31 @@ func First(names []string) string {
 	return tail(names)
 }
 
-// KNOWN-FP(phase-5): FP/requires-lifting — bound-derived obligation
-// kept local instead of lifted to the caller: `idx`'s parameter type is
-// `uint16`, so `int(idx)` is provably in [0, 65535] at every call site
-// by Go's conversion semantics alone, and the constant 16-byte element
-// size can never make the product overflow a uintptr on any real
-// platform — but the analyzer's generic summary for `elemOffset`
-// treats its `n int` parameter as an unconstrained int and never
-// propagates the caller-side uint16 domain fact through the `int(idx)`
-// conversion (exemplar C101: bbolt's `LeafPageElement`/
-// `BranchPageElement`, whose `uint16` index is converted to `int`
-// before reaching `UnsafeIndex`'s unconstrained `n int`).
+// elemOffset itself still has NO general bound on `n` (its generic summary
+// treats `n int` as unconstrained) — a caller passing a truly-unbounded
+// int can still violate its "overflow" requirement. Exemplar C101: bbolt's
+// `LeafPageElement`/`BranchPageElement`, whose `uint16` index is converted
+// to `int` before reaching `UnsafeIndex`'s unconstrained `n int`.
 func elemOffset(base uintptr, elemSize uintptr, n int) uintptr {
 	return base + uintptr(n)*elemSize
 }
 
+// FIXED (followups 2026-07-21, task 4A): formerly KNOWN-FP(phase-5) —
+// FP/requires-lifting. `idx`'s parameter type is `uint16`, so `int(idx)`
+// is provably in [0, 65535] by Go's conversion semantics alone, and the
+// constant 16-byte element size can never make the product overflow a
+// uintptr on any real platform — this call site was never a real bug.
+// Previously the analyzer's generic `elemOffset` summary treated its
+// `n int` parameter as unconstrained and never propagated the caller-
+// side uint16 domain fact through the `int(idx)` conversion, so the
+// call-site "overflow" obligation stayed (wrongly) Sat. Task 4A's
+// widening-`Op::Convert` range model asserts `int(idx) <= 65535`
+// directly on the conversion's OWN dst — the call-site obligation's
+// query substitutes that bound in regardless of what `elemOffset`'s own
+// summary knows, so it now discharges Unsat here. Kept as the green
+// regression case.
 func BranchElemOffset(base uintptr, idx uint16) uintptr {
-	return elemOffset(base, 16, int(idx)) // want: overflow
+	return elemOffset(base, 16, int(idx))
 }
 
 // fix-wave fix 3 (green): the nil-deref manifestation of mechanism

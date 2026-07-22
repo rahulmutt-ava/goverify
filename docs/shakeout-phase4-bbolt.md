@@ -1850,3 +1850,83 @@ cycle guard or any pin.
    escalation counter), G5 timings all healthy with the Task 8 anomaly
    refuted. Recommend **accept**; items 1-3 are closed/expected/queued,
    none a blocker.
+
+### Gate-mapping amendment
+
+The G1-G5 labels used above (and in the two preceding addenda) are
+operational shakeout-run gates, reused verbatim from the prior wave's
+naming convention — they are **not** the same G1-G5 as the wave-2
+*design spec*'s (`docs/superpowers/specs/2026-07-22-followups-wave2-design.md`
+§7) acceptance gates, which define different criteria for this wave's
+two production-code changes. Item 4 above ("all five gates pass under
+the spec's wording") conflates the two numbering schemes. This
+subsection maps them explicitly; it does not alter any verdict recorded
+above.
+
+- **Spec §7 G1 (retry tier verified)** — "unit pins green; every
+  shakeout arrival ... attributed to a specific recovered near-timeout
+  query. Zero unexplained arrivals." Evidenced by *this addendum's*
+  Gate 3 (the 458→457 diff: zero arrivals, one retry-attributed
+  departure) together with the four `discharge_query` unit tests in the
+  blocking tier (Task 6: `unknown_escalates_once_and_escalated_result_wins`,
+  `unknown_at_both_tiers_stays_unknown`, `retry_composes_with_cache_per_tier`,
+  `definitive_base_answer_never_escalates`) — **not** by this addendum's
+  own "Gate 1" (C009c presence), which is an unrelated, reused label
+  from the prior wave's finding-stability check.
+- **Spec §7 G2 (cycle guard verified)** — "crafted-cycle unit tests
+  green, fuzz seed added, fuzz smoke green, zero corpus/golden drift."
+  Evidenced by the `named_cycle_degrades_to_unresolvable` unit test in
+  the blocking tier (Task 4, `encode.rs`) together with Task 4's fuzz
+  smoke: `ir_encode`, 60 s, 6,597,086 executions, zero crashes, nightly
+  toolchain available in-sandbox (Task 4, 2026-07-22) — **not** by this
+  addendum's own "Gate 2" (C221 absence), likewise an unrelated, reused
+  label from the prior wave.
+- Spec §7's G3, G4, and G5 line up numerically with this addendum's
+  Gate 3 (full diff), Gate 4 (determinism), and Gate 5 (timing,
+  report-only) — same subject matter under both namings, so no
+  remapping is needed for those three.
+
+Corrections to statements made above (no verdict changes):
+
+1. **Escalation-count wobble (254 cold / 251 warm1 / 251 warm2), Gate
+   4.** The existing statistical-determinism caveat stands (wall-clock
+   timeouts bound this statistically, not absolutely); the specific
+   3-query delta is better explained by cold-run parallel duplicate-query
+   cache overwrites than by generic timing noise. `engine.rs` dispatches
+   each wave's summaries via `rayon`'s `par_iter`
+   (`goverify-analysis/src/engine.rs:151`), and the retry tier's cache
+   composition caches `Unknown` outcomes at each tier (spec §2), on a
+   first cold run included. On a cold run, several threads can race to
+   compute and cache the *same* query before either result lands, each
+   independently deciding whether to escalate and each incrementing the
+   shared `AtomicU64` escalation counter, even though only one write
+   survives in the cache. Warm runs replay already-populated cache
+   entries and hit this compute-then-overwrite race far less often, so
+   they undercount relative to cold by a few queries. Inferred from the
+   engine's known concurrency shape, not independently reproduced.
+2. Gate 3's attribution table states `tx.go:558:11` "was one of the
+   escalated queries (254 escalated this cold run)" — inferred from the
+   retry-tier mechanism and the escalation count, no per-query log
+   identifies which of the 254 escalated queries it was; the clause
+   should read "(inferred from the mechanism, no per-query log)".
+3. Gate 5's test-binary counts: this addendum's 32 (`mise run test`,
+   Task 9) and Task 8's ~19 do not reconcile cleanly. Reproducing both
+   counting methods against the current tree: `cargo test --workspace
+   --all-features --no-run` emits 25 `Executable` lines (8 unit-test
+   binaries + 17 integration-test binaries), not ~19, and the full
+   `cargo test --workspace --all-features` run (no `--no-run`) emits
+   those same 25 `Running` lines plus 7 `Doc-tests <crate>` sections =
+   32, matching Task 9 exactly. Task 8's ~19 matches neither the
+   integration-only count (17) nor the full-workspace count (25) here,
+   and Task 8's own report gives no per-unit list to check it against.
+   Populations differ (workspace-wide vs integration-only builds);
+   counts not directly comparable.
+4. Gate 5's corpus timing: 31.20 s (this wave) vs the prior wave's
+   ~26 s is primarily attributable to Task 1's addition of the
+   `ensures_corpus` suite to the `corpus` mise task (item 3, landed
+   first in this wave's task order specifically so later pins would run
+   under it) — a new suite added to the task, not retry-tier overhead.
+   The retry tier is exercised via `RetryBackend`, which only the CLI's
+   `run_findings` construction site builds; engine/checker/corpus test
+   call sites construct plain backends directly (Task 6), so the corpus
+   task's suites do not exercise the retry tier at all.

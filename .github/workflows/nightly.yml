@@ -26,7 +26,8 @@ jobs:
           workspaces: fuzz -> target
       - run: cargo +nightly fuzz run gvir_decode -- -max_total_time=900
       - run: cargo +nightly fuzz run ir_lower -- -max_total_time=900
-      - run: cargo +nightly fuzz run ir_encode -- -max_total_time=900
+      - run: mkdir -p fuzz/corpus/ir_encode
+      - run: cargo +nightly fuzz run ir_encode fuzz/corpus/ir_encode fuzz/seeds/ir_encode -- -max_total_time=900
       - run: cargo +nightly fuzz run smt_reader -- -max_total_time=900
   audit:
     runs-on: ubuntu-latest

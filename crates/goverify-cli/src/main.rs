@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use goverify_extract::Sidecar;
 use goverify_solver::TextSolver;
 
+mod json;
 mod render;
 
 #[derive(Parser)]
@@ -43,6 +44,14 @@ enum Cmd {
     },
     /// Analyze packages and report findings (spec §10).
     Check(CheckArgs),
+}
+
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+enum OutputFormat {
+    /// Labeled source spans with traces (default).
+    Human,
+    /// Native machine schema (schema_version 1).
+    Json,
 }
 
 #[derive(clap::Args)]
@@ -81,6 +90,10 @@ struct CheckArgs {
     /// rendered and gate the exit code.
     #[arg(long)]
     scope: Option<String>,
+    /// Output format (spec §10): human terminal report, or machine
+    /// formats for CI. Machine formats are byte-identical across runs.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+    format: OutputFormat,
 }
 
 #[derive(clap::Args)]
@@ -473,7 +486,18 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             a.findings.clone()
         }
     };
-    print!("{}", render::render_findings(&scoped, Path::new(".")));
+    let fps = goverify_cli::fingerprint::fingerprints(&scoped);
+    let summary = json::Summary {
+        total: scoped.len(),
+        suppressed_by_baseline: 0,
+        diff_base_scoped: false,
+    };
+    match ca.format {
+        OutputFormat::Human => {
+            print!("{}", render::render_findings(&scoped, Path::new(".")));
+        }
+        OutputFormat::Json => print!("{}", json::render_json(&scoped, &fps, &summary)),
+    }
     if timings {
         eprintln!(
             "goverify: timing: scope+render {:.2}s",

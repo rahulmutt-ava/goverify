@@ -180,3 +180,96 @@ fn explicit_baseline_flags() {
     );
     assert_eq!(out.status.code(), Some(2), "write+--no-baseline rejected");
 }
+
+/// Two identical-shape findings in one function (spec §2): same
+/// (checker, func, tag, message), distinct positions -> distinct
+/// ordinal fingerprints; baselining one leaves the other reported.
+#[test]
+fn identical_siblings_baseline_independently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("ordpair");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(
+        module.join("go.mod"),
+        "module example.com/ordpair\n\ngo 1.25.10\n",
+    )
+    .unwrap();
+    // Two nil-deref findings in one function: same (checker, func, tag,
+    // message), different positions. Mirror the nil corpus deref pattern.
+    std::fs::write(
+        module.join("ordpair.go"),
+        r#"package ordpair
+
+type T struct{ X int }
+
+func deref(p *T) int { return p.X }
+
+func twice() int {
+	x := deref(nil)
+	y := deref(nil)
+	return x + y
+}
+"#,
+    )
+    .unwrap();
+
+    let out = goverify(
+        &["check", "--format", "json", "./..."],
+        &module,
+        cache.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid --format json");
+    let findings = v["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 2, "two sibling findings expected: {v}");
+    assert_eq!(
+        findings[0]["message"], findings[1]["message"],
+        "identical shape"
+    );
+    assert_ne!(
+        findings[0]["fingerprint"], findings[1]["fingerprint"],
+        "ordinals separate identical siblings"
+    );
+
+    // Baseline everything, then remove ONE entry: exactly one resurfaces.
+    let w = goverify(&["baseline", "write", "./..."], &module, cache.path());
+    assert!(w.status.success());
+    let path = module.join(".goverify/baseline.json");
+    let mut b = goverify_cli::baseline::parse(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(b.entries.len(), 2);
+    b.entries.pop();
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "entries": [{
+                "fingerprint": b.entries[0].fingerprint,
+                "checker": b.entries[0].checker,
+                "tag": b.entries[0].tag,
+                "func": b.entries[0].func,
+                "message": b.entries[0].message,
+            }],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let one = goverify(
+        &["check", "--format", "json", "./..."],
+        &module,
+        cache.path(),
+    );
+    assert_eq!(one.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&one.stdout).unwrap();
+    assert_eq!(
+        v["findings"].as_array().unwrap().len(),
+        1,
+        "one sibling suppressed: {v}"
+    );
+    assert_eq!(v["summary"]["suppressed_by_baseline"], 1);
+}

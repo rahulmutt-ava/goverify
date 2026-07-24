@@ -128,6 +128,57 @@ func TestManifestListsClosureWithDepsAndFiles(t *testing.T) {
 			}
 		}
 	}
+	assertManifestClosureComplete(t, out)
+}
+
+// assertManifestClosureComplete pins the generic invariant that catches
+// the whole class of "dep line doesn't match any pkg line" bugs: every
+// "dep <path>" printed must resolve to a "pkg <path>" line somewhere in
+// the same manifest output. This is what the Rust side's package_keys
+// closure check relies on — printing an unresolved import-map key
+// (rather than the resolved PkgPath) instead of the actual PkgPath
+// silently desyncs the two and degrades the whole extraction cache.
+func assertManifestClosureComplete(t *testing.T, manifestOut string) {
+	t.Helper()
+	pkgs := map[string]bool{}
+	var deps []string
+	for _, line := range strings.Split(manifestOut, "\n") {
+		if p, ok := strings.CutPrefix(line, "pkg "); ok {
+			pkgs[p] = true
+		} else if d, ok := strings.CutPrefix(line, "dep "); ok {
+			deps = append(deps, d)
+		}
+	}
+	for _, d := range deps {
+		if !pkgs[d] {
+			t.Errorf("manifest: dep %q has no matching pkg line (closure incomplete)", d)
+		}
+	}
+}
+
+// TestManifestClosureCrossesVendorBoundary pins the exact regression
+// this test was added for: crypto/ecdsa imports the source-level path
+// "golang.org/x/crypto/cryptobyte", but go/packages resolves it to the
+// stdlib-vendored PkgPath "vendor/golang.org/x/crypto/cryptobyte" — the
+// same path its "pkg" line prints. If manifest ever prints the
+// import-map KEY instead of the resolved PkgPath, this dep line goes
+// unmatched and assertManifestClosureComplete catches it.
+func TestManifestClosureCrossesVendorBoundary(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "go.mod", "module example.com/vendorcross\n\ngo 1.25\n")
+	writeFile(t, dir, "main.go", "package m\n\nimport \"crypto/ecdsa\"\n\nvar _ = ecdsa.PublicKey{}\n")
+	var buf bytes.Buffer
+	if err := manifest(dir, []string{"./..."}, &buf); err != nil {
+		t.Fatalf("manifest: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "pkg vendor/golang.org/x/crypto/cryptobyte\n") {
+		t.Fatalf("manifest missing expected vendored closure package; fixture assumption (crypto/ecdsa pulls in vendored cryptobyte) may no longer hold:\n%s", out)
+	}
+	if !strings.Contains(out, "dep vendor/golang.org/x/crypto/cryptobyte\n") {
+		t.Errorf("manifest missing resolved dep edge to vendored cryptobyte (printing unresolved import key instead of PkgPath?):\n%s", out)
+	}
+	assertManifestClosureComplete(t, out)
 }
 
 func keys[V any](m map[string]*V) []string {

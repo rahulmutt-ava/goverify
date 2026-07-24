@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/url"
 	"os"
 	"os/exec"
@@ -171,7 +170,25 @@ func manifest(dir string, patterns []string, w io.Writer) error {
 			continue
 		}
 		fmt.Fprintf(w, "pkg %s\n", p.PkgPath)
-		deps := slices.Sorted(maps.Keys(p.Imports))
+		// Print each dep's RESOLVED PkgPath, not the import-map key: for
+		// stdlib-internal vendored packages (e.g. golang.org/x/crypto/...)
+		// the source-level import path differs from the resolved
+		// PkgPath (vendor/golang.org/x/crypto/...), which is what the
+		// corresponding "pkg" line prints. Printing keys instead of
+		// resolved paths desyncs the two, and the Rust side's
+		// package_keys closure check treats every such dep as missing,
+		// degrading the whole extraction cache to uncached.
+		var deps []string
+		for _, dp := range p.Imports {
+			if dp == nil {
+				// Degrade, never die: a nil import-map value shouldn't
+				// happen, but skip it defensively rather than panic.
+				continue
+			}
+			deps = append(deps, dp.PkgPath)
+		}
+		slices.Sort(deps)
+		deps = slices.Compact(deps)
 		for _, d := range deps {
 			fmt.Fprintf(w, "dep %s\n", d)
 		}

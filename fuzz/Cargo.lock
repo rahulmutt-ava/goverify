@@ -183,6 +183,7 @@ dependencies = [
 name = "goverify-analysis"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "goverify-cache",
  "goverify-ir",
  "goverify-solver",
@@ -201,8 +202,10 @@ name = "goverify-extract"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "goverify-cache",
  "prost",
  "prost-build",
+ "tempfile",
 ]
 
 [[package]]
@@ -221,7 +224,9 @@ dependencies = [
 name = "goverify-ir"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "goverify-extract",
+ "prost",
  "tempfile",
 ]
 

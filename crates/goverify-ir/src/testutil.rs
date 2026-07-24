@@ -85,11 +85,19 @@ pub fn wants_in(dir: &Path) -> Vec<(String, u32, String)> {
             if code.trim().is_empty() || code.trim_start().starts_with("//") {
                 continue; // whole-line or comment-only prefix: prose, not a pin
             }
-            let tags: Vec<&str> = rest.split(',').map(str::trim).collect();
+            // Empty segments (trailing/doubled commas) are tolerated and
+            // dropped; only a non-empty segment that fails the charset
+            // check condemns the whole line as prose. A marker with only
+            // empty segments (`// want:` or `// want: ,`) yields zero tags
+            // — that's "no pin", not an error.
+            let tags: Vec<&str> = rest
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .collect();
             let valid = |t: &str| {
-                !t.is_empty()
-                    && t.chars()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                t.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
             };
             if !tags.iter().all(|t| valid(t)) {
                 continue; // prose after "want:" — not a tag list
@@ -147,6 +155,33 @@ mod tests {
             got,
             vec![("a.go".to_string(), 5, "overflow".to_string())],
             "wants_in(): only the trailing-comment marker with valid tags parses"
+        );
+    }
+
+    #[test]
+    fn wants_tolerates_empty_tag_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.go"),
+            concat!(
+                "package a\n",
+                "func F() int { return 1 } // want: overflow,\n", // trailing comma: yields overflow only
+                "func G() int { return 2 } // want: a,,b\n",      // doubled comma: yields a, b
+                "func H() int { return 3 } // want:\n",           // bare marker: no pin
+                "func I() int { return 4 } // want: not a valid tag list\n", // still prose: NOT a pin
+            ),
+        )
+        .unwrap();
+        let got = wants_in(dir.path());
+        assert_eq!(
+            got,
+            vec![
+                ("a.go".to_string(), 2, "overflow".to_string()),
+                ("a.go".to_string(), 3, "a".to_string()),
+                ("a.go".to_string(), 3, "b".to_string()),
+            ],
+            "wants_in(): empty tag segments (trailing/doubled commas) are dropped; \
+             bare `// want:` yields no pin; a non-empty invalid tag still rejects the whole line"
         );
     }
 }

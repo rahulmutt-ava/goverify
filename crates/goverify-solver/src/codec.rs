@@ -474,10 +474,9 @@ mod tests {
             &[][..],
         ] {
             let mut input = garbage;
-            assert!(
-                decode_term(&mut input, &[]).is_none() || true,
-                "reject-never-panic is the property; None or partial is fine"
-            );
+            // Property under test is reject-never-panic: executing without
+            // panicking IS the check, whatever decode_term returns.
+            let _ = decode_term(&mut input, &[]);
         }
         // A bv width of 0 or >128 must be rejected BEFORE bv_lit's assert.
         // (Constructed by hand-editing the width field of a valid encoding

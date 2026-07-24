@@ -44,21 +44,28 @@ impl CallGraph {
         for caller in 0..n {
             let caller = FuncId(caller as u32);
             for &callee in self.callees(caller) {
-                rev[callee.0 as usize].push(caller);
+                // Guard against out-of-range callee ids: degrade, never panic.
+                if let Some(slot) = rev.get_mut(callee.0 as usize) {
+                    slot.push(caller);
+                }
             }
         }
         let mut closure: std::collections::HashSet<FuncId> =
             std::collections::HashSet::with_capacity(seeds.len());
         let mut stack: Vec<FuncId> = Vec::new();
         for &s in seeds {
-            if closure.insert(s) {
+            // Skip out-of-range seeds: they have no callers and can't be real functions.
+            if (s.0 as usize) < n && closure.insert(s) {
                 stack.push(s);
             }
         }
         while let Some(v) = stack.pop() {
-            for &caller in &rev[v.0 as usize] {
-                if closure.insert(caller) {
-                    stack.push(caller);
+            // Traversal indexing is safe by construction, but keep robust anyway.
+            if let Some(callers) = rev.get(v.0 as usize) {
+                for &caller in callers {
+                    if closure.insert(caller) {
+                        stack.push(caller);
+                    }
                 }
             }
         }
@@ -605,6 +612,37 @@ mod tests {
         assert!(
             g.callers_closure(&[]).is_empty(),
             "empty seeds -> empty closure"
+        );
+    }
+
+    /// Regression: `callers_closure` must ignore out-of-range ids (degrade,
+    /// never panic). A caller-supplied graph can have out-of-range callee ids
+    /// (e.g. a future Task 13-15 caller with a `g`/`n` mismatch, or fuzzed
+    /// input), and seeds can be out-of-range too (caller-supplied). Before
+    /// the fix, indexing `rev[callee.0 as usize]` and `rev[v.0 as usize]`
+    /// without bounds checks panicked. The implementation must guard all
+    /// accesses and skip out-of-range seeds, mirroring the `callees()`
+    /// accessor and `Sccs` traversal's defensive guards.
+    #[test]
+    fn callers_closure_ignores_out_of_range_ids() {
+        // Graph: n=2, but edge 0→5 is out of range. Seed 7 is also out of range.
+        let g = from_edges(2, &[(0, 1), (0, 5)]);
+        let closure = g.callers_closure(&[FuncId(1), FuncId(7)]);
+        let mut got: Vec<u32> = closure.iter().map(|f| f.0).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![0, 1],
+            "out-of-range callee (5) and out-of-range seed (7) must be \
+             dropped, not panic; in-range seed (1) and its transitive callers \
+             (0) must be included"
+        );
+
+        // Only out-of-range seeds: empty closure.
+        let closure = g.callers_closure(&[FuncId(5), FuncId(10)]);
+        assert!(
+            closure.is_empty(),
+            "seeds with no in-range functions must degrade to empty closure"
         );
     }
 }

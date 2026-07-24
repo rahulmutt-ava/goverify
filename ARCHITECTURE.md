@@ -24,13 +24,13 @@ Rust core: IR load ─▶ call-graph SCC order ─▶ per-function analysis
 | Crate | Owns | Deliberately does NOT own |
 |---|---|---|
 | `goverify-cli` | argument parsing, orchestration, rendering | any analysis logic |
-| `goverify-extract` | sidecar driving, `.gvir` schema + loader | interpretation of the IR |
+| `goverify-extract` | sidecar driving, `.gvir` schema + loader, the extraction cache (go-list closure manifest + per-package gvir keying, degrades to uncached extraction on a manifest miss) | interpretation of the IR |
 | `goverify-ir` | analyzer-owned SSA-style IR lowered from `.gvir`, the whole-program call graph (static/interface/function-value edges), SCC condensation for scheduling | x/tools SSA quirks (isolated at the extractor boundary) |
-| `goverify-analysis` | the SCC-ordered engine: concurrency effects, the syntactic pre-pass (no SMT), summary instantiation over placeholder clauses | what to check (checkers plug in) |
+| `goverify-analysis` | the SCC-ordered engine: concurrency effects, the syntactic pre-pass (no SMT), summary instantiation over placeholder clauses, the SCC summary cache (context-hash keying + entry framing over the shared Store) | what to check (checkers plug in) |
 | `goverify-checkers` | `Checker` trait consumers: `NilChecker` (tag `nil-deref`) and `BoundsChecker` (tags `bounds`, `div-zero`, `overflow`) | engine machinery, solver details |
 | `goverify-solver` | typed QF term language (Bool, BV, Array, Ptr-ADT); canonical SMT-LIB2 printer is the single lowering — cache keys and artifacts are byte-identical to solved queries; `Z3Native` (statically-linked bundled Z3 4.16.0) and `SmtLib2Process` (external binary) backends both consume printer bytes; differential harness guards agreement | summary semantics |
 | `goverify-spec` | summary/annotation format: parse, serialize, validate | inference |
-| `goverify-cache` | content-addressed store (blake3, atomic rename, advisory lock, corrupt=miss); query layer keyed on canonical SMT text ⊕ solver identity ⊕ limits; extraction/summary caching layers arrive in phase 5 | what the bytes mean |
+| `goverify-cache` | content-addressed store (blake3, atomic rename, advisory lock, corrupt=miss) — bytes only, layer-agnostic. Three live layers write to it: `extract` (keyed in goverify-extract), `scc` (keyed + framed in goverify-analysis), and `query` (keyed here on canonical SMT text ⊕ solver identity ⊕ limits) | what the bytes mean; how any layer keys or frames them |
 
 Checkers depend on `goverify-analysis` + `goverify-ir` + `goverify-solver`
 and nothing else — notably not `goverify-extract`, `goverify-cache`, or

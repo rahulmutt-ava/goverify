@@ -1,6 +1,7 @@
-//! Content-addressed cache (parent spec §9; phase-3 spec §7). Phase 3
-//! ships the generic store + the query layer; extraction/summary layers
-//! land in phase 5 on the same Store.
+//! Content-addressed cache (parent spec §9; phase-3 spec §7). Ships the
+//! generic byte-only Store + the query layer; the phase-5a extraction and
+//! SCC-summary layers key/frame their own bytes and write to the same Store
+//! (in goverify-extract and goverify-analysis respectively).
 
 mod query;
 mod store;

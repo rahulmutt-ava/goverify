@@ -42,14 +42,22 @@ shakeout target (`.goverify/shakeout/bbolt` @ v1.4.0), the same
    exec timeout than the harness default. Not a gate failure — G2 has
    no timing threshold, and every subsequent warm run against that
    same cache dir completed in 3-4s as expected.
-4. **G4 semantic-edit tx.go finding count shifts by one (47→48), not
+4. **G4 semantic-edit tx.go finding count shifts by one (49→50), not
    the exact same set.** The probe edit inserts a literal source line
    into `tx.go`, which shifts every later line number in that file by
    one — so `tx.go`'s own findings necessarily report different
    `line:col` headers pre- vs. post-edit even though they're the same
    underlying findings. This was verified benign (see G4 below) by
    checking that findings in *other* files are an exact subset of the
-   full baseline; only `tx.go`'s own line numbers move.
+   full baseline; only `tx.go`'s own line numbers move. (An earlier
+   draft of this addendum misreported this breakdown as 47→48 /
+   405→391 — those numbers came from piping the finding-header grep
+   through `sort -u`, which silently collapsed pairs of distinct
+   findings that happen to share identical header text down to one
+   line each. Recounted directly from the raw `check` output with the
+   brief's finding-header grep and no `sort -u`: tx.go is 49→50,
+   non-tx.go is 408→392 — these sum to the gate's own totals,
+   49+408=457 and 50+392=442.)
 5. A stray untracked `.z3-trace` (0 bytes, dated Jul 22, predates this
    session) sits in the bbolt clone; it was not created by this task
    and was left alone — it isn't part of the G1-G5 cleanup contract
@@ -141,13 +149,15 @@ real side effect survives lowering):
   subset of 457.
 - Verified the "strict subset" property directly rather than trusting
   the raw count: for every file *other than* `tx.go`, the reported
-  findings (391) are an **exact subset** (`comm -23` empty) of that
-  file's findings in the full G1 baseline run (405) — i.e.
+  findings (392) are an **exact subset** (`comm -23` empty) of that
+  file's findings in the full G1 baseline run (408) — i.e.
   `--diff-base` correctly narrowed the report to the changed
   function's caller closure and dropped unrelated findings, adding
-  none. `tx.go`'s own findings shift from 47 to 48 purely because the
+  none. `tx.go`'s own findings shift from 49 to 50 purely because the
   inserted line renumbers everything below it in that file (deviation
-  #4) — not a new or spurious finding.
+  #4) — not a new or spurious finding. (408+49=457, 392+50=442 — the
+  per-file breakdown sums to the gate's own totals; see deviation #4
+  for the `sort -u` bug in an earlier draft of these two numbers.)
 - → **G4 PASS**
 
 Cleanup: `mv tx.go.bak tx.go` after the comment edit, `git checkout --

@@ -45,6 +45,18 @@ enum Cmd {
     },
     /// Analyze packages and report findings (spec §10).
     Check(CheckArgs),
+    /// Manage the findings baseline (spec §10).
+    Baseline {
+        #[command(subcommand)]
+        what: BaselineWhat,
+    },
+}
+
+#[derive(Subcommand)]
+enum BaselineWhat {
+    /// Record current findings in .goverify/baseline.json; later
+    /// `check` runs report only new findings.
+    Write(CheckArgs),
 }
 
 #[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
@@ -177,6 +189,9 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
         Cmd::Debug { what } => run_debug(what).map(|()| ExitCode::SUCCESS),
         Cmd::Check(ca) => run_check(ca),
+        Cmd::Baseline { what } => match what {
+            BaselineWhat::Write(ca) => run_baseline_write(ca),
+        },
     }
 }
 
@@ -358,17 +373,24 @@ fn run_findings(fa: FindingsArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Everything `check` and `baseline write` share (spec §4): cache-root
+/// resolution, program acquisition (extraction cache when available),
+/// the engine run, and module scoping. Returns the SCOPED findings in
+/// render order plus the pieces `--diff-base` (spec §5) needs.
+#[allow(dead_code)] // program/cache_root: consumed by --diff-base (Task 5) and Task 10.
+struct Analyzed {
+    program: goverify_ir::Program,
+    scoped: Vec<goverify_analysis::Finding>,
+    cache_root: Option<PathBuf>,
+    timings: bool,
+}
+
 /// `check` (spec §10, this task): the user-facing analyzer entry point.
 /// Two solver-timeout tiers — tight for the per-SCC requires-inference
 /// backend, generous for the sequential findings pass that gates
 /// user-visible output (`BackendRole` doc comment, engine.rs) — unlike
 /// `debug findings`, which keeps one timeout for both roles.
-fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let dargs = DebugArgs {
-        gvir_dir: ca.gvir_dir.clone(),
-        func: None,
-        patterns: ca.patterns.clone(),
-    };
+fn analyze_module(ca: &CheckArgs) -> Result<Analyzed, Box<dyn std::error::Error>> {
     // Phase wall-clocks on stderr, opt-in by setting GOVERIFY_TIMINGS to
     // any value (presence-checked, not compared to "1"; spec §6 rider 1 /
     // G4). stderr only: stdout is the cold/warm byte-identity surface.
@@ -390,33 +412,13 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
     };
     let t_extract = std::time::Instant::now();
-    // Program acquisition: --gvir-dir (or no cache root) takes the plain
-    // load_program path (no extraction-cache interaction, spec §9);
-    // otherwise extract through the cache and fall back to plain
-    // extraction on any cache failure (degrade, never die).
-    let program = match (&ca.gvir_dir, &cache_root) {
-        (Some(_), _) | (None, None) => load_program(&dargs)?,
-        (None, Some(root)) => {
-            let sidecar = Sidecar::build(&extractor_dir()?, &sidecar_build_dir())?;
-            let patterns: Vec<&str> = ca.patterns.iter().map(String::as_str).collect();
-            match goverify_extract::load_packages_cached(&sidecar, Path::new("."), &patterns, root)
-            {
-                Ok((pkgs, stats)) => {
-                    if timings {
-                        eprintln!(
-                            "goverify: timing: extract cache {} hit / {} extracted",
-                            stats.cached, stats.extracted
-                        );
-                    }
-                    goverify_ir::Program::from_packages(pkgs)
-                }
-                Err(e) => {
-                    eprintln!("goverify: extraction cache unavailable ({e}); extracting uncached");
-                    load_program(&dargs)?
-                }
-            }
-        }
-    };
+    let program = acquire_program(
+        Path::new("."),
+        ca.gvir_dir.as_ref(),
+        &ca.patterns,
+        cache_root.as_ref(),
+        timings,
+    )?;
     if timings {
         eprintln!(
             "goverify: timing: extract+load {:.2}s",
@@ -472,7 +474,6 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     if esc > 0 {
         eprintln!("goverify: solver: {esc} queries escalated to the retry tier");
     }
-    let t_render = std::time::Instant::now();
     // Scope findings to the analyzed module: extraction walks the whole
     // import closure (stdlib + deps), so `a.findings` covers far more than
     // the user asked to check. Inference/summaries above already used the
@@ -489,30 +490,104 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             a.findings.clone()
         }
     };
-    let fps = goverify_cli::fingerprint::fingerprints(&scoped);
+    Ok(Analyzed {
+        program,
+        scoped,
+        cache_root,
+        timings,
+    })
+}
+
+/// Program acquisition for the module rooted at `dir` (spec §9 paths):
+/// an explicit gvir_dir loads as-is; with a cache root, extract through
+/// the extraction cache and fall back to plain extraction on any cache
+/// failure (degrade, never die); otherwise plain extraction.
+fn acquire_program(
+    dir: &Path,
+    gvir_dir: Option<&PathBuf>,
+    patterns: &[String],
+    cache_root: Option<&PathBuf>,
+    timings: bool,
+) -> Result<goverify_ir::Program, Box<dyn std::error::Error>> {
+    let dargs = DebugArgs {
+        gvir_dir: gvir_dir.cloned(),
+        func: None,
+        patterns: patterns.to_vec(),
+    };
+    // Program acquisition: --gvir-dir (or no cache root) takes the plain
+    // load_program path (no extraction-cache interaction, spec §9);
+    // otherwise extract through the cache and fall back to plain
+    // extraction on any cache failure (degrade, never die).
+    match (gvir_dir, cache_root) {
+        (Some(_), _) | (None, None) => load_program(&dargs),
+        (None, Some(root)) => {
+            let sidecar = Sidecar::build(&extractor_dir()?, &sidecar_build_dir())?;
+            let patterns: Vec<&str> = patterns.iter().map(String::as_str).collect();
+            match goverify_extract::load_packages_cached(&sidecar, dir, &patterns, root) {
+                Ok((pkgs, stats)) => {
+                    if timings {
+                        eprintln!(
+                            "goverify: timing: extract cache {} hit / {} extracted",
+                            stats.cached, stats.extracted
+                        );
+                    }
+                    Ok(goverify_ir::Program::from_packages(pkgs))
+                }
+                Err(e) => {
+                    eprintln!("goverify: extraction cache unavailable ({e}); extracting uncached");
+                    load_program(&dargs)
+                }
+            }
+        }
+    }
+}
+
+fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let a = analyze_module(&ca)?;
+    let t_render = std::time::Instant::now();
+    let fps = goverify_cli::fingerprint::fingerprints(&a.scoped);
     let summary = json::Summary {
-        total: scoped.len(),
+        total: a.scoped.len(),
         suppressed_by_baseline: 0,
         diff_base_scoped: false,
     };
     match ca.format {
         OutputFormat::Human => {
-            print!("{}", render::render_findings(&scoped, Path::new(".")));
+            print!("{}", render::render_findings(&a.scoped, Path::new(".")));
         }
-        OutputFormat::Json => print!("{}", json::render_json(&scoped, &fps, &summary)),
-        OutputFormat::Sarif => print!("{}", sarif::render_sarif(&scoped, &fps, 0)),
+        OutputFormat::Json => print!("{}", json::render_json(&a.scoped, &fps, &summary)),
+        OutputFormat::Sarif => print!("{}", sarif::render_sarif(&a.scoped, &fps, 0)),
     }
-    if timings {
+    if a.timings {
         eprintln!(
             "goverify: timing: scope+render {:.2}s",
             t_render.elapsed().as_secs_f64()
         );
     }
-    Ok(if scoped.is_empty() {
+    Ok(if a.scoped.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
     })
+}
+
+/// `baseline write` (spec §4): the identical pipeline as `check`,
+/// recording the scoped findings instead of rendering them. Exit 0 on
+/// success regardless of finding count — recording findings is the
+/// point.
+fn run_baseline_write(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let a = analyze_module(&ca)?;
+    let fps = goverify_cli::fingerprint::fingerprints(&a.scoped);
+    let dir = Path::new(".goverify");
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("baseline.json");
+    std::fs::write(&path, goverify_cli::baseline::render(&a.scoped, &fps))?;
+    eprintln!(
+        "goverify: baseline: {} finding(s) recorded in {}",
+        a.scoped.len(),
+        path.display()
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Keep only findings whose function lives in the module rooted at

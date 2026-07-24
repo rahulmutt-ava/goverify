@@ -5,4 +5,5 @@
 //! layer. Orchestration (formats dispatch, git, rendering) stays
 //! bin-side.
 
+pub mod baseline;
 pub mod fingerprint;

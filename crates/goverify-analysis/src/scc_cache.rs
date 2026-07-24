@@ -36,7 +36,13 @@ fn hash_field(h: &mut blake3::Hasher, b: &[u8]) {
 
 #[derive(Debug, Clone)]
 pub struct CacheConfigKey {
+    /// The Infer-role backend's identity.
     pub solver_identity: String,
+    /// The Findings-role backend's identity. Kept distinct from
+    /// `solver_identity` because `mk_backend` may return a different
+    /// solver kind per role; without it in the salt, two roles that
+    /// differ only by kind (not by limits) would silently share entries.
+    pub findings_identity: String,
     pub infer_limits: SolverLimits,
     pub findings_limits: SolverLimits,
     pub widen_after: u32,
@@ -55,7 +61,13 @@ impl SccCache {
         h.update(b"goverify-scc-salt\0");
         h.update(&SCC_CACHE_VERSION.to_le_bytes());
         h.update(&[goverify_solver::TERM_CODEC_VERSION]);
+        // Both backend-role identities are salt inputs. Adding
+        // `findings_identity` here (a salt-input ADDITION) rotates every
+        // existing key naturally — no SCC_CACHE_VERSION bump is required
+        // for salt-input additions, since the salt change itself orphans
+        // stale entries.
         hash_field(&mut h, cfg.solver_identity.as_bytes());
+        hash_field(&mut h, cfg.findings_identity.as_bytes());
         h.update(&cfg.infer_limits.timeout_ms.to_le_bytes());
         h.update(&cfg.infer_limits.mem_mb.to_le_bytes());
         h.update(&cfg.findings_limits.timeout_ms.to_le_bytes());
@@ -681,6 +693,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = CacheConfigKey {
             solver_identity: "stub".to_string(),
+            findings_identity: "stub".to_string(),
             infer_limits: goverify_solver::SolverLimits::default(),
             findings_limits: goverify_solver::SolverLimits::default(),
             widen_after: 3,
@@ -699,13 +712,26 @@ mod tests {
         // integration tests; here we only pin salt sensitivity.)
         let cfg2 = CacheConfigKey {
             solver_identity: "other".to_string(),
-            ..cfg
+            ..cfg.clone()
         };
         let c2 = SccCache::open(dir.path().to_path_buf(), &cfg2);
         assert_ne!(
             c.salt_for_test(),
             c2.salt_for_test(),
-            "identity is in the salt"
+            "infer identity is in the salt"
+        );
+
+        // findings_identity is a distinct salt input: a backend that
+        // differs only in its Findings-role kind must not share entries.
+        let cfg3 = CacheConfigKey {
+            findings_identity: "other-findings".to_string(),
+            ..cfg
+        };
+        let c3 = SccCache::open(dir.path().to_path_buf(), &cfg3);
+        assert_ne!(
+            c.salt_for_test(),
+            c3.salt_for_test(),
+            "findings identity is in the salt"
         );
     }
 }

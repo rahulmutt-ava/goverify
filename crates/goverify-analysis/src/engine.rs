@@ -154,15 +154,22 @@ pub fn analyze_full(
     let diag_slots: Vec<Mutex<Option<String>>> = (0..n_funcs).map(|_| Mutex::new(None)).collect();
 
     // Per-SCC cache (phase-5a spec §4). Only constructed when a cache dir
-    // is configured AND there are checkers: the checker-less debug
-    // prepass/summary paths run the fixpoint with no findings and must
-    // stay allocation-free (and never poison entries). Probe one backend
-    // per role for identity/limits — with the lazy escalated tier this
-    // allocates one Z3 context per probe, freed immediately.
+    // is configured AND there are checkers AND we are not dumping SMT: the
+    // checker-less debug prepass/summary paths run the fixpoint with no
+    // findings and must stay allocation-free (and never poison entries).
+    // `emit_smt` is a debug/audit mode whose whole point is a COMPLETE dump
+    // of every discharged query; an SCC cache hit replays a summary/finding
+    // without ever re-entering discharge, so a warm run would silently emit
+    // only the missed SCCs' queries. Disable the cache entirely under
+    // emit_smt so the dump is always complete (correctness over speed here).
+    // Probe one backend per role for identity/limits — with the lazy
+    // escalated tier this allocates one Z3 context per probe, freed
+    // immediately.
     let scc_cache = cfg
         .cache_dir
         .clone()
         .filter(|_| !checkers.is_empty())
+        .filter(|_| cfg.emit_smt.is_none())
         .map(|root| {
             let infer_probe = mk_backend(BackendRole::Infer);
             let findings_probe = mk_backend(BackendRole::Findings);
@@ -170,6 +177,7 @@ pub fn analyze_full(
                 root,
                 &crate::scc_cache::CacheConfigKey {
                     solver_identity: infer_probe.identity(),
+                    findings_identity: findings_probe.identity(),
                     infer_limits: infer_probe.limits(),
                     findings_limits: findings_probe.limits(),
                     widen_after: cfg.opts.widen_after,

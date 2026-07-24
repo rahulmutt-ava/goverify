@@ -11,7 +11,11 @@ use crate::load::load_package_bytes;
 use crate::sidecar::{ManifestPkg, Sidecar, SidecarError};
 
 /// Bump on any change to the key preimage or stored-value semantics.
-const EXTRACT_CACHE_VERSION: u32 = 1;
+/// v2: the per-package file set now includes the module's go.mod (its
+/// `go` directive changes emitted SSA per-module), and the sidecar
+/// `content_key` now folds `GOOS`/`GOARCH`/`GOEXPERIMENT` — both new
+/// preimage inputs.
+const EXTRACT_CACHE_VERSION: u32 = 2;
 const LAYER: &str = "extract";
 
 pub struct ExtractStats {

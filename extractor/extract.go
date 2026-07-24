@@ -192,8 +192,17 @@ func manifest(dir string, patterns []string, w io.Writer) error {
 		for _, d := range deps {
 			fmt.Fprintf(w, "dep %s\n", d)
 		}
+		// The module's go.mod is additional key material: its `go`
+		// directive changes emitted SSA without touching any .go file
+		// (since go1.22 the loop-variable semantics are per-module),
+		// so fold it into the file set the Rust side content-hashes.
+		// nil-safe for stdlib / no-module packages.
 		files := slices.Clone(p.CompiledGoFiles)
+		if p.Module != nil && p.Module.GoMod != "" {
+			files = append(files, p.Module.GoMod)
+		}
 		slices.Sort(files)
+		files = slices.Compact(files)
 		for _, f := range files {
 			fmt.Fprintf(w, "file %s\n", f)
 		}

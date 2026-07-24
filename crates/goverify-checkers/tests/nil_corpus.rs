@@ -88,6 +88,66 @@ fn nil_corpus_findings_match_want_comments() {
     assert_eq!(got, want, "findings vs want comments");
 }
 
+/// Runs with BOTH a cache dir and an --emit-smt dir set, returning the
+/// SCC-cache accounting so the test can prove the cache stayed off.
+fn run_with_cache_and_emit(cache_dir: std::path::PathBuf, emit: std::path::PathBuf) -> (u64, u64) {
+    let p = goverify_ir::testutil::load_corpus("nil");
+    let cfg = EngineConfig {
+        opts: Options::default(),
+        cache_dir: Some(cache_dir),
+        emit_smt: Some(emit),
+    };
+    let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&NilChecker];
+    let a = analyze_full(&p, &cfg, &checkers, &|_role| {
+        Box::new(Z3Native::new(limits()))
+    });
+    (a.scc_cache_hits, a.scc_cache_misses)
+}
+
+#[test]
+fn emit_smt_disables_scc_cache() {
+    // Finding 2 regression: --emit-smt is a debug/audit mode whose point
+    // is a COMPLETE query dump. An SCC cache hit replays without
+    // re-entering discharge, so a warm run would emit only the missed
+    // SCCs' queries. With emit_smt set, the SCC cache must be fully
+    // disabled — zero hits AND zero misses (never even constructed) —
+    // across two consecutive runs sharing the same cache dir, so the dump
+    // is always complete.
+    let cache = tempfile::tempdir().unwrap();
+    let e1 = tempfile::tempdir().unwrap();
+    let e2 = tempfile::tempdir().unwrap();
+    let (h1, m1) = run_with_cache_and_emit(cache.path().to_path_buf(), e1.path().to_path_buf());
+    let (h2, m2) = run_with_cache_and_emit(cache.path().to_path_buf(), e2.path().to_path_buf());
+    assert_eq!(
+        (h1, m1),
+        (0, 0),
+        "emit_smt must disable the SCC cache (run 1)"
+    );
+    assert_eq!(
+        (h2, m2),
+        (0, 0),
+        "emit_smt must disable the SCC cache (run 2)"
+    );
+
+    // And the two emit dirs hold the same complete file set: a warm run
+    // is not shortchanged (this is the observable consequence of the
+    // cache staying off — names are content hashes).
+    let list = |d: &std::path::Path| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        list(e1.path()),
+        list(e2.path()),
+        "both runs must emit the identical complete query set"
+    );
+    assert!(!list(e1.path()).is_empty(), "the tracer must emit queries");
+}
+
 #[test]
 fn findings_and_smt_artifacts_are_deterministic() {
     let d1 = tempfile::tempdir().unwrap();

@@ -128,6 +128,13 @@ func TestManifestListsClosureWithDepsAndFiles(t *testing.T) {
 			}
 		}
 	}
+	// The module's go.mod is folded into the file set as key material
+	// (its `go` directive changes emitted SSA without touching any .go
+	// file). It must appear as an absolute `file` line under the module.
+	goMod := filepath.Join(dir, "go.mod")
+	if !strings.Contains(out, "file "+goMod+"\n") {
+		t.Errorf("manifest missing go.mod file line %q:\n%s", goMod, out)
+	}
 	assertManifestClosureComplete(t, out)
 }
 

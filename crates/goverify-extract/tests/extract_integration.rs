@@ -264,6 +264,53 @@ fn cached_load_cold_warm_and_invalidation() {
 }
 
 #[test]
+fn editing_go_directive_invalidates_module_packages() {
+    // Finding 1 regression: the module's `go` directive (go.mod) changes
+    // emitted SSA per-module (since go1.22, loop-variable semantics)
+    // without touching any .go file. It's folded into every module
+    // package's manifest file set, so editing it must re-extract the
+    // module's own packages while stdlib (no module -> no go.mod line)
+    // stays cached.
+    let (sc, module) = sidecar_and_module();
+    let cache = tempfile::tempdir().unwrap();
+
+    let (_p1, s1) =
+        goverify_extract::load_packages_cached(&sc, module.path(), &["./..."], cache.path())
+            .expect("cold cached load");
+    assert_eq!(s1.cached, 0, "cold run extracts everything");
+
+    // Warm: fully saturated.
+    let (_p2, s2) =
+        goverify_extract::load_packages_cached(&sc, module.path(), &["./..."], cache.path())
+            .expect("warm cached load");
+    assert_eq!(s2.extracted, 0, "warm run extracts nothing");
+    assert_eq!(s2.cached, s1.extracted);
+
+    // Edit ONLY the go.mod `go` directive (byte change, no .go file
+    // touched): the two module packages (example.com/m + .../inner)
+    // must re-extract; stdlib stays cached.
+    let go_mod = module.path().join("go.mod");
+    let orig = std::fs::read_to_string(&go_mod).unwrap();
+    assert!(orig.contains("go 1.25"), "fixture go.mod shape: {orig}");
+    std::fs::write(&go_mod, orig.replace("go 1.25", "go 1.24")).unwrap();
+
+    let (_p3, s3) =
+        goverify_extract::load_packages_cached(&sc, module.path(), &["./..."], cache.path())
+            .expect("go.mod-edited cached load");
+    assert!(
+        s3.extracted >= 2,
+        "editing the go directive must re-extract the module's own packages (>=2), got {}",
+        s3.extracted
+    );
+    assert!(
+        s3.cached < s2.cached,
+        "stdlib may stay cached, but fewer packages are cached than the fully-warm run: {} !< {}",
+        s3.cached,
+        s2.cached
+    );
+}
+
+#[test]
 fn gvir_contains_no_absolute_paths() {
     let out = tempfile::tempdir().unwrap();
     let files = sidecar()

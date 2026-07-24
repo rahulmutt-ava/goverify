@@ -59,7 +59,8 @@ impl From<io::Error> for SidecarError {
 impl Sidecar {
     pub fn build(extractor_src: &Path, build_dir: &Path) -> Result<Sidecar, SidecarError> {
         let go_version = go_version()?;
-        let hash = cache_key(extractor_src, &go_version)?;
+        let build_env = go_build_env()?;
+        let hash = cache_key(extractor_src, &go_version, &build_env)?;
         let bin = build_dir.join(format!("goverify-extractor-{}", &hash[..16]));
         if !bin.exists() {
             fs::create_dir_all(build_dir)?;
@@ -240,15 +241,38 @@ fn version_from_output(ok: bool, stdout: &[u8], stderr: &[u8]) -> Result<String,
     Ok(version)
 }
 
+/// Resolves the build-affecting Go environment via `go env GOOS GOARCH
+/// GOEXPERIMENT` (one value per line), trimmed of surrounding whitespace.
+/// Folded into the sidecar cache key alongside the toolchain version:
+/// arch-dependent constants and GOEXPERIMENT-gated language changes fold
+/// into emitted SSA without touching any source file or changing the
+/// toolchain version string, so they must be key material too. Mirrors
+/// `go_version`'s probe: spawn failure -> `SidecarError::Io` via `?`; a
+/// non-zero exit -> `SidecarError::GoProbe`. Empty output is NOT an error
+/// (an unset GOEXPERIMENT legitimately yields a blank line).
+fn go_build_env() -> Result<String, SidecarError> {
+    let output = Command::new("go")
+        .args(["env", "GOOS", "GOARCH", "GOEXPERIMENT"])
+        .output()?;
+    if !output.status.success() {
+        return Err(SidecarError::GoProbe(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// The sidecar binary's cache key: blake3 over the Go toolchain version
-/// (domain-separated from the file entries below by a distinct tag and
-/// its own length prefix, so it can never collide with file content or
-/// path bytes) followed by (length-prefixed relative path, length, bytes) of every
+/// and the build-affecting Go env (`GOOS`/`GOARCH`/`GOEXPERIMENT`), each
+/// domain-separated by a distinct tag and its own length prefix (so they
+/// can never collide with each other or with file content/path bytes),
+/// followed by (length-prefixed relative path, length, bytes) of every
 /// non-hidden file in `dir`, in sorted path order.
 ///
-/// Takes `go_version` as a parameter rather than resolving it internally
-/// so the hashing logic stays unit-testable without invoking `go`.
-fn cache_key(dir: &Path, go_version: &str) -> Result<String, SidecarError> {
+/// Takes `go_version` and `build_env` as parameters rather than resolving
+/// them internally so the hashing logic stays unit-testable without
+/// invoking `go`.
+fn cache_key(dir: &Path, go_version: &str, build_env: &str) -> Result<String, SidecarError> {
     let mut files = Vec::new();
     collect_files(dir, dir, &mut files)?;
     files.sort();
@@ -256,6 +280,9 @@ fn cache_key(dir: &Path, go_version: &str) -> Result<String, SidecarError> {
     hasher.update(b"goverify-sidecar-cache-key/go-version\0");
     hasher.update(&(go_version.len() as u64).to_le_bytes());
     hasher.update(go_version.as_bytes());
+    hasher.update(b"goverify-sidecar-cache-key/build-env\0");
+    hasher.update(&(build_env.len() as u64).to_le_bytes());
+    hasher.update(build_env.as_bytes());
     for rel in &files {
         hasher.update(&(rel.len() as u64).to_le_bytes());
         hasher.update(rel.as_bytes());
@@ -293,6 +320,7 @@ mod tests {
     use super::*;
 
     const GO_VERSION: &str = "go1.25.1";
+    const BUILD_ENV: &str = "darwin\narm64\n";
 
     #[test]
     fn cache_key_is_stable_and_content_sensitive() {
@@ -301,14 +329,14 @@ mod tests {
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/b.go"), "package sub\n").unwrap();
 
-        let h1 = cache_key(dir.path(), GO_VERSION).unwrap();
-        let h2 = cache_key(dir.path(), GO_VERSION).unwrap();
+        let h1 = cache_key(dir.path(), GO_VERSION, BUILD_ENV).unwrap();
+        let h2 = cache_key(dir.path(), GO_VERSION, BUILD_ENV).unwrap();
         assert_eq!(h1, h2, "cache_key must be deterministic");
 
         std::fs::write(dir.path().join("a.go"), "package a // changed\n").unwrap();
         assert_ne!(
             h1,
-            cache_key(dir.path(), GO_VERSION).unwrap(),
+            cache_key(dir.path(), GO_VERSION, BUILD_ENV).unwrap(),
             "content change must change the hash"
         );
     }
@@ -317,9 +345,9 @@ mod tests {
     fn cache_key_ignores_hidden_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.go"), "package a\n").unwrap();
-        let h1 = cache_key(dir.path(), GO_VERSION).unwrap();
+        let h1 = cache_key(dir.path(), GO_VERSION, BUILD_ENV).unwrap();
         std::fs::write(dir.path().join(".DS_Store"), "junk").unwrap();
-        assert_eq!(h1, cache_key(dir.path(), GO_VERSION).unwrap());
+        assert_eq!(h1, cache_key(dir.path(), GO_VERSION, BUILD_ENV).unwrap());
     }
 
     #[test]
@@ -327,12 +355,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.go"), "package a\n").unwrap();
 
-        let h1 = cache_key(dir.path(), "go1.25.1").unwrap();
-        let h2 = cache_key(dir.path(), "go1.26.0").unwrap();
+        let h1 = cache_key(dir.path(), "go1.25.1", BUILD_ENV).unwrap();
+        let h2 = cache_key(dir.path(), "go1.26.0", BUILD_ENV).unwrap();
         assert_ne!(
             h1, h2,
             "same directory with a different Go version must produce a different key"
         );
+    }
+
+    #[test]
+    fn cache_key_changes_with_build_env() {
+        // Same sources + same toolchain version, but a different
+        // GOOS/GOARCH/GOEXPERIMENT must rotate the key: arch-dependent
+        // constants and experiment-gated language changes fold into the
+        // emitted SSA without touching any file or the version string.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.go"), "package a\n").unwrap();
+
+        let h1 = cache_key(dir.path(), GO_VERSION, "darwin\narm64\n").unwrap();
+        let h2 = cache_key(dir.path(), GO_VERSION, "linux\namd64\n").unwrap();
+        assert_ne!(
+            h1, h2,
+            "same sources + version but different build env must produce a different key"
+        );
+        // GOEXPERIMENT toggling (third line) must matter too.
+        let h3 = cache_key(dir.path(), GO_VERSION, "darwin\narm64\nloopvar\n").unwrap();
+        assert_ne!(h1, h3, "a GOEXPERIMENT change must rotate the key");
     }
 
     #[test]
@@ -345,8 +393,8 @@ mod tests {
         let d2 = tempfile::tempdir().unwrap();
         std::fs::write(d2.path().join("a.go"), "bx").unwrap();
         assert_ne!(
-            cache_key(d1.path(), GO_VERSION).unwrap(),
-            cache_key(d2.path(), GO_VERSION).unwrap(),
+            cache_key(d1.path(), GO_VERSION, BUILD_ENV).unwrap(),
+            cache_key(d2.path(), GO_VERSION, BUILD_ENV).unwrap(),
             "path/content boundary must be domain-separated"
         );
     }

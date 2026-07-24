@@ -2133,6 +2133,13 @@ that the extractor is now deterministic and the SCC keys are stable.
   is the extract-warm/scc-cold control at **45.0 s** (EDR-clean), which is
   the true "cold analyze" cost once the extractor exec is out of the
   critical path.
+- **Not delivered this session (read this before treating the 45.0 s control
+  as the answer):** the spec's cold-overhead-vs-~207s-baseline quantification
+  (how much the new manifest/hashing/put layers add on a genuine cold run)
+  could not be cleanly measured because the cold run was EDR-contaminated;
+  the 45.0 s extract-warm/scc-cold control is only a *partial* substitute —
+  it isolates the scc-write path and does not include the extraction-cache
+  cold overhead, so it is not the missing cold-vs-baseline number.
 - **Warm vs Task-1's denominator (21.51 s, no scc cache).** Warm3 is
   **5.41 s** — a **−16.1 s (−75 %)** reduction. The analyze phase collapses
   18.21 → 3.91 s (SCC cache absorbs all 18965 recomputations) and

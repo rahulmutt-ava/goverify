@@ -353,9 +353,9 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         func: None,
         patterns: ca.patterns.clone(),
     };
-    // Phase wall-clocks on stderr, opt-in via GOVERIFY_TIMINGS=1 (spec
-    // §6 rider 1 / G4). stderr only: stdout is the cold/warm
-    // byte-identity surface.
+    // Phase wall-clocks on stderr, opt-in by setting GOVERIFY_TIMINGS to
+    // any value (presence-checked, not compared to "1"; spec §6 rider 1 /
+    // G4). stderr only: stdout is the cold/warm byte-identity surface.
     let timings = std::env::var_os("GOVERIFY_TIMINGS").is_some();
     // Cache-root resolution (spec §9): --no-cache disables every layer
     // (extract, scc, query) by leaving cache_root at None; otherwise an

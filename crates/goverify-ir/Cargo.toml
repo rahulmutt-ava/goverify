@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 goverify-extract = { workspace = true }
+blake3.workspace = true
+prost.workspace = true
 # Regular (not dev) dependency: `testutil` below is test-only code, but it
 # lives in `src` (not `tests/`) so Tasks 8, 9, 14, and 16's integration
 # tests can share it via `goverify_ir::testutil`, which requires it to

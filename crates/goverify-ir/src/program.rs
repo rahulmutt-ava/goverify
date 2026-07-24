@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use goverify_extract::{gvir, load_package};
+use prost::Message;
 
 use crate::func::Function;
 use crate::types::TypeTable;
@@ -25,10 +26,69 @@ pub struct Program {
     func_names: Vec<String>, // FuncId → ssa id string
     by_name: HashMap<String, FuncId>,
     funcs: Vec<Option<Function>>, // FuncId → lowered body (None = external)
+    func_hashes: Vec<[u8; 32]>,   // FuncId → content hash (see func_ir_hash)
     /// Method sets of named types, keyed by the type's global TypeId,
     /// sorted entries. Used by Task 9's invoke resolution.
     pub method_sets: std::collections::BTreeMap<crate::types::TypeId, Vec<MethodInfo>>,
     diagnostics: Vec<String>,
+}
+
+/// blake3 hash over a package's non-function sections: `schema_version`,
+/// `go_version`, `extractor_version`, `import_path`, and the re-encoded
+/// `types`/`method_sets`/`files`/`pragmas` tables. Folded into every
+/// function hash in the package because a function's own encoding
+/// indexes into the package's type table — a types/method-sets change
+/// must invalidate every function in the package even though their own
+/// message bytes are unchanged.
+fn ctx_hash(pkg: &gvir::Package) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"goverify-func-ctx\0");
+    let mut field = |bytes: &[u8]| {
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    };
+    field(pkg.schema_version.as_bytes());
+    field(pkg.go_version.as_bytes());
+    field(pkg.extractor_version.as_bytes());
+    field(pkg.import_path.as_bytes());
+    for t in &pkg.types {
+        field(&t.encode_to_vec());
+    }
+    for m in &pkg.method_sets {
+        field(&m.encode_to_vec());
+    }
+    for f in &pkg.files {
+        field(&f.encode_to_vec());
+    }
+    for pr in &pkg.pragmas {
+        field(&pr.encode_to_vec());
+    }
+    *h.finalize().as_bytes()
+}
+
+/// blake3 hash of a function-with-a-body: the domain tag, its package's
+/// `ctx_hash`, and the length-prefixed `encode_to_vec()` of its own
+/// `gvir::Function` message. Function messages embed their positions, so
+/// a line shift invalidates exactly the shifted functions.
+fn func_hash(ctx: &[u8; 32], f: &gvir::Function) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"goverify-func-ir\0");
+    h.update(ctx);
+    let bytes = f.encode_to_vec();
+    h.update(&(bytes.len() as u64).to_le_bytes());
+    h.update(&bytes);
+    *h.finalize().as_bytes()
+}
+
+/// blake3 hash of an interned-but-absent (external) function: the domain
+/// tag plus its length-prefixed name only. Externals are havoc; this
+/// only pins identity.
+fn external_hash(name: &str) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"goverify-func-ext\0");
+    h.update(&(name.len() as u64).to_le_bytes());
+    h.update(name.as_bytes());
+    *h.finalize().as_bytes()
 }
 
 impl Program {
@@ -50,11 +110,32 @@ impl Program {
         for n in names {
             p.intern_func(n);
         }
-        // Pass 2: types, method sets, bodies (bodies land in Task 6).
+        // Pass 2: types, method sets, bodies. This can lazily intern
+        // further FuncIds (method-set entries and call/aux references
+        // whose target is never declared as a `gvir::Function` in any
+        // loaded package), so the hash table below is only sized once
+        // all interning from this pass is done.
         for pkg in &pkgs {
             let tmap = p.types.import_package(&pkg.types);
             p.import_method_sets(pkg, &tmap);
             p.lower_package(pkg, &tmap);
+        }
+        // Pass 3: per-function content hashes (Task 7's SCC cache key
+        // input). Every interned name defaults to a name-only external
+        // hash; functions with a `gvir::Function` entry in some package
+        // are then overwritten with a package-context + own-IR hash. If
+        // the same function id appears in more than one package, the
+        // last package processed (packages are sorted by import_path,
+        // above) wins — the same order pass 2's `set_func_body` resolves
+        // duplicates in.
+        p.func_hashes = p.func_names.iter().map(|n| external_hash(n)).collect();
+        for pkg in &pkgs {
+            let ctx = ctx_hash(pkg);
+            for f in &pkg.functions {
+                if let Some(&id) = p.by_name.get(f.id.as_str()) {
+                    p.func_hashes[id.0 as usize] = func_hash(&ctx, f);
+                }
+            }
         }
         p
     }
@@ -131,6 +212,17 @@ impl Program {
 
     pub fn lookup_func(&self, name: &str) -> Option<FuncId> {
         self.by_name.get(name).copied()
+    }
+
+    /// Stable content hash of this function's IR + its package context
+    /// (types/method-sets/files/pragmas). See phase-5a spec §2: this is
+    /// the member-hash input to the SCC cache key. Externals hash their
+    /// name only.
+    pub fn func_ir_hash(&self, id: FuncId) -> [u8; 32] {
+        self.func_hashes
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or([0u8; 32])
     }
 
     pub fn types(&self) -> &TypeTable {
@@ -229,6 +321,53 @@ mod tests {
             diags[0].contains("malformed.gvir"),
             "first diagnostic should mention malformed.gvir, got: {:?}",
             diags[0]
+        );
+    }
+
+    #[test]
+    fn func_ir_hashes_are_stable_and_content_sensitive() {
+        // Build two identical single-function packages via the same
+        // constructor the fuzz seeds use (fuzz_seeds.rs pattern), then a
+        // third with a mutated function body position.
+        fn pkg(line: u32) -> goverify_extract::gvir::Package {
+            use goverify_extract::gvir;
+            gvir::Package {
+                schema_version: goverify_extract::SCHEMA_VERSION.to_string(),
+                go_version: "go1.25.10".to_string(),
+                extractor_version: "0.1.0".to_string(),
+                import_path: "example.com/h".to_string(),
+                files: vec![],
+                types: vec![],
+                functions: vec![gvir::Function {
+                    id: "example.com/h.F".to_string(),
+                    name: "F".to_string(),
+                    r#type: 0,
+                    params: vec![],
+                    aux: vec![],
+                    blocks: vec![],
+                    pos: Some(gvir::Position {
+                        file: 0,
+                        line,
+                        col: 1,
+                    }),
+                }],
+                method_sets: vec![],
+                pragmas: vec![],
+            }
+        }
+        let p1 = Program::from_packages(vec![pkg(1)]);
+        let p2 = Program::from_packages(vec![pkg(1)]);
+        let p3 = Program::from_packages(vec![pkg(2)]);
+        let f = p1.lookup_func("example.com/h.F").expect("lookup_func");
+        assert_eq!(
+            p1.func_ir_hash(f),
+            p2.func_ir_hash(f),
+            "identical packages hash identically"
+        );
+        assert_ne!(
+            p1.func_ir_hash(f),
+            p3.func_ir_hash(f),
+            "a position change must change the hash"
         );
     }
 }

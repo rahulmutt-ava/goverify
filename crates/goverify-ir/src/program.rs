@@ -34,12 +34,27 @@ pub struct Program {
 }
 
 /// blake3 hash over a package's non-function sections: `schema_version`,
-/// `go_version`, `extractor_version`, `import_path`, and the re-encoded
-/// `types`/`method_sets`/`files`/`pragmas` tables. Folded into every
-/// function hash in the package because a function's own encoding
-/// indexes into the package's type table — a types/method-sets change
-/// must invalidate every function in the package even though their own
-/// message bytes are unchanged.
+/// `go_version`, `extractor_version`, `import_path`, the re-encoded
+/// `types`/`method_sets`/`pragmas` tables, and each file's `path` (NOT
+/// its `sha256` — see below). Folded into every function hash in the
+/// package because a function's own encoding indexes into the package's
+/// type table — a types/method-sets change must invalidate every
+/// function in the package even though their own message bytes are
+/// unchanged.
+///
+/// Files are keyed by path (and path order), not by `gvir::File.sha256`
+/// (proto/gvir/v1/gvir.proto), deliberately: a `Position.file` index and
+/// a printed finding's path are both about *which file*, so a path
+/// rename/reorder is context that must invalidate. But file *content*
+/// is not extra context here — every content change that affects
+/// analysis already surfaces in some hash this function separately
+/// folds in (the edited functions' own re-encoded messages, including
+/// their positions; `types`; `method_sets`; `pragmas`; or the synthetic
+/// `init` function for global initializers). Hashing `sha256` here would
+/// make every function in a package (including comment-only edits)
+/// invalidate on any byte in any file changing — the wave's G3
+/// acceptance gate ("edit one function → exactly its SCC + callers
+/// re-analyze") requires exactly this to not happen.
 fn ctx_hash(pkg: &gvir::Package) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(b"goverify-func-ctx\0");
@@ -58,7 +73,7 @@ fn ctx_hash(pkg: &gvir::Package) -> [u8; 32] {
         field(&m.encode_to_vec());
     }
     for f in &pkg.files {
-        field(&f.encode_to_vec());
+        field(f.path.as_bytes());
     }
     for pr in &pkg.pragmas {
         field(&pr.encode_to_vec());
@@ -234,9 +249,10 @@ impl Program {
     }
 
     /// Stable content hash of this function's IR + its package context
-    /// (types/method-sets/files/pragmas). See phase-5a spec §2: this is
-    /// the member-hash input to the SCC cache key. Externals hash their
-    /// name only.
+    /// (types/method-sets/pragmas, and files' paths — not file content;
+    /// see `ctx_hash`'s doc comment). See phase-5a spec §2: this is the
+    /// member-hash input to the SCC cache key. Externals hash their name
+    /// only.
     pub fn func_ir_hash(&self, id: FuncId) -> [u8; 32] {
         self.func_hashes
             .get(id.0 as usize)
@@ -387,6 +403,69 @@ mod tests {
             p1.func_ir_hash(f),
             p3.func_ir_hash(f),
             "a position change must change the hash"
+        );
+    }
+
+    #[test]
+    fn ctx_hash_keys_file_path_not_content() {
+        // G3 acceptance gate: a source-file byte edit (which changes its
+        // `sha256` but not its `path`) must not invalidate functions
+        // whose own IR is unchanged. A path change (rename/reorder) is
+        // real context — `Position.file` and printed findings reference
+        // files by path — and must invalidate.
+        fn pkg(path: &str, sha256: &str) -> goverify_extract::gvir::Package {
+            use goverify_extract::gvir;
+            gvir::Package {
+                schema_version: goverify_extract::SCHEMA_VERSION.to_string(),
+                go_version: "go1.25.10".to_string(),
+                extractor_version: "0.1.0".to_string(),
+                import_path: "example.com/h".to_string(),
+                files: vec![gvir::File {
+                    path: path.to_string(),
+                    sha256: sha256.to_string(),
+                }],
+                types: vec![],
+                functions: vec![gvir::Function {
+                    id: "example.com/h.F".to_string(),
+                    name: "F".to_string(),
+                    r#type: 0,
+                    params: vec![],
+                    aux: vec![],
+                    blocks: vec![],
+                    pos: Some(gvir::Position {
+                        file: 1,
+                        line: 1,
+                        col: 1,
+                    }),
+                }],
+                method_sets: vec![],
+                pragmas: vec![],
+            }
+        }
+        let same_sha = Program::from_packages(vec![pkg("h.go", "aaaa")]);
+        let edited_content = Program::from_packages(vec![pkg("h.go", "bbbb")]);
+        let renamed = Program::from_packages(vec![pkg("h2.go", "aaaa")]);
+
+        let f1 = same_sha
+            .lookup_func("example.com/h.F")
+            .expect("lookup_func same_sha");
+        let f2 = edited_content
+            .lookup_func("example.com/h.F")
+            .expect("lookup_func edited_content");
+        let f3 = renamed
+            .lookup_func("example.com/h.F")
+            .expect("lookup_func renamed");
+
+        assert_eq!(
+            same_sha.func_ir_hash(f1),
+            edited_content.func_ir_hash(f2),
+            "a file content edit (sha256 change only) must not change \
+             func_ir_hash (G3: unchanged functions must not invalidate)"
+        );
+        assert_ne!(
+            same_sha.func_ir_hash(f1),
+            renamed.func_ir_hash(f3),
+            "a file path change is real context and must change func_ir_hash"
         );
     }
 

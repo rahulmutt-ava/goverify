@@ -5,6 +5,7 @@
 //! the single entry point that renders canonical text once, consults the
 //! query cache, and falls back to the backend on a miss.
 
+mod codec;
 mod discharge;
 mod printer;
 mod process;
@@ -17,6 +18,7 @@ mod term;
 pub mod testgen;
 mod z3native;
 
+pub use codec::{TERM_CODEC_VERSION, decode_sort, decode_term, encode_sort, encode_term};
 pub use discharge::discharge_query;
 pub use printer::{Logic, Query};
 pub use process::SmtLib2Process;

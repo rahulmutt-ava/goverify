@@ -87,7 +87,7 @@ fn err(msg: impl Into<String>) -> SortError {
 }
 
 /// Bare SMT-LIB2 simple symbol — keeps the printer quoting-free.
-fn valid_symbol(s: &str) -> bool {
+pub(crate) fn valid_symbol(s: &str) -> bool {
     const EXTRA: &[char] = &[
         '~', '!', '@', '$', '%', '^', '&', '*', '_', '-', '+', '=', '<', '>', '.', '?', '/',
     ];

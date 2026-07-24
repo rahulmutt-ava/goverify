@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
 goverify-cache = { workspace = true }
 goverify-ir = { workspace = true }
 goverify-solver = { workspace = true }
@@ -20,3 +21,5 @@ goverify-extract = { workspace = true }
 # Task 10) — same join-law style as goverify-ir/goverify-solver's proptest
 # suites.
 proptest = { workspace = true }
+# scc_cache.rs `Store`-backed tests need a scratch directory.
+tempfile = { workspace = true }

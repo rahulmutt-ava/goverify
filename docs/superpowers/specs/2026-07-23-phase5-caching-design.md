@@ -121,8 +121,10 @@ inferred requires/ensures clauses are **terms**, so the solver term
 language needs a binary encode/decode (deliberately deferred in phase
 3). Term encode/decode lives in `goverify-solver` (it owns the term
 types); the SCC entry framing — versioning, findings/diagnostics
-fields, layer plumbing — lives in `goverify-cache`, keeping the crate
-boundary "cache owns bytes, not meaning" intact. The whole entry is a
+fields, layer plumbing — lives in `goverify-analysis::scc_cache`
+(goverify-cache cannot name `Summary`/`Finding`/`Term` without a
+dependency cycle); `goverify-cache` stays bytes-only, which is the
+actual boundary the crate table promises. The whole entry is a
 private versioned format (version-byte bump = full miss), like
 `CachedOutcome` — no protobuf changes; the human-readable `.gvspec` surface stays phase 6.
 Findings serialize with full trace/model text so rendering replays

@@ -92,6 +92,11 @@ impl Checker for NilChecker {
         "nil"
     }
 
+    // bump on any semantic change to this checker's clauses/obligations.
+    fn version(&self) -> u32 {
+        1
+    }
+
     fn infer_requires(
         &self,
         p: &Program,

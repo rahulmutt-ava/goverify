@@ -7,6 +7,7 @@ mod effects;
 mod encode;
 mod engine;
 mod prepass;
+mod scc_cache;
 mod summary;
 #[cfg(test)]
 mod testpkg;
@@ -23,6 +24,7 @@ pub use engine::{
     dump_prepass, dump_summaries,
 };
 pub use prepass::{Domains, value_clean};
+pub use scc_cache::{CacheConfigKey, MemberEntry, SccCache, SccEntry, decode_entry_bytes};
 pub use summary::{
     BoundClause, Clause, Formula, IfaceVar, Provenance, Summary, iface_var_name,
     instantiate_ensures, instantiate_requires,

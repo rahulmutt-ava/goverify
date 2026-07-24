@@ -53,6 +53,13 @@ pub struct TraceStep {
 pub trait Checker: Sync {
     fn name(&self) -> &'static str;
 
+    /// Cache-key version of this checker's semantics (phase-5a spec
+    /// §2). Bump on any change to the clauses or obligations it
+    /// produces; stale entries otherwise replay old findings.
+    fn version(&self) -> u32 {
+        1
+    }
+
     /// Derive `f`'s own preconditions from its body. `discharge` lets
     /// the checker consult the solver without owning any backend/cache
     /// plumbing (the engine owns that, Task 12); a checker must only

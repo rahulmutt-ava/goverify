@@ -210,7 +210,7 @@ fn run_debug(what: DebugWhat) -> Result<(), Box<dyn std::error::Error>> {
     if args.func.is_some() && matches!(kind, "callgraph" | "sccs") {
         eprintln!("goverify: --func has no effect on `debug {kind}`; ignoring");
     }
-    let program = load_program(&args)?;
+    let program = load_program(Path::new("."), &args)?;
     for d in program.diagnostics() {
         eprintln!("goverify: {d}");
     }
@@ -257,11 +257,15 @@ fn run_debug(what: DebugWhat) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Shared gvir-dir resolution: an explicit `--gvir-dir` is loaded as-is;
-/// otherwise extract the current directory into a fresh temp dir first
-/// (the tempdir is cleaned up once this function returns, after
-/// `Program::load_dir` has already copied everything it needs into
-/// memory).
-fn load_program(args: &DebugArgs) -> Result<goverify_ir::Program, Box<dyn std::error::Error>> {
+/// otherwise extract `dir` into a fresh temp dir first (the tempdir is
+/// cleaned up once this function returns, after `Program::load_dir` has
+/// already copied everything it needs into memory). Debug-command call
+/// sites are all cwd-bound (`Path::new(".")`); `acquire_program` passes
+/// its caller-supplied `dir` through instead.
+fn load_program(
+    dir: &Path,
+    args: &DebugArgs,
+) -> Result<goverify_ir::Program, Box<dyn std::error::Error>> {
     let mut _tmp: Option<tempfile::TempDir> = None; // keep tempdir alive
     let gvir_dir = match &args.gvir_dir {
         Some(d) => d.clone(),
@@ -269,7 +273,7 @@ fn load_program(args: &DebugArgs) -> Result<goverify_ir::Program, Box<dyn std::e
             let sidecar = Sidecar::build(&extractor_dir()?, &sidecar_build_dir())?;
             let tmp = tempfile::tempdir()?;
             let patterns: Vec<&str> = args.patterns.iter().map(String::as_str).collect();
-            sidecar.extract(Path::new("."), &patterns, tmp.path())?;
+            sidecar.extract(dir, &patterns, tmp.path())?;
             let d = tmp.path().to_path_buf();
             _tmp = Some(tmp);
             d
@@ -341,7 +345,7 @@ fn run_findings(fa: FindingsArgs) -> Result<(), Box<dyn std::error::Error>> {
     if fa.common.func.is_some() {
         eprintln!("goverify: --func has no effect on `debug findings`; ignoring");
     }
-    let program = load_program(&fa.common)?;
+    let program = load_program(Path::new("."), &fa.common)?;
     for d in program.diagnostics() {
         eprintln!("goverify: {d}");
     }
@@ -377,10 +381,11 @@ fn run_findings(fa: FindingsArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// resolution, program acquisition (extraction cache when available),
 /// the engine run, and module scoping. Returns the SCOPED findings in
 /// render order plus the pieces `--diff-base` (spec §5) needs.
-#[allow(dead_code)] // program/cache_root: consumed by --diff-base (Task 5) and Task 10.
 struct Analyzed {
+    #[allow(dead_code)] // consumed by --diff-base (Task 5) and Task 10.
     program: goverify_ir::Program,
     scoped: Vec<goverify_analysis::Finding>,
+    #[allow(dead_code)] // consumed by --diff-base (Task 5) and Task 10.
     cache_root: Option<PathBuf>,
     timings: bool,
 }
@@ -519,7 +524,7 @@ fn acquire_program(
     // otherwise extract through the cache and fall back to plain
     // extraction on any cache failure (degrade, never die).
     match (gvir_dir, cache_root) {
-        (Some(_), _) | (None, None) => load_program(&dargs),
+        (Some(_), _) | (None, None) => load_program(dir, &dargs),
         (None, Some(root)) => {
             let sidecar = Sidecar::build(&extractor_dir()?, &sidecar_build_dir())?;
             let patterns: Vec<&str> = patterns.iter().map(String::as_str).collect();
@@ -535,7 +540,7 @@ fn acquire_program(
                 }
                 Err(e) => {
                     eprintln!("goverify: extraction cache unavailable ({e}); extracting uncached");
-                    load_program(&dargs)
+                    load_program(dir, &dargs)
                 }
             }
         }

@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use goverify_extract::Sidecar;
 use goverify_solver::TextSolver;
 
+mod diff;
 mod json;
 mod render;
 mod sarif;
@@ -117,6 +118,11 @@ struct CheckArgs {
     /// Ignore any baseline file.
     #[arg(long)]
     no_baseline: bool,
+    /// Report only findings in functions changed since this git ref, or
+    /// in their transitive callers (spec §10). Analysis still covers
+    /// everything; only the report is scoped. Requires git.
+    #[arg(long, value_name = "GIT_REF")]
+    diff_base: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -390,10 +396,8 @@ fn run_findings(fa: FindingsArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// the engine run, and module scoping. Returns the SCOPED findings in
 /// render order plus the pieces `--diff-base` (spec §5) needs.
 struct Analyzed {
-    #[allow(dead_code)] // consumed by --diff-base (Task 5) and Task 10.
     program: goverify_ir::Program,
     scoped: Vec<goverify_analysis::Finding>,
-    #[allow(dead_code)] // consumed by --diff-base (Task 5) and Task 10.
     cache_root: Option<PathBuf>,
     timings: bool,
 }
@@ -607,14 +611,54 @@ fn apply_baseline(
 }
 
 fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let a = analyze_module(&ca)?;
+    let Analyzed {
+        program,
+        scoped,
+        cache_root,
+        timings,
+    } = analyze_module(&ca)?;
     let t_render = std::time::Instant::now();
-    let fps = goverify_cli::fingerprint::fingerprints(&a.scoped);
-    let (scoped, fps, suppressed) = apply_baseline(&ca, a.scoped, fps)?;
+    // Filter order (spec §5): scope (already applied) -> diff-base ->
+    // fingerprints -> baseline. Fingerprint ordinals are stable across
+    // this: diff-base filters whole functions, so identical-sibling
+    // groups never split (spec §2).
+    let (scoped, diff_base_scoped) = match &ca.diff_base {
+        None => (scoped, false),
+        Some(git_ref) => {
+            let base = diff::checkout_base(Path::new("."), git_ref)?;
+            let base_prog = acquire_program(
+                &base.module_dir,
+                None,
+                &ca.patterns,
+                cache_root.as_ref(),
+                timings,
+            )
+            .map_err(|e| format!("--diff-base: extracting {git_ref:?}: {e}"))?;
+            let changed = diff::changed_funcs(&program, &base_prog);
+            let g = goverify_ir::CallGraph::build(&program);
+            let keep = g.callers_closure(&changed);
+            let kept: Vec<goverify_analysis::Finding> = scoped
+                .into_iter()
+                .filter(|f| {
+                    // A finding whose function isn't in the current
+                    // program is kept (conservative: never hide by
+                    // accident).
+                    program
+                        .lookup_func(&f.func)
+                        .is_none_or(|id| keep.contains(&id))
+                })
+                .collect();
+            (kept, true)
+            // `base` drops here: worktree removed on success and (via
+            // Drop) on every error path above.
+        }
+    };
+    let fps = goverify_cli::fingerprint::fingerprints(&scoped);
+    let (scoped, fps, suppressed) = apply_baseline(&ca, scoped, fps)?;
     let summary = json::Summary {
         total: scoped.len(),
         suppressed_by_baseline: suppressed,
-        diff_base_scoped: false,
+        diff_base_scoped,
     };
     match ca.format {
         OutputFormat::Human => {
@@ -626,7 +670,7 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         OutputFormat::Json => print!("{}", json::render_json(&scoped, &fps, &summary)),
         OutputFormat::Sarif => print!("{}", sarif::render_sarif(&scoped, &fps, suppressed)),
     }
-    if a.timings {
+    if timings {
         eprintln!(
             "goverify: timing: scope+render {:.2}s",
             t_render.elapsed().as_secs_f64()
@@ -644,9 +688,9 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 /// success regardless of finding count — recording findings is the
 /// point.
 fn run_baseline_write(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    if ca.baseline.is_some() || ca.no_baseline {
+    if ca.baseline.is_some() || ca.no_baseline || ca.diff_base.is_some() {
         return Err("baseline write records the full finding set; \
-                    --baseline/--no-baseline do not apply"
+                    --baseline/--no-baseline/--diff-base do not apply"
             .into());
     }
     let a = analyze_module(&ca)?;

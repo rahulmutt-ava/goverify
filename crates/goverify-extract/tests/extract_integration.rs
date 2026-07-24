@@ -21,18 +21,29 @@ fn sidecar() -> Sidecar {
 
 /// Same fixture shape as `manifest_returns_closure_with_deps_and_files`
 /// (a module importing "strings"), but copied into a scratch tempdir so
-/// tests can edit `main.go` in place without mutating the checked-in
-/// corpus fixture.
+/// tests can edit files in place without mutating the checked-in corpus
+/// fixture. Two local packages — root `example.com/m` and a subpackage
+/// `example.com/m/inner` that root imports — so cache-invalidation
+/// tests can exercise upward-closure through a local dep edge (not just
+/// the root-has-no-importers case): root also imports "strings"
+/// directly, giving both packages a shared stdlib dependency that must
+/// stay cached regardless of which local file is edited.
 fn sidecar_and_module() -> (Sidecar, tempfile::TempDir) {
     let module = tempfile::tempdir().unwrap();
     std::fs::write(
         module.path().join("go.mod"),
-        "module example.com/withdeps\n\ngo 1.25\n",
+        "module example.com/m\n\ngo 1.25\n",
     )
     .unwrap();
     std::fs::write(
         module.path().join("main.go"),
-        "package withdeps\n\nimport \"strings\"\n\nfunc Shout(s string) string { return strings.ToUpper(s) + \"!\" }\n",
+        "package m\n\nimport (\n\t\"strings\"\n\n\t\"example.com/m/inner\"\n)\n\nfunc Shout(s string) string { return strings.ToUpper(s) + \"!\" }\n\nfunc UseInner(s string) string { return inner.Wrap(s) }\n",
+    )
+    .unwrap();
+    std::fs::create_dir(module.path().join("inner")).unwrap();
+    std::fs::write(
+        module.path().join("inner/inner.go"),
+        "package inner\n\nimport \"strings\"\n\nfunc Wrap(s string) string { return strings.ToLower(s) + \"?\" }\n",
     )
     .unwrap();
     (sidecar(), module)
@@ -167,8 +178,9 @@ fn cached_load_cold_warm_and_invalidation() {
         "cached packages decode identically to freshly extracted ones"
     );
 
-    // Edit the module's own file: only the root package re-extracts
-    // (stdlib deps stay cached — nothing imports the root).
+    // Edit the module's own root file: only the root package re-extracts
+    // (stdlib deps and the local `inner` subpackage stay cached — root
+    // has no importers, and nothing root depends on changed).
     let main_go = module.path().join("main.go");
     let src = std::fs::read_to_string(&main_go).unwrap();
     std::fs::write(&main_go, src.replace("ToUpper", "ToLower")).unwrap();
@@ -180,6 +192,23 @@ fn cached_load_cold_warm_and_invalidation() {
         "exactly the edited leaf-of-import-DAG package re-extracts"
     );
     assert_eq!(s3.cached, s1.extracted - 1);
+
+    // Edit the local dependency `inner`: upward closure means BOTH inner
+    // (content changed) and root (its recursive key folds inner's key,
+    // which just changed) re-extract — exactly those two, nothing more.
+    // stdlib ("strings", imported by both root and inner) is untouched
+    // by either edit and must stay cached throughout.
+    let inner_go = module.path().join("inner/inner.go");
+    let inner_src = std::fs::read_to_string(&inner_go).unwrap();
+    std::fs::write(&inner_go, inner_src.replace("+ \"?\"", "+ \"??\"")).unwrap();
+    let (_pkgs4, s4) =
+        goverify_extract::load_packages_cached(&sc, module.path(), &["./..."], cache.path())
+            .expect("inner-edited cached load");
+    assert_eq!(
+        s4.extracted, 2,
+        "upward closure: editing inner re-extracts inner + root, nothing else"
+    );
+    assert_eq!(s4.cached, s1.extracted - 2, "stdlib closure stays cached");
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Extraction-cache orchestration (phase-5a spec §3): manifest ->
 //! recursive import-DAG keys -> store hits + dirty-set extraction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use goverify_cache::Store;
@@ -136,15 +136,37 @@ pub fn load_packages_cached(
         }
     }
     if !dirty.is_empty() {
+        // Consumed as fresh artifacts are matched to their requested
+        // import path below: a `remove` that returns `false` catches
+        // both "the extractor emitted a package we never asked for"
+        // and "the extractor emitted the same package twice" in one
+        // check, since either way the path is no longer in the set the
+        // second time it's seen.
+        let mut dirty_set: HashSet<&str> = dirty.iter().copied().collect();
         let out = tempfile::tempdir().map_err(SidecarError::Io)?;
         let files = sc.extract_only(module_dir, &dirty, out.path())?;
         for f in &files {
             let bytes = std::fs::read(f).map_err(SidecarError::Io)?;
-            let Ok(pkg) = load_package_bytes(&bytes) else {
-                // Undecodable fresh artifact: skip (extract's own
-                // diagnostics already went to stderr).
-                continue;
+            let pkg = match load_package_bytes(&bytes) {
+                Ok(pkg) => pkg,
+                Err(e) => {
+                    // Skip WITH a diagnostic (spec §11: degrade, never
+                    // die — silently is not the same as silently
+                    // dropping a manifest entry without a trace).
+                    eprintln!(
+                        "goverify: extract cache: skipping undecodable artifact {}: {e}",
+                        f.display()
+                    );
+                    continue;
+                }
             };
+            if !dirty_set.remove(pkg.import_path.as_str()) {
+                eprintln!(
+                    "goverify: extract cache: skipping unexpected package {} (not in the requested dirty set, or a duplicate)",
+                    pkg.import_path
+                );
+                continue;
+            }
             if let Some(key) = keys.get(&pkg.import_path) {
                 // Write failure degrades to slower, never wrong.
                 let _ = store.put(LAYER, key, &bytes);

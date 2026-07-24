@@ -8,6 +8,10 @@ license.workspace = true
 name = "goverify"
 path = "src/main.rs"
 
+[lib]
+name = "goverify_cli"
+path = "src/lib.rs"
+
 [dependencies]
 clap.workspace = true
 goverify-extract.workspace = true
@@ -16,3 +20,6 @@ goverify-analysis.workspace = true
 goverify-checkers.workspace = true
 goverify-solver.workspace = true
 tempfile.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true

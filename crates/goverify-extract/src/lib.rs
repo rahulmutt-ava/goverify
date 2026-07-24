@@ -6,8 +6,10 @@ pub mod gvir {
     include!(concat!(env!("OUT_DIR"), "/gvir.v1.rs"));
 }
 
+mod cached;
 mod load;
 mod sidecar;
 
-pub use load::{LoadError, SCHEMA_VERSION, load_package};
+pub use cached::{ExtractStats, load_packages_cached};
+pub use load::{LoadError, SCHEMA_VERSION, load_package, load_package_bytes};
 pub use sidecar::{ManifestPkg, Sidecar, SidecarError};

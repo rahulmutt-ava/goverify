@@ -30,11 +30,10 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-pub fn load_package(path: &Path) -> Result<gvir::Package, LoadError> {
+pub fn load_package_bytes(bytes: &[u8]) -> Result<gvir::Package, LoadError> {
     use prost::Message;
 
-    let bytes = std::fs::read(path).map_err(LoadError::Io)?;
-    let pkg = gvir::Package::decode(bytes.as_slice()).map_err(LoadError::Decode)?;
+    let pkg = gvir::Package::decode(bytes).map_err(LoadError::Decode)?;
     if pkg.schema_version != SCHEMA_VERSION {
         return Err(LoadError::SchemaVersion {
             found: pkg.schema_version,
@@ -42,6 +41,10 @@ pub fn load_package(path: &Path) -> Result<gvir::Package, LoadError> {
         });
     }
     Ok(pkg)
+}
+
+pub fn load_package(path: &Path) -> Result<gvir::Package, LoadError> {
+    load_package_bytes(&std::fs::read(path).map_err(LoadError::Io)?)
 }
 
 #[cfg(test)]

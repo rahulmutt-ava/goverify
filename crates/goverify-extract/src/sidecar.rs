@@ -108,29 +108,33 @@ impl Sidecar {
     ) -> Result<Vec<PathBuf>, SidecarError> {
         fs::create_dir_all(out_dir)?;
         let out_abs = out_dir.canonicalize()?;
-        let output = Command::new(&self.bin)
-            .arg("-out")
+        let mut cmd = Command::new(&self.bin);
+        cmd.arg("-out")
             .arg(&out_abs)
             .args(patterns)
-            .current_dir(module_dir)
-            .output()?;
-        if !output.status.success() {
-            return Err(SidecarError::Extractor(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ));
-        }
-        // Forward the extractor's degrade diagnostics ("goverify: skipping
-        // <pkg>: <err>") to our stderr; otherwise they vanish even though
-        // extraction succeeded (spec §11: degrade, never die — silently).
-        if !output.stderr.is_empty() {
-            eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        }
-        let mut files: Vec<PathBuf> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(PathBuf::from)
-            .collect();
-        files.sort();
-        Ok(files)
+            .current_dir(module_dir);
+        run_extractor(cmd)
+    }
+
+    /// Extract exactly `import_paths` (no dependency walk): passes the
+    /// extractor's existing -deps=false. Callers must pass an
+    /// upward-closed dirty set (phase-5a spec §3) — dep types come from
+    /// Go's export data, not from re-extraction.
+    pub fn extract_only(
+        &self,
+        module_dir: &Path,
+        import_paths: &[&str],
+        out_dir: &Path,
+    ) -> Result<Vec<PathBuf>, SidecarError> {
+        fs::create_dir_all(out_dir)?;
+        let out_abs = out_dir.canonicalize()?;
+        let mut cmd = Command::new(&self.bin);
+        cmd.arg("-out")
+            .arg(&out_abs)
+            .arg("-deps=false")
+            .args(import_paths)
+            .current_dir(module_dir);
+        run_extractor(cmd)
     }
 
     /// go-list-level closure enumeration (no type-checking). Parses the
@@ -181,6 +185,32 @@ impl Sidecar {
         }
         Ok(pkgs)
     }
+}
+
+/// Runs a prepared extractor `Command` (either `extract`'s or
+/// `extract_only`'s, differing only in their args) and handles its
+/// output uniformly: non-zero exit -> `SidecarError::Extractor`;
+/// otherwise forward the extractor's degrade diagnostics ("goverify:
+/// skipping <pkg>: <err>") to our stderr so they don't vanish even
+/// though extraction succeeded (spec §11: degrade, never die —
+/// silently), and parse stdout's lines as the sorted list of written
+/// .gvir paths.
+fn run_extractor(mut cmd: Command) -> Result<Vec<PathBuf>, SidecarError> {
+    let output = cmd.output()?;
+    if !output.status.success() {
+        return Err(SidecarError::Extractor(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+    let mut files: Vec<PathBuf> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(PathBuf::from)
+        .collect();
+    files.sort();
+    Ok(files)
 }
 
 /// Resolves the Go toolchain version via `go env GOVERSION` (output like

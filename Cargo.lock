@@ -357,6 +357,7 @@ name = "goverify-extract"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "goverify-cache",
  "prost",
  "prost-build",
  "tempfile",

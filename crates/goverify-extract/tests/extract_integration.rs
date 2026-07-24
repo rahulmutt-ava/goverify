@@ -19,6 +19,25 @@ fn sidecar() -> Sidecar {
         .expect("Sidecar::build")
 }
 
+/// Same fixture shape as `manifest_returns_closure_with_deps_and_files`
+/// (a module importing "strings"), but copied into a scratch tempdir so
+/// tests can edit `main.go` in place without mutating the checked-in
+/// corpus fixture.
+fn sidecar_and_module() -> (Sidecar, tempfile::TempDir) {
+    let module = tempfile::tempdir().unwrap();
+    std::fs::write(
+        module.path().join("go.mod"),
+        "module example.com/withdeps\n\ngo 1.25\n",
+    )
+    .unwrap();
+    std::fs::write(
+        module.path().join("main.go"),
+        "package withdeps\n\nimport \"strings\"\n\nfunc Shout(s string) string { return strings.ToUpper(s) + \"!\" }\n",
+    )
+    .unwrap();
+    (sidecar(), module)
+}
+
 #[test]
 fn extracts_and_loads_hello_module() {
     let out = tempfile::tempdir().unwrap();
@@ -123,6 +142,44 @@ fn manifest_returns_closure_with_deps_and_files() {
     // Closure includes deps: the fixture module imports "strings".
     assert!(pkgs.iter().any(|p| p.import_path == "strings"));
     assert!(root.deps.contains(&"strings".to_string()));
+}
+
+#[test]
+fn cached_load_cold_warm_and_invalidation() {
+    let (sc, module) = sidecar_and_module(); // same fixture as the manifest test
+    let cache = tempfile::tempdir().unwrap();
+
+    // Cold: everything extracted, store populated.
+    let (pkgs1, s1) =
+        goverify_extract::load_packages_cached(&sc, module.path(), &["./..."], cache.path())
+            .expect("cold cached load");
+    assert_eq!(s1.cached, 0, "cold run extracts everything");
+    assert!(s1.extracted >= 2, "root + at least one dep in the closure");
+
+    // Warm: zero extraction, identical packages.
+    let (pkgs2, s2) =
+        goverify_extract::load_packages_cached(&sc, module.path(), &["./..."], cache.path())
+            .expect("warm cached load");
+    assert_eq!(s2.extracted, 0, "warm run extracts nothing");
+    assert_eq!(s2.cached, s1.extracted);
+    assert_eq!(
+        pkgs1, pkgs2,
+        "cached packages decode identically to freshly extracted ones"
+    );
+
+    // Edit the module's own file: only the root package re-extracts
+    // (stdlib deps stay cached — nothing imports the root).
+    let main_go = module.path().join("main.go");
+    let src = std::fs::read_to_string(&main_go).unwrap();
+    std::fs::write(&main_go, src.replace("ToUpper", "ToLower")).unwrap();
+    let (_pkgs3, s3) =
+        goverify_extract::load_packages_cached(&sc, module.path(), &["./..."], cache.path())
+            .expect("edited cached load");
+    assert_eq!(
+        s3.extracted, 1,
+        "exactly the edited leaf-of-import-DAG package re-extracts"
+    );
+    assert_eq!(s3.cached, s1.extracted - 1);
 }
 
 #[test]

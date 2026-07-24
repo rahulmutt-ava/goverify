@@ -474,6 +474,21 @@ func GlobalElemOffset(base uintptr) uintptr {
 	return elemOffset(base, 16, unboundedN) // want: overflow
 }
 
+// unboundedN32 mirrors unboundedN at a narrower width so the call below
+// must route through a widening int32->int Convert.
+var unboundedN32 int32
+
+// ConvertWidenedElemOffset pins the 4A Convert path on a non-liftable
+// shape (wave-2 spec §4 item 2's narrow claim): the multiplier reaches
+// elemOffset through a widening Convert whose SOURCE is a global load,
+// so the obligation cannot lift into inferred requires, and 4A's
+// int->int source-range assertion must not discharge an genuinely
+// unbounded multiplication. If this pin ever goes silent, 4A has
+// started over-suppressing through widening Converts.
+func ConvertWidenedElemOffset(base uintptr) uintptr {
+	return elemOffset(base, 16, int(unboundedN32)) // want: overflow
+}
+
 // fix-wave fix 3 (green): the nil-deref manifestation of mechanism
 // group 3 — a method with an inferred non-nil-receiver requirement is
 // called on a pointer minted from uintptr arithmetic (bbolt C001's

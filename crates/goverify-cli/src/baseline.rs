@@ -31,6 +31,11 @@ pub struct BaselineEntry {
 /// Deterministic baseline text: entries sorted by fingerprint, pretty
 /// JSON, trailing newline. `fps` is parallel to `findings`.
 pub fn render(findings: &[Finding], fps: &[String]) -> String {
+    debug_assert_eq!(
+        findings.len(),
+        fps.len(),
+        "baseline::render: findings/fps length mismatch would silently truncate the baseline via zip"
+    );
     let mut entries: Vec<BaselineEntry> = findings
         .iter()
         .zip(fps)

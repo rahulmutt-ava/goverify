@@ -17,6 +17,12 @@ use crate::summary::{Clause, Summary};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Obligation {
     pub tag: String,
+    /// Human-readable description of the candidate violation. INVARIANT:
+    /// must never embed a source position — `pos` below is the sole
+    /// carrier of that. `Finding::message` (derived from this) is
+    /// hashed into finding fingerprints (goverify-cli fingerprint.rs)
+    /// on the assumption that it is position-independent; a position
+    /// baked into the text would churn baselines on every line shift.
     pub message: String,
     pub pos: Option<Pos>,
     pub query: Query,
@@ -30,6 +36,11 @@ pub struct Finding {
     pub tag: String,
     pub func: String,
     pub pos: Option<Pos>,
+    /// INVARIANT: must never contain a source position — `pos` above is
+    /// the sole carrier of that. Finding fingerprints (goverify-cli
+    /// fingerprint.rs) hash this field on the assumption that it is
+    /// position-independent; a position embedded here would churn
+    /// baselines on every line shift.
     pub message: String,
     /// The path that leads to the violation (phase-4 spec §10). Filled in
     /// by Task 10; every `Finding` before then carries an empty trace.

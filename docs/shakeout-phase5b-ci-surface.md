@@ -196,8 +196,8 @@ to fail.**
   `.goverify/baseline.json`); subsequent `goverify check ./...` runs
   report only *new* findings and exit 0 once nothing new appears (G3).
 - **PR-scoped CI:** `goverify check --diff-base <base-ref> ./...`
-  restricts the report to findings reachable from functions that
-  changed since `<base-ref>`, using function-IR hash comparison rather
+  restricts the report to functions changed since `<base-ref>`, or in
+  their transitive callers, using function-IR hash comparison rather
   than line ranges — so comment/whitespace-only diffs report nothing
   (G4a) and genuine semantic changes report exactly the affected
   closure (G4b), never the whole-repo baseline.

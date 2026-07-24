@@ -70,7 +70,7 @@ pub fn checkout_base(module_dir: &Path, git_ref: &str) -> Result<BaseCheckout, S
             &format!("{git_ref}^{{commit}}"),
         ],
     )
-    .map_err(|_| format!("--diff-base: unknown git ref {git_ref:?}"))?;
+    .map_err(|e| format!("--diff-base: cannot resolve {git_ref:?}: {e}"))?;
     // The module may sit below the repo root; mirror that inside the
     // worktree.
     let prefix = git(module_dir, &["rev-parse", "--show-prefix"])?;

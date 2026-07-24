@@ -101,8 +101,8 @@ goverify check --diff-base origin/main ./...   # PR-scoped report
 cold/warm cache runs and emit no absolute paths. `baseline write`
 records the current finding set; a later `check` reports only findings
 absent from the baseline (exit 0 once fully suppressed). `--diff-base
-<rev>` restricts the report to functions reachable from those changed
-since `<rev>` (comment-only edits report nothing).
+<rev>` restricts the report to functions changed since `<rev>`, or in
+their transitive callers (comment-only edits report nothing).
 
 ## Development
 

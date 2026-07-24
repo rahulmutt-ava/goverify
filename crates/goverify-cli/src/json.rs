@@ -45,6 +45,11 @@ struct JsonTraceStep<'a> {
 
 /// `fps` is parallel to `findings` (fingerprint::fingerprints).
 pub fn render_json(findings: &[Finding], fps: &[String], summary: &Summary) -> String {
+    debug_assert_eq!(
+        findings.len(),
+        fps.len(),
+        "render_json: findings/fps length mismatch would silently truncate the report via zip"
+    );
     let findings: Vec<JsonFinding> = findings
         .iter()
         .zip(fps)

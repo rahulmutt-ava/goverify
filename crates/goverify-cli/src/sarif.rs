@@ -82,6 +82,11 @@ struct SarifResult<'a> {
     code_flows: Option<[CodeFlow<'a>; 1]>,
 }
 
+// The `goverify/v1` key below is NOT derived from `fingerprint::SCHEME`
+// at runtime (renaming a serde field to a computed string would need a
+// custom Serialize impl, and this key is part of the pinned SARIF
+// byte output). Keep the two in sync by hand; `partial_fingerprints_key_matches_scheme`
+// below fails the build the day they drift.
 #[derive(Serialize)]
 struct PartialFingerprints<'a> {
     #[serde(rename = "goverify/v1")]
@@ -141,8 +146,12 @@ fn location(p: &goverify_ir::Pos) -> Location<'_> {
     }
 }
 
-/// Finding message + model bindings, matching the human renderer's
-/// `with:` line so both surfaces read the same.
+/// Finding message + model bindings, in the same `with:`-line shape the
+/// human renderer uses. Not a byte-for-byte match, though: per spec §3,
+/// machine formats deliberately carry raw values and rely on JSON
+/// string escaping, whereas the human renderer sanitizes for a
+/// terminal — the two surfaces can render the same model binding
+/// differently.
 fn message_text(f: &Finding) -> String {
     if f.model.is_empty() {
         return f.message.clone();
@@ -153,6 +162,11 @@ fn message_text(f: &Finding) -> String {
 
 /// `fps` is parallel to `findings` (fingerprint::fingerprints).
 pub fn render_sarif(findings: &[Finding], fps: &[String], suppressed_by_baseline: usize) -> String {
+    debug_assert_eq!(
+        findings.len(),
+        fps.len(),
+        "render_sarif: findings/fps length mismatch would silently truncate the report via zip"
+    );
     let results: Vec<SarifResult> = findings
         .iter()
         .zip(fps)
@@ -275,6 +289,19 @@ mod tests {
             "no provenance"
         );
         assert!(!got.contains("\"/"), "no absolute paths: {got}");
+    }
+
+    #[test]
+    fn partial_fingerprints_key_matches_scheme() {
+        // The literal `#[serde(rename = "goverify/v1")]` above must stay
+        // in lock-step with `fingerprint::SCHEME` (F4, phase5b review):
+        // a future SCHEME bump that forgets this rename would silently
+        // decouple the SARIF key from the value's scheme prefix.
+        assert_eq!(
+            "goverify/v1",
+            format!("goverify/{}", goverify_cli::fingerprint::SCHEME),
+            "partialFingerprints key must be goverify/<fingerprint::SCHEME>"
+        );
     }
 
     #[test]

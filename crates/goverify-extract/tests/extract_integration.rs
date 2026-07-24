@@ -104,6 +104,58 @@ fn extraction_is_byte_identical_across_runs() {
     }
 }
 
+/// Regression guard for the cross-package type-alias determinism bug:
+/// the aliasgen fixture instantiates one generic (shared.Reduce) from two
+/// packages that spell the same underlying element type differently — one
+/// via a cross-package alias (pkgalias.Entry = base.U), one named
+/// (base.U). Before the extractor canonicalized alias spellings, the
+/// shared ssa instance recorded whichever spelling won the concurrent
+/// type-check race, so re-extraction flipped its bytes (~1-in-4 runs) —
+/// the same mechanism that flipped bbolt's io/fs.gvir and os.gvir. The
+/// closure includes both instantiating packages in one load, so this is
+/// exactly the shape the hello-only determinism test could not catch.
+#[test]
+fn aliased_generic_instance_extraction_is_byte_identical() {
+    let sc = sidecar();
+    let aliasgen = repo_root().join("testdata/corpus/aliasgen");
+    let (out1, out2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+
+    let files1 = sc.extract(&aliasgen, &["./..."], out1.path()).unwrap();
+    let files2 = sc.extract(&aliasgen, &["./..."], out2.path()).unwrap();
+    assert_eq!(files1.len(), files2.len(), "file sets must match");
+
+    for (a, b) in files1.iter().zip(&files2) {
+        assert_eq!(a.file_name(), b.file_name(), "file sets must match");
+        assert_eq!(
+            std::fs::read(a).unwrap(),
+            std::fs::read(b).unwrap(),
+            "nondeterministic .gvir bytes (alias-spelling flip): {}",
+            a.display()
+        );
+    }
+
+    // The canonical underlying spelling must reach output; the alias must
+    // not. Load pkgalias and assert its emitted callee names never carry
+    // the alias spelling (deterministic post-fix, independent of the race).
+    let alias_pkg = files1
+        .iter()
+        .find(|f| {
+            f.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("pkgalias")
+        })
+        .expect("pkgalias.gvir emitted");
+    let pkg = load_package(alias_pkg).expect("load_package");
+    for f in &pkg.functions {
+        assert!(
+            !f.id.contains("pkgalias.Entry") && !f.name.contains("pkgalias.Entry"),
+            "alias spelling leaked into function id/name: {}",
+            f.id
+        );
+    }
+}
+
 #[test]
 fn dependency_traversal_extracts_the_import_closure() {
     let out = tempfile::tempdir().unwrap();

@@ -273,6 +273,87 @@ func TestDeterministicBytesAcrossRuns(t *testing.T) {
 	}
 }
 
+// TestAliasCanonicalization pins the root-invariant fix: when a generic
+// function is instantiated from two packages that spell the same
+// underlying element type differently — one via a cross-package alias
+// (pkgalias.Entry = base.U), one via the named type (base.U) — every
+// emitted id/name/callee/type-repr must render the canonical underlying
+// spelling (base.U), never the alias. Otherwise the shared *ssa.Function
+// instance's raced type-arg spelling leaks into the bytes and flips
+// run-to-run under concurrent loading (the bbolt io/fs.gvir/os.gvir bug).
+func TestAliasCanonicalization(t *testing.T) {
+	pkgs := extractCorpus(t, "../testdata/corpus/aliasgen", true)
+
+	const aliasSpelling = "pkgalias.Entry"
+	const canonCallee = "example.com/aliasgen/shared.Reduce[example.com/aliasgen/base.U]"
+	sawAlias, sawCanon := false, false
+	for _, p := range pkgs {
+		for _, ty := range p.GetTypes() {
+			if strings.Contains(ty.GetRepr(), aliasSpelling) {
+				sawAlias = true
+			}
+		}
+		for _, f := range p.GetFunctions() {
+			if strings.Contains(f.GetId(), aliasSpelling) || strings.Contains(f.GetName(), aliasSpelling) {
+				sawAlias = true
+			}
+			for _, a := range f.GetAux() {
+				if strings.Contains(a.GetRepr(), aliasSpelling) {
+					sawAlias = true
+				}
+				if strings.Contains(a.GetRepr(), canonCallee) {
+					sawCanon = true
+				}
+			}
+			for _, b := range f.GetBlocks() {
+				for _, ins := range b.GetInstrs() {
+					if c := ins.GetCall(); c != nil {
+						if strings.Contains(c.GetStaticCallee(), aliasSpelling) {
+							sawAlias = true
+						}
+						if strings.Contains(c.GetStaticCallee(), canonCallee) {
+							sawCanon = true
+						}
+					}
+				}
+			}
+		}
+	}
+	if sawAlias {
+		t.Errorf("alias spelling %q leaked into emitted output; canonicalization failed", aliasSpelling)
+	}
+	if !sawCanon {
+		t.Errorf("canonical shared-instance callee %q not found; fixture did not instantiate as expected", canonCallee)
+	}
+}
+
+// TestAliasgenDeterministicBytes double-extracts the aliasgen fixture and
+// requires byte-identical output. Pre-fix this flips (~1-in-4 runs the
+// shared Reduce instance records the pkgalias.Entry spelling instead of
+// base.U); post-fix canonicalization makes it stable.
+func TestAliasgenDeterministicBytes(t *testing.T) {
+	const dir = "../testdata/corpus/aliasgen"
+	out1, out2 := t.TempDir(), t.TempDir()
+	w1, err := run(dir, []string{"./..."}, out1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2, err := run(dir, []string{"./..."}, out2, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w1) != len(w2) {
+		t.Fatalf("run 1 wrote %d files, run 2 wrote %d", len(w1), len(w2))
+	}
+	for i := range w1 {
+		b1, _ := os.ReadFile(w1[i])
+		b2, _ := os.ReadFile(w2[i])
+		if !bytes.Equal(b1, b2) {
+			t.Errorf("nondeterministic .gvir: %s", w1[i])
+		}
+	}
+}
+
 // TestBlockPreds pins that preds are emitted in b.Preds order: phi
 // operand i must correspond to preds[i] (encoder soundness).
 func TestBlockPreds(t *testing.T) {

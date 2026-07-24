@@ -110,7 +110,7 @@ func (e *emitter) emitFiles() {
 // Ids are first-encounter order — deterministic because every walk
 // that reaches here is deterministic.
 func (e *emitter) typeID(t types.Type) uint32 {
-	repr := types.TypeString(t, func(p *types.Package) string { return p.Path() })
+	repr := canonType(t)
 	if id, ok := e.typeIDs[repr]; ok {
 		return id
 	}
@@ -179,6 +179,198 @@ func (e *emitter) fillType(pb *gvirpb.Type, t types.Type) {
 	// unspecified as opaque/unknown (degrade, never die)
 }
 
+// canonicalize rebuilds t so that two go/types representations that are
+// type-identical but rendered differently under concurrent package
+// loading collapse to one deterministic string. It resolves two
+// load-order-raced sources of nondeterminism (both proven to flip bbolt
+// extraction run-to-run):
+//
+//  1. Type aliases. types.Unalias is shallow (it only follows a
+//     top-level alias chain), so a slice/signature/instance whose
+//     COMPONENT is an alias — []os.DirEntry, func(os.DirEntry) int,
+//     Foo[os.DirEntry] — still renders the alias spelling unless every
+//     component is unaliased. A shared generic instance
+//     (slices.SortFunc[fs.DirEntry]) records whichever alias spelling
+//     (os.DirEntry vs io/fs.DirEntry) won the type-check race. We resolve
+//     every alias to its underlying named type.
+//
+//  2. Signature parameter/result/receiver NAMES. These are not part of a
+//     type's identity (types.Identical ignores them), but they DO appear
+//     in types.TypeString. go/types canonicalizes structurally-identical
+//     signatures into one shared object whose parameter names come from
+//     whichever call site was registered first — another race. We blank
+//     every signature's parameter names so the rendered type is
+//     name-invariant. (Struct field names ARE part of type identity and
+//     are declared once, so they are preserved.)
+//
+// Determinism > pretty names (spec): the result always uses the
+// underlying type's fully-qualified name and unnamed signature params.
+// Non-signature, alias-free types return the ORIGINAL object unchanged,
+// so their types.TypeString rendering is byte-identical to before.
+func canonicalize(t types.Type) types.Type {
+	switch t := t.(type) {
+	case *types.Alias:
+		return canonicalize(types.Unalias(t))
+	case *types.Pointer:
+		if e := canonicalize(t.Elem()); e != t.Elem() {
+			return types.NewPointer(e)
+		}
+	case *types.Slice:
+		if e := canonicalize(t.Elem()); e != t.Elem() {
+			return types.NewSlice(e)
+		}
+	case *types.Array:
+		if e := canonicalize(t.Elem()); e != t.Elem() {
+			return types.NewArray(e, t.Len())
+		}
+	case *types.Chan:
+		if e := canonicalize(t.Elem()); e != t.Elem() {
+			return types.NewChan(t.Dir(), e)
+		}
+	case *types.Map:
+		k, v := canonicalize(t.Key()), canonicalize(t.Elem())
+		if k != t.Key() || v != t.Elem() {
+			return types.NewMap(k, v)
+		}
+	case *types.Tuple:
+		// A bare tuple type: blank element names like a signature.
+		return blankTuple(t)
+	case *types.Struct:
+		n := t.NumFields()
+		fields := make([]*types.Var, n)
+		tags := make([]string, n)
+		changed := false
+		for i := range fields {
+			f := t.Field(i)
+			ft := canonicalize(f.Type())
+			if ft != f.Type() {
+				changed = true
+			}
+			// Field names are part of struct identity: preserve them.
+			fields[i] = types.NewField(f.Pos(), f.Pkg(), f.Name(), ft, f.Embedded())
+			tags[i] = t.Tag(i)
+		}
+		if changed {
+			return types.NewStruct(fields, tags)
+		}
+	case *types.Signature:
+		// Uninstantiated generic signatures carry free type params that a
+		// rebuilt tuple would still reference; leave them be (they render
+		// type-param names, not aliases, and are not shared-instance
+		// canonicalized).
+		if t.TypeParams().Len() > 0 || t.RecvTypeParams().Len() > 0 {
+			return t
+		}
+		var recv *types.Var
+		if r := t.Recv(); r != nil {
+			recv = types.NewVar(token.NoPos, nil, "", canonicalize(r.Type()))
+		}
+		// Always rebuild with blanked param/result names — the fix for
+		// the parameter-name race — deep-canonicalizing each type.
+		return types.NewSignatureType(recv, nil, nil, blankTuple(t.Params()), blankTuple(t.Results()), t.Variadic())
+	case *types.Named:
+		targs := t.TypeArgs()
+		if targs == nil || targs.Len() == 0 {
+			return t
+		}
+		args := make([]types.Type, targs.Len())
+		changed := false
+		for i := range args {
+			args[i] = canonicalize(targs.At(i))
+			if args[i] != targs.At(i) {
+				changed = true
+			}
+		}
+		if changed {
+			if inst, err := types.Instantiate(nil, t.Origin(), args, false); err == nil {
+				return inst
+			}
+		}
+	}
+	return t
+}
+
+// blankTuple rebuilds tup with every element's type canonicalized and its
+// NAME blanked, so the rendered signature is parameter-name-invariant.
+func blankTuple(tup *types.Tuple) *types.Tuple {
+	if tup == nil {
+		return nil
+	}
+	vars := make([]*types.Var, tup.Len())
+	for i := range vars {
+		vars[i] = types.NewVar(token.NoPos, nil, "", canonicalize(tup.At(i).Type()))
+	}
+	return types.NewTuple(vars...)
+}
+
+func pathQualifier(p *types.Package) string { return p.Path() }
+
+// canonType renders t's fully-qualified, alias- and param-name-canonical
+// string. For alias-free non-signature types it is byte-identical to the
+// previous types.TypeString(t, path-qualifier) rendering.
+func canonType(t types.Type) string {
+	return types.TypeString(canonicalize(t), pathQualifier)
+}
+
+// canonizeTypeArgs canonicalizes the type-argument spellings baked into a
+// generic instance's rendered ssa string s (its String()/Name(), or a
+// call detail that embeds it). ssa bakes the raced alias spelling into
+// the instance name at instantiation, so we replace each type argument's
+// raw spelling with its alias-canonical one. This substitutes the
+// per-argument type substrings rather than the bracketed list as a whole,
+// so it is robust to ssa's "[a, b]" comma formatting (an earlier
+// suffix-reconstruction attempt failed because it assumed fmt's
+// space-separated slice formatting). Longest raws first so a shorter arg
+// spelling can't partially rewrite a longer one. A no-op when no type
+// argument contains an alias.
+func canonizeTypeArgs(s string, targs []types.Type) string {
+	type sub struct{ raw, can string }
+	var subs []sub
+	for _, a := range targs {
+		raw := types.TypeString(a, pathQualifier)
+		can := canonType(a)
+		if raw != can {
+			subs = append(subs, sub{raw, can})
+		}
+	}
+	if len(subs) == 0 {
+		return s
+	}
+	slices.SortFunc(subs, func(x, y sub) int { return cmp.Compare(len(y.raw), len(x.raw)) })
+	for _, p := range subs {
+		s = strings.ReplaceAll(s, p.raw, p.can)
+	}
+	return s
+}
+
+// canonFuncID renders an ssa.Function's fully-qualified id with any alias
+// spelling in its type arguments canonicalized.
+func canonFuncID(fn *ssa.Function) string {
+	return canonizeTypeArgs(fn.String(), fn.TypeArgs())
+}
+
+// canonDetail canonicalizes the human-readable instruction detail
+// (ins.String()), which bakes the raced alias spelling of any generic
+// instance it references — the static callee of a call, or a
+// function-valued operand.
+func canonDetail(ins ssa.Instruction) string {
+	detail := ins.String()
+	if ci, ok := ins.(ssa.CallInstruction); ok {
+		if callee := ci.Common().StaticCallee(); callee != nil {
+			detail = canonizeTypeArgs(detail, callee.TypeArgs())
+		}
+	}
+	for _, op := range ins.Operands(nil) {
+		if op == nil || *op == nil {
+			continue
+		}
+		if fn, ok := (*op).(*ssa.Function); ok && len(fn.TypeArgs()) > 0 {
+			detail = canonizeTypeArgs(detail, fn.TypeArgs())
+		}
+	}
+	return detail
+}
+
 func (e *emitter) position(pos token.Pos) *gvirpb.Position {
 	if pos == token.NoPos {
 		return nil
@@ -197,8 +389,8 @@ func (e *emitter) position(pos token.Pos) *gvirpb.Position {
 // then aux values at first operand encounter.
 func (e *emitter) emitFunction(fn *ssa.Function) *gvirpb.Function {
 	f := &gvirpb.Function{
-		Id:   fn.String(),
-		Name: fn.Name(),
+		Id:   canonFuncID(fn),
+		Name: canonizeTypeArgs(fn.Name(), fn.TypeArgs()),
 		Type: e.typeID(fn.Signature),
 		Pos:  e.position(fn.Pos()),
 	}
@@ -241,10 +433,16 @@ func (e *emitter) emitFunction(fn *ssa.Function) *gvirpb.Function {
 			return id
 		}
 		id := assign(v)
+		// A Function operand's String() bakes the raced generic-instance
+		// type-arg spelling; canonicalize it like the Function.Id above.
+		repr := v.String()
+		if fn, ok := v.(*ssa.Function); ok {
+			repr = canonFuncID(fn)
+		}
 		aux := &gvirpb.AuxValue{
 			Id:   id,
 			Kind: auxKind(v),
-			Repr: v.String(),
+			Repr: repr,
 			Type: e.typeID(v.Type()),
 		}
 		if c, ok := v.(*ssa.Const); ok {
@@ -266,7 +464,7 @@ func (e *emitter) emitFunction(fn *ssa.Function) *gvirpb.Function {
 			pi := &gvirpb.Instruction{
 				Kind:   strings.TrimPrefix(fmt.Sprintf("%T", ins), "*ssa."),
 				Pos:    e.position(ins.Pos()),
-				Detail: ins.String(),
+				Detail: canonDetail(ins),
 			}
 			if v, ok := ins.(ssa.Value); ok {
 				pi.Register = ids[v]
@@ -326,7 +524,7 @@ func (e *emitter) emitFunction(fn *ssa.Function) *gvirpb.Function {
 					sem.MethodSig = e.typeID(cc.Method.Type())
 				} else {
 					if f := cc.StaticCallee(); f != nil {
-						sem.StaticCallee = f.String()
+						sem.StaticCallee = canonFuncID(f)
 					} else if b, ok := cc.Value.(*ssa.Builtin); ok {
 						sem.Builtin = b.Name()
 					}
@@ -410,7 +608,7 @@ func (e *emitter) emitMethodSets(sp *ssa.Package) {
 			m := &gvirpb.Method{Name: obj.Name(), Sig: e.typeID(sel.Type())}
 			if !types.IsInterface(T) {
 				if fn := sp.Prog.MethodValue(sel); fn != nil {
-					m.FuncId = fn.String()
+					m.FuncId = canonFuncID(fn)
 				}
 			}
 			pb.Methods = append(pb.Methods, m)

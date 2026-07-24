@@ -30,6 +30,41 @@ impl CallGraph {
         self.callees.get(f.0 as usize).map_or(&[], Vec::as_slice)
     }
 
+    /// Reverse reachability (phase-5b spec §5): every function from
+    /// which some seed is reachable through call edges — the seeds'
+    /// transitive callers, seeds included. `--diff-base` scopes its
+    /// report to `callers_closure(changed functions)`: a changed
+    /// callee's summary feeds every transitive caller's obligations.
+    /// Returned as a set for membership tests only — callers must never
+    /// iterate it into output (iteration order is not deterministic).
+    pub fn callers_closure(&self, seeds: &[FuncId]) -> std::collections::HashSet<FuncId> {
+        // Reverse adjacency over the callee lists.
+        let n = self.callees.len();
+        let mut rev: Vec<Vec<FuncId>> = vec![Vec::new(); n];
+        for caller in 0..n {
+            let caller = FuncId(caller as u32);
+            for &callee in self.callees(caller) {
+                rev[callee.0 as usize].push(caller);
+            }
+        }
+        let mut closure: std::collections::HashSet<FuncId> =
+            std::collections::HashSet::with_capacity(seeds.len());
+        let mut stack: Vec<FuncId> = Vec::new();
+        for &s in seeds {
+            if closure.insert(s) {
+                stack.push(s);
+            }
+        }
+        while let Some(v) = stack.pop() {
+            for &caller in &rev[v.0 as usize] {
+                if closure.insert(caller) {
+                    stack.push(caller);
+                }
+            }
+        }
+        closure
+    }
+
     pub fn build(p: &Program) -> CallGraph {
         let mut keys = StructuralKeyCache::new();
         // Index 1: (method name, structural sig key) → [(owner type
@@ -550,6 +585,26 @@ mod tests {
             sccs.callee_sccs(1), // schedule slot for {FuncId(0)}
             &[0],
             "the out-of-range callee (FuncId(5)) must be dropped, not panic"
+        );
+    }
+
+    #[test]
+    fn callers_closure_walks_call_edges_backward() {
+        // 0 -> 1 -> 2,  3 -> 1,  4 isolated.
+        let g = from_edges(5, &[(0, 1), (1, 2), (3, 1)]);
+        let closure = g.callers_closure(&[FuncId(2)]);
+        let mut got: Vec<u32> = closure.iter().map(|f| f.0).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2, 3], "callers_closure(seeds=[2])");
+
+        let closure = g.callers_closure(&[FuncId(4)]);
+        let mut got: Vec<u32> = closure.iter().map(|f| f.0).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![4], "isolated seed is its own closure");
+
+        assert!(
+            g.callers_closure(&[]).is_empty(),
+            "empty seeds -> empty closure"
         );
     }
 }

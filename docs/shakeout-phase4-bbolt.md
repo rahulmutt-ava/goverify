@@ -1935,234 +1935,293 @@ Corrections to statements made above (no verdict changes):
 ## Phase-5a caching addendum (2026-07-24)
 
 Re-run of the phase-4 shakeout against phase-5a caching (`phase5a/caching`
-@ `6f77ebb`, base wave-2 HEAD). This wave adds **default-on caching** to
-`goverify check` — three content-addressed layers on the shared `Store`:
-the **extraction cache** (keyed in `goverify-extract`, per-package gvir
-blobs behind a go-list closure manifest), the **SCC cache** (keyed +
-framed in `goverify-analysis`, per-summary with a path-keyed context hash),
-and the pre-existing **query cache** (canonical SMT text ⊕ solver identity
-⊕ limits). The wave's one behavioural invariant is that **the cache must
-be finding-neutral**: identical source must produce byte-identical findings
-whether solved cold or replayed warm. This section records the spec §7
-gate verdicts (G1–G5) against that invariant, plus the report-only speed
-milestone and the generics-blowup measurement deferred from Task 14.
+@ `122d554`), evaluated against `.goverify/shakeout/baseline-457.txt`. This
+wave adds **default-on caching** to `goverify check` — three
+content-addressed layers on the shared byte-only `Store`: the **extraction
+cache** (keyed in `goverify-extract`, per-package gvir blobs behind a
+go-list closure manifest), the **SCC summary cache** (keyed + framed in
+`goverify-analysis`, one entry per schedule position under a path-keyed
+context hash), and the pre-existing **query cache**. The wave's invariant
+is that **the cache must be finding-neutral**: identical source ⇒
+byte-identical findings whether solved cold or replayed warm.
+
+**This addendum supersedes the first phase-5a addendum draft (commit
+`073c5f3`), whose diagnosis was wrong and whose numbers predate the
+determinism fix.** The correction is the headline story below — the cache
+did its job by *exposing a latent bug*.
+
+### Headline: the cache exposed a root-invariant violation the corpus missed
+
+The first draft observed that warm SCC-cache misses never converged to zero
+(5213 → 4027 → 3713 across three warm runs) and the store held 32002 SCC
+entries against only 19049 cold misses. It attributed this to a rayon
+`par_iter` "compute-then-overwrite race" in the analysis engine. **That
+diagnosis was wrong.** A read-only investigation
+(`.superpowers/sdd/nondeterminism-investigation.md`) root-caused it to a
+violation of the project's **root determinism invariant** — *identical
+source bytes must produce byte-identical `.gvir`* — living in the **Go
+extractor**, not the engine:
+
+- A **frozen-gvir control** (extract once, then `check --gvir-dir` twice on
+  the byte-frozen output) hit **19049 hits / 0 misses on the first warm
+  replay** — proving the engine + hash + key layer are perfectly
+  deterministic given fixed bytes. The engine was never the problem.
+- A **double-extraction diff** of the pinned bbolt (identical source, same
+  binary) showed the extractor emits **byte-different `.gvir`**: under
+  `packages.Load`'s concurrent type-checking + SSA's shared-instance dedup,
+  go/types keeps one canonical object for structurally-identical types and
+  records whichever incidental rendering the first-registered call site
+  supplied — which then races run-to-run. Three such details reached the
+  emitted bytes and flipped by load order: **(a)** type-alias spellings of a
+  shared generic instance (`slices.SortFunc[io/fs.DirEntry]` vs
+  `[os.DirEntry]` — `os.DirEntry` is an alias of `fs.DirEntry`; `io/fs.gvir`
+  and `os.gvir` coin-flipped together), **(b)** signature parameter names in
+  shared canonicalized signatures (`func(s, sep string)` vs `func(x, y
+  string)` — names are not part of type identity but do appear in
+  `types.TypeString`), and **(c)** the same alias/param-name class inside
+  anonymous-interface method `Repr`s.
+
+Each flip perturbed the flipped package's `func_ir_hash`, and because `os`
+sits in the transitive callee set of thousands of SCCs, one flipped leaf key
+**cascaded** into thousands of distinct SCC keys — so every warm run minted
+never-before-seen keys and the store accreted **both** coin-flip states
+without ever converging. **The 32002-entry observation is explained
+exactly**: 19049 (cold) + 5213 + 4027 + 3713 (each warm run's fresh-minted
+keys) = 32002. The first draft's "one logical SCC → >1 entry
+(per-checker/per-instantiation variants)" gloss was also wrong: the design
+emits **exactly one key per schedule position**.
+
+The corpus determinism suite missed this because no corpus module
+instantiated a generic function with a cross-package-aliased type while both
+packages were in one load. **The cache is what surfaced it** — phase-5a
+started keying on those bytes and made the latent nondeterminism
+observable. That is a genuine win for the wave, recorded straight.
+
+### The two extractor fixes
+
+1. **Type/name canonicalization** (`17a319d` + review follow-up `122d554`,
+   `extractor/emit.go`). A `canonicalize(types.Type)` helper rebuilds a type
+   so type-identical-but-differently-rendered forms collapse to one string:
+   recursively resolves aliases (deep — `[]os.DirEntry`, `func(os.DirEntry)`,
+   `Foo[os.DirEntry]`), blanks signature parameter/result/receiver names
+   (struct field names preserved — they *are* part of struct identity),
+   re-instantiates generic `*types.Named` with canonicalized type args, and
+   (follow-up) rebuilds anonymous `*types.Interface` method signatures the
+   same way. Routed through `typeID` (`Type.Repr`), the instance-name
+   strings (`Function.Id`/`Name`, `AuxValue.Repr`, `CallSem.StaticCallee`,
+   `Method.FuncId`) via per-type-arg substring substitution, and
+   `Instruction.Detail`. Alias-free non-signature types return the original
+   object, so non-generic code renders byte-identically to before (no golden
+   churn). New corpus fixture `testdata/corpus/aliasgen/` (a generic
+   `Reduce[E]` instantiated at the same underlying type spelled named vs
+   cross-package-aliased) + a double-extract byte-identity test now guard it
+   in `mise run corpus`.
+2. **Manifest resolved-PkgPath** (`e512b8e`, this addendum's Concern 1 from
+   the first draft — also a bug, not "expected degrade"). The go-list
+   closure manifest printed dep lines using import-map **keys**, but
+   stdlib-vendored `golang.org/x/…` packages resolve to a `vendor/`-prefixed
+   `PkgPath` (15 mismatches for bbolt, incl.
+   `golang.org/x/crypto/cryptobyte`). The mismatch made the manifest report
+   a missing dep, so the extract layer degraded to uncached on *every* bbolt
+   run. Fixed to print the resolved `PkgPath`; the extract cache now engages.
 
 ### Run parameters
 
-- goverify branch: `phase5a/caching` @ `6f77ebb`. Prior addenda's caveats
-  (bbolt ref, timeouts, retry tier) all carry unchanged; the only new
-  production behaviour shakeout exercises is the caching layers.
-- bbolt ref: v1.4.0 (`0d51685`, unchanged from the prior three addenda).
-- timeouts: base tier infer 100 ms / obligation 250 ms; retry tier 10×
-  (1000 ms / 2500 ms), unchanged from wave 2.
+- goverify branch: `phase5a/caching` @ `122d554` (three fixes above stacked
+  on the first draft's `073c5f3`).
+- bbolt ref: v1.4.0 (`0d51685`, unchanged from the prior addenda).
+- timeouts: unchanged (base 100/250 ms, retry 10×).
 - command: manual mirror of `scripts/shakeout.sh` (`goverify check ./...
-  --cache-dir .goverify/shakeout/cache`) with `GOVERIFY_TIMINGS=1` and
-  `/usr/bin/time -p`; stdout → `p5a-cold.txt` / `p5a-warm{1,2,3}.txt`.
-  **Cold** = `rm -rf .goverify/shakeout/cache` first; the three **warm**
-  runs reuse the cache without wiping it.
-- **Baseline.** Evaluated against `.goverify/shakeout/baseline-457.txt`
-  (**458** finding headers by `grep -cE '^[a-zA-Z0-9_./-]+\.go:[0-9]+:[0-9]+:'`,
-  `tx.go:558:11` PRESENT — the file name's "457" is a plan path-stability
-  artifact, see the wave-2 addendum). HEAD expectation is **457** with
-  `tx.go:558:11` retry-discharged (the wave-2 `timing-flaky-pre-4A`
-  discharge). The G1 finding-neutrality diff is therefore against the
-  **458-baseline minus `tx.go:558:11`** = a 457-signature set.
-- findings this wave: **457** (byte-identical across cold + 3 warm). Net
-  **0** vs the HEAD expectation — the cache introduces no finding delta.
-- **Extraction cache degraded to uncached on bbolt (honest caveat).**
-  Every run printed `extraction cache unavailable (extractor failed:
-  manifest: missing dep golang.org/x/crypto/cryptobyte); extracting
-  uncached`. The go-list closure manifest (Task 10) could not resolve
-  bbolt's transitive `golang.org/x/crypto/cryptobyte` dependency, so the
-  extract layer fell back to full uncached extraction — correct
-  degrade-not-die behaviour, finding-neutral, but it means **only 2 of the
-  3 layers (scc, query) actually engaged** on this target. `extract+load`
-  stays at the full uncached ~3 s on every run.
-- **Environment / EDR caveat (applies to every wall-clock below).** All
-  measurements 2026-07-24. The freshly-built release binary's first exec
-  measured **0.41 s** (a SentinelOne re-wedge would be minutes); machine
-  healthy, no step stalled. Wall-clocks are reported clean but carry this
-  caveat (the exec-verdict stall mechanism is documented in Tasks 7/8 of
-  the prior wave).
+  --cache-dir .goverify/shakeout/cache`) with `GOVERIFY_TIMINGS=1` +
+  `/usr/bin/time -p`; stdout → `p5a2-cold.txt` / `p5a2-warm{1,2,3}.txt`.
+  **Cold** = `rm -rf .goverify/shakeout/cache` first; three **warm** runs
+  reuse the cache.
+- findings this wave: **457**, byte-identical across cold + 3 warm.
+- **Extract cache now engages** on bbolt: **no "extraction cache
+  unavailable" line on any run**; cold `extract cache 0 hit / 220
+  extracted`, warm `220 hit / 0 extracted`. All three layers are now live on
+  the flagship target.
+- **EDR caveat — stronger this session.** Fresh release binary first exec
+  0.58 s (clean). But the **cold** shakeout runs the Go extractor subprocess
+  (freshly rebuilt from the `emit.go` change → new binary hash → SentinelOne
+  first-exec verdict delay), and that exec **stalled**: cold run 1 completed
+  in **509 s** wall against only ~334 s CPU (a ~175 s non-CPU gap), and a
+  cold *retry* (per the brief's retry-once rule) was **killed at the 600 s
+  timeout**. The stall is confined to the cold extractor exec + the
+  tens-of-thousands of new cache-file creations EDR scans; it is **not** in
+  the analyzer. Proof: a run with the extract cache already warm (extractor
+  *not* invoked) but the SCC cache cold completed **EDR-clean in 45.0 s**
+  (real 45 < CPU 59.6, fully parallel, no gap). **Cold wall-clock is
+  therefore not cleanly measurable this session and is reported only with
+  this caveat; the warm walls below are clean.**
 
 ### Gate 1 (spec §7 — correctness, cache finding-neutral): PASSES
 
-Signature-diff of `p5a-cold.txt` against the 458-baseline minus
-`tx.go:558:11`, at both `file:line:col` and whitespace-normalized
-full-header-line granularity:
+Signature-diff of `p5a2-cold.txt` against the 458-baseline minus
+`tx.go:558:11` (the pre-existing wave-2 retry discharge), at both
+`file:line:col` and whitespace-normalized full-header granularity:
 
 ```
-$ # expected = baseline headers minus tx.go:558:11
-$ comm -23 expected.sigs cold.sigs    # departures
-(none)
-$ comm -13 expected.sigs cold.sigs    # arrivals
-(none)
-$ diff expected.full cold.full | grep -cE '^[<>]'
-0
-$ grep -c '^tx.go:558:11:' cold.sigs
-0
+expected full-header lines: 457   cold: 457
+departures: (none)   arrivals: (none)   diff line count: 0
+tx.go:558:11 in cold: 0 (absent)
 ```
 
-**Zero arrivals, zero departures** vs the expected 457-signature set. The
-−1 vs the raw 458-baseline is `tx.go:558:11`, the pre-existing wave-2
-retry-tier discharge (`timing-flaky-pre-4A`), **not** caused by the cache
-wave. The cache is finding-neutral. **Gate 1 satisfied.**
+**Zero arrivals, zero departures.** The type/name canonicalization is
+**finding-neutral**: it changed the *witness* output (canonicalized
+`DirEntry`/param-name spellings in trace text) but not which findings are
+reported. **Gate 1 satisfied.**
 
 ### Gate 2 (spec §7 — replay fidelity, cold vs warm byte-identical): PASSES
 
 ```
-$ cmp p5a-cold.txt p5a-warm1.txt   # silent
-$ cmp p5a-cold.txt p5a-warm2.txt   # silent
-$ cmp p5a-cold.txt p5a-warm3.txt   # silent
-$ sha256  (all four)  2ae5d3d38e4e2e6d2e47b764c5b18156ff6bbc93d8326866d00c4b76b431cac4
+cmp p5a2-cold.txt p5a2-warm{1,2,3}.txt  →  all BYTE-IDENTICAL
+sha256 (all four): f498a77b88a75b946d7ae5dd1da4b5ab9b01cea2cd615621be962c6428a6303d
 ```
 
-All four stdouts (1 cold + 3 warm) are **byte-identical**, 457/457/457/457
-findings, one shared sha256. Cache replay reproduces the cold solve exactly.
-**Gate 2 satisfied.**
+All four stdouts (1 cold + 3 warm) share one sha256, 457/457/457/457
+findings. With the extractor now deterministic, byte-identity holds
+end-to-end across the full extract→analyze→render pipeline. **Gate 2
+satisfied.**
 
-**Honesty caveat (carried from prior addenda).** Only the cold run is an
-independent computation. The warm runs replay the cache — they are
-cache-reuse evidence, not independent re-solves. Finding-neutrality
-therefore rests on one independent cold solve plus three cache replays, all
-agreeing byte-for-byte.
+**Cache-lineage honesty caveat.** Byte-identity holds *within one clean
+cache lineage*. A separate run seeded from a **different** (killed-retry
+partial) query cache produced identical finding *headers* (457, header-diff
+0) but 344 differing *witness* lines — 64 `path:` traces and 280 `with:`
+SMT counterexample models. An SMT solver may return any valid model, and a
+cached model is replayed verbatim while a freshly-solved query may pick a
+different (equally valid) one; witness paths are likewise
+traversal-order-sensitive to the cache lineage. This is the same
+"warm = cache replay, not independent re-solve" honesty caveat the prior
+addenda carried, now made concrete: **findings** are lineage-independent,
+**witnesses** are not. Not a Gate-2 failure (Gate 2 is one clean lineage),
+but recorded straight.
 
-### Gate 3 (spec §7 — targeted invalidation): PASSES (already gated)
+### Gate 3 (spec §7 — targeted invalidation): PASSES (already gated, unchanged)
 
-Covered by the `scc_cache_invalidation` corpus test (in the blocking
-`corpus` gate, exact-miss-count assertion; Task 9). Counts: cold `hits1=0
-misses1=4`; unchanged replay `hits2=4 misses2=0` (full byte-identical hit);
-one-function edit `hits3=2 misses3=2` — re-analyzes exactly the edited SCC
-+ its caller's SCC and replays the two untouched SCCs. Assertion
-`misses3==2 && hits3==misses1-2` passes unweakened. No bbolt-side probe
-needed (Gate 2 passed). **Gate 3 satisfied.**
+`scc_cache_invalidation` corpus test (blocking gate): cold `hits1=0
+misses1=4`, unchanged replay `hits2=4 misses2=0`, one-function edit `hits3=2
+misses3=2`; assertion `misses3==2 && hits3==misses1-2` passes unweakened.
 
-### Gate 4 (spec §7 — speed, report-only): recorded; <5 s milestone NOT met
+### Gate — saturation (the fix's acceptance criterion): PASSES
 
-Per-run wall-clock and `GOVERIFY_TIMINGS` phase breakdown:
+The determinism fix's whole point is that warm replays must now *saturate*:
+
+| | cold | warm1 | warm2 | warm3 |
+|---|---|---|---|---|
+| extract cache | 0 hit / **220 extracted** | 220 hit / 0 | 220 hit / 0 | 220 hit / 0 |
+| scc cache | 0 hit / **18965 miss** | **18965 hit / 0 miss** | 18965 hit / 0 miss | 18965 hit / 0 miss |
+| escalations | 105 | 0 | 0 | 0 |
+
+**Warm SCC hits == cold misses (18965), warm misses == 0, on the *first*
+warm run** — full saturation, versus the pre-fix 5213/4027/3713
+never-converging misses. Warm escalations are **0** (replay skips solving
+entirely), versus the pre-fix 77/57/55. This is the direct, quantified proof
+that the extractor is now deterministic and the SCC keys are stable.
+
+### Gate 4 (spec §7 — speed, report-only): warm ~5.4 s; <5 s milestone JUST missed
 
 | run | real (s) | extract+load | analyze | scope+render | scc hit/miss | escalations |
 |---|---|---|---|---|---|---|
-| cold  | **264.47** | 3.76 | **260.35** | 0.02 | 0 / 19049 | 167 |
-| warm1 | 20.73 | 3.72 | 16.69 | 0.01 | 13836 / 5213 | 77 |
-| warm2 | 16.53 | 2.95 | 13.49 | 0.02 | 15022 / 4027 | 57 |
-| warm3 | **16.69** | 3.03 | 13.53 | 0.07 | 15336 / 3713 | 55 |
+| cold  | **509.12** (EDR) | 3.26 | 222.53 | 0.03 | 0 / 18965 | 105 |
+| warm1 | 7.51 | 2.25 | 4.75 | 0.13 | 18965 / 0 | 0 |
+| warm2 | 5.57 | 1.44 | 3.89 | 0.14 | 18965 / 0 | 0 |
+| warm3 | **5.41** | 1.27 | 3.91 | 0.10 | 18965 / 0 | 0 |
 
-- **Cold overhead vs the ~207 s uncached baseline.** 264.47 s vs the wave-2
-  cold 206.74 s = **+57.73 s (+27.9 %)**. The layer that engaged on cold is
-  the **scc cache** (0 hit / 19049 miss → 19049 frame+blake3+atomic-rename
-  puts); the extract layer degraded to uncached (negligible). This is the
-  new-layer write overhead paid on a cold cache, recovered on warm reuse.
-  Not a clean isolated measurement (machine-state caveat + scc encode work).
-- **Warm vs Task-1's denominator.** Task-1's warm baseline (no scc cache,
-  warm query cache) was extract+load 3.00 / analyze 18.21 / scope+render
-  0.01, total **21.51 s**. This wave's warm3 is 3.03 / **13.53** / 0.07,
-  real **16.69 s** — **−4.82 s (−22 %)**, entirely in the analyze phase
-  (18.21 → 13.53) where the scc cache absorbs recomputation (15336 hits).
-- **<5 s milestone: NOT MET.** Warm wall ~16.5–20.7 s, ~3.3–4.1× over the
-  target. **The analyze phase dominates the gap** (~13.5 s of the ~16.7 s
-  warm total). Two causes: (a) the scc cache does **not saturate in a single
-  run** — misses fall 5213 → 4027 → 3713 across the warm runs and are still
-  converging, because the engine dispatches SCC summaries via rayon
-  `par_iter` (`goverify-analysis/src/engine.rs`) and threads race to
-  compute-then-overwrite the same key, so a few thousand SCCs recompute
-  every run (the same concurrency shape the wave-2 addendum diagnosed for
-  the escalation-count wobble); (b) the effects pre-pass / gated-SSA
-  encoding / non-SCC analyze work is uncached. `extract+load` (~3 s,
-  uncached on bbolt) is the second fixed cost. Reaching <5 s needs both the
-  residual analyze cost and extraction to drop >3×.
-- **Escalation counts non-deterministic by design** (cold 167; warm 77 / 57
-  / 55) and **scc hit/miss counts likewise** (same par_iter race, converging
-  across warm runs) — reported, **not regressions**; findings are
-  byte-identical regardless (Gate 2).
+- **Cold: EDR-contaminated, not cleanly measurable** (509 s with a ~175 s
+  non-CPU gap; retry killed at 600 s — see the EDR caveat). The clean signal
+  is the extract-warm/scc-cold control at **45.0 s** (EDR-clean), which is
+  the true "cold analyze" cost once the extractor exec is out of the
+  critical path.
+- **Warm vs Task-1's denominator (21.51 s, no scc cache).** Warm3 is
+  **5.41 s** — a **−16.1 s (−75 %)** reduction. The analyze phase collapses
+  18.21 → 3.91 s (SCC cache absorbs all 18965 recomputations) and
+  extract+load 3.00 → 1.27 s (gvir served from the 220 cached blobs, no
+  extractor exec). This also corrects the first draft's ~16.5 s warm figure,
+  which was inflated by the non-converging misses the determinism bug caused.
+- **<5 s milestone: JUST MISSED.** Best warm is **5.41 s**, ~0.4 s (8 %)
+  over the target — versus the first draft's 16.5 s (3.3× over). **The
+  analyze phase (~3.9 s) is the dominant remaining cost** (the effects
+  pre-pass / gated-SSA encoding is uncached even when every SCC summary is a
+  hit), with extract+load (~1.3 s gvir decode) second. Closing the last
+  ~0.4 s would need trimming the uncached analyze front-half or the gvir
+  decode; the wave brought warm within a hair of the milestone.
+- Escalation counts non-deterministic by design; warm = 0 (replay skips
+  solving), expected, not a regression.
 
 ### Gate 5 (spec §7 — evidence bundle): PASSES
 
-- **Blocking tier all green** (2026-07-24): `lint` exit 0 (`cargo fmt
-  --check`, `clippy -D warnings`, `buf lint`, extractor `gofmt`+`go vet`);
-  `test` exit 0 (**59.65 s**, 26 test binaries); `corpus` exit 0 (**27.28
-  s**, all suites incl. `scc_cache_invalidation`); `secrets` (gitleaks) exit
-  0 — 212 commits scanned, no leaks; `audit` (cargo audit) exit 0 — 99 crate
-  deps scanned, clean.
-- **Fuzz smoke (Task 13):** `scc_entry` target over `decode_entry_bytes` —
-  **7,000,230 executions / 61 s / 0 crashes / 0 panics** (nightly CI
-  budgeted at 900 s).
+- **Blocking tier all green** (fixed tree, 2026-07-24): `test` exit 0
+  (**30.47 s**), `corpus` exit 0 (**22.36 s**, incl. the new `aliasgen`
+  determinism fixture + `scc_cache_invalidation`), `lint` exit 0
+  (**2.19 s**; `cargo fmt --check`, `clippy -D warnings`, `buf lint`,
+  extractor `gofmt`+`go vet`). (`secrets`/`audit` unchanged from the first
+  draft: gitleaks no leaks, cargo audit clean.)
+- **Fuzz smoke (Task 13, unchanged):** `scc_entry` over `decode_entry_bytes`
+  — 7,000,230 executions / 61 s / 0 crashes.
 - **Cache-store stats** (`scripts/cache_stats.sh .goverify/shakeout/cache`,
-  after cold + 3 warm):
+  extract + scc fully populated):
 
   ```
-  extract: (absent)
-  scc:   32002 entries, 17049065 bytes   (~16.3 MB, ~533 B/entry)
-  query: 95485 entries, 37927601 bytes   (~36.2 MB, ~397 B/entry)
+  extract: 220 entries,    67675450 bytes   (~64.5 MB — layer now engages)
+  scc:     18965 entries,   6715926 bytes   (~6.4 MB, ~354 B/entry)
+  query:   95038 entries,  37960541 bytes   (~36.2 MB)
   ```
 
-  `extract` absent — the layer never populated (degraded, above). The scc
-  entry count (32002) exceeds the cold miss count (19049) because SCCs are
-  keyed with context (per-checker / per-instantiation variants), so one
-  logical SCC yields >1 entry and successive runs persist more distinct keys
-  as the race resolves.
+  **The SCC entry count is now 18965 — exactly the cold miss count**, versus
+  the first draft's 32002. The key explosion is gone: with the extractor
+  deterministic, there is exactly one SCC key per schedule position and no
+  coin-flip minting. `extract` now populates (220 packages) where the first
+  draft showed it absent.
 
-- **Generics-blowup measurement (Task 14 deferral, corrected signal).**
-  `goverify debug summary ./...` over bbolt (whole-program, incl. transitive
-  stdlib closure — the corrected signal is the `[<concrete>]`-suffixed
-  summary name, **not** `debug ir` brackets; see Task 14):
-
-  | metric | count |
-  |---|---|
-  | total summarized functions | 20944 |
-  | instantiation summaries (`^\S+\[[^]]+\] effects=`) | **285** (1.36 %) |
-  | — unspecialized templates (`[E]`/`[T]`/…) | 83 |
-  | — concrete instantiations | 202 |
-  | distinct generic base names | 150 |
-  | max instantiation multiplicity | **44** (`(*sync/atomic.Pointer)`) |
-
-  Top multiplicities: `atomic.Pointer` 44, `reflect.TypeFor` 33,
-  `internal/sync.HashTrieMap` 26, `runtime/atomic.Pointer` 23,
-  `slices.SortFunc` 14. **Unlike the local corpus (knownfp: 0
-  instantiations, inconclusive — Task 14), bbolt gives a real signal:**
-  generic instantiations exist, driven entirely by the stdlib closure
-  (bbolt's own source has none). But the blowup is **bounded and small** —
-  285/20944 = 1.36 % of the function population, worst case 44×, a small
-  fraction of the 32002 scc entries; **no pathological blowup observed**.
-  This materially de-risks parent spec §16 but does **not** formally close
-  it: a purpose-built fixture (one type-parameterized function called at N
-  distinct concrete types) is still the right way to stress the worst case
-  deliberately before §16 is marked closed. Not overclaimed as closed.
+- **Generics-blowup measurement (Task 14 deferral, unchanged numbers, now on
+  canonical spellings).** `goverify debug summary ./...` over bbolt: **285**
+  bracket-suffixed instantiation summaries out of **20944** total (1.36 %),
+  150 distinct generic base names, max multiplicity **44**
+  (`(*sync/atomic.Pointer)`); driven entirely by the stdlib closure (bbolt's
+  own source has no generics). Bounded and small — no pathological blowup.
+  This materially de-risks parent spec §16 but does **not** formally close it
+  (a purpose-built worst-case fixture is still the right closure vehicle).
+  Note the type-arg spellings behind these instance names are now
+  *canonical* (alias-resolved), so the summary counts are stable across runs
+  where the first draft's would have wobbled.
 
 ### Finding-count headline
 
-**457 → 457** (net 0). The cache wave is **finding-neutral**: cold and all
-three warm runs are byte-identical at 457 findings, zero arrivals, zero
-departures vs the HEAD expectation. (The 458-baseline's −1 is the
-pre-existing wave-2 `tx.go:558:11` discharge, not this wave.)
+**457 → 457** (net 0). The cache wave is finding-neutral; the extractor
+determinism fix (the wave's real find) is likewise finding-neutral — it
+changed witness spellings, not findings.
 
 ### Gate summary
 
 | Gate | Verdict | Evidence |
 |---|---|---|
-| G1 | **PASS** | cold = expected 457 set (458-baseline − `tx.go:558:11`); zero arrivals, zero departures at file:line:col + full-header granularity; cache finding-neutral |
-| G2 | **PASS** | cold + 3 warm stdout byte-identical (one sha256 `2ae5d3d3…`) |
+| G1 | **PASS** | cold = expected 457 set; zero arrivals/departures at file:line:col + full-header granularity; canonicalization finding-neutral |
+| G2 | **PASS** | cold + 3 warm byte-identical (one sha256 `f498a77b…`); extractor now deterministic end-to-end |
 | G3 | **PASS** | `scc_cache_invalidation` corpus test (gated): `misses3==2`, `hits3==misses1−2` |
-| G4 | report-only | cold 264.47 s (+57.73 vs 206.74 baseline; scc-put overhead), warm 20.73/16.53/16.69 s (−22 % vs Task-1 21.51); **<5 s NOT MET**, analyze-dominated |
-| G5 | **PASS** | blocking tier green; fuzz 7,000,230/61 s/0; scc 32002/17.0 MB, query 95485/37.9 MB, extract absent; generics 285/20944 bounded (max 44×) |
+| saturation | **PASS** | warm scc 18965 hit / 0 miss == cold 18965 miss; extract 220 hit / 0; warm escalations 0 — full saturation on first warm run |
+| G4 | report-only | warm 7.51/5.57/**5.41** s (−75 % vs Task-1 21.51); **<5 s JUST missed** (best 5.41 s, analyze-dominated); cold EDR-contaminated, not cleanly measurable |
+| G5 | **PASS** | blocking green; fuzz 7,000,230/61 s/0; **scc 18965 entries == cold misses** (no key explosion), extract 220 engages, query 95038; generics 285/20944 bounded, canonical spellings |
 
 ### Known costs and open items (for the plan owner)
 
-1. **Extraction cache did not engage on bbolt.** The go-list closure
-   manifest (Task 10) rejected bbolt's transitive
-   `golang.org/x/crypto/cryptobyte` dep and the extract layer degraded to
-   uncached on all four runs — correct degrade-not-die, finding-neutral, but
-   one of the three headline layers delivered zero benefit on the flagship
-   target and `extract+load` stayed at the full uncached ~3 s. Follow-up
-   queue item, not a gate blocker.
-2. **<5 s milestone not met** (G4, report-only). Warm ~16.5 s,
-   analyze-dominated; the scc cache helps (−22 % vs Task-1) but does not
-   saturate in one run (par_iter compute-then-overwrite race — misses still
-   converging at run 3) and the effects/encode work is uncached.
-3. **scc + escalation counts are non-deterministic by design** and must be
-   read as report-only; key stability on the byte-identical **findings**
-   (Gate 2), never on the stderr counters.
-4. **Acceptance recommendation:** all five gates pass under spec §7 — G1/G2
-   confirm the cache is finding-neutral and replay-faithful, G3's targeted
-   invalidation is gated in corpus, G4/G5 are report-only. Recommend
-   **accept**; items 1–3 are queued/expected, none a blocker.
+1. **EDR stalls the cold extractor exec** (environmental, not a code
+   defect). The freshly-rebuilt Go extractor's first exec under SentinelOne
+   inflates the cold wall unpredictably (509 s once, >600 s killed); warm
+   runs (extract-cache hits, extractor not invoked) and the extract-warm/
+   scc-cold control (45 s) are EDR-clean. Cold wall-clock is not a reliable
+   metric in this environment.
+2. **<5 s milestone missed by ~0.4 s** (G4, report-only). Warm ~5.4 s,
+   analyze-front-half-dominated (uncached effects pre-pass / encoding);
+   extract+load gvir decode second. Within a hair of the target.
+3. **Witness (path/SMT-model) output is cache-lineage-dependent** (G2
+   caveat). Findings are not, but reproducing byte-identical *witnesses*
+   requires the same cache lineage. Inherent to replaying cached solver
+   models; recorded, not a blocker.
+4. **Acceptance recommendation:** all gates pass under spec §7 — G1/G2
+   finding-neutral + replay-faithful, G3 gated, saturation proven (18965/0),
+   G4/G5 report-only. The wave's marquee outcome is that the cache **exposed
+   and drove the fix of a latent root-invariant violation** (extractor
+   nondeterminism under concurrent load) that the corpus suite could not
+   see. Recommend **accept**; items 1–3 are environmental/expected/queued.
+

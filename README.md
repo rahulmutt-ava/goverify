@@ -6,12 +6,16 @@ summaries, constraints discharged with Z3, aggressive content-addressed
 caching. Bug-finder first — high-confidence reports, false positives
 are the enemy.
 
-**Status:** early development. Phases 1-4 of the
+**Status:** early development. Phases 1-5 of the
 [design](docs/superpowers/specs/2026-07-16-goverify-design.md) are
 implemented: extraction pipeline, IR/call-graph/analysis engine, the Z3
-solver layer, and the nil + bounds checkers behind `goverify check`.
-Caching's full stack (summary/extraction caches, baselines, SARIF) and
-the concurrency checkers land in later phases.
+solver layer, the nil + bounds checkers behind `goverify check`, the
+summary/extraction caches, and the CI-facing surface — SARIF/JSON
+output, findings baselines (`goverify baseline write`), and
+`--diff-base` PR-scoped reporting. See
+[docs/shakeout-phase5b-ci-surface.md](docs/shakeout-phase5b-ci-surface.md)
+for the acceptance-gate results at bbolt scale. The concurrency
+checkers land in later phases.
 
 ## Quickstart
 
@@ -83,6 +87,22 @@ goverify debug findings            # analyze CWD, print nil-tracer findings
 goverify debug findings --emit-smt /tmp/smt   # dump canonical SMT-LIB2 artifacts
 goverify debug findings --solver-cmd z3       # portable backend instead of built-in Z3
 ```
+
+### CI usage
+
+```sh
+goverify check --format sarif ./...      # GitHub code scanning
+goverify baseline write ./...            # adopt on an existing codebase
+goverify check ./...                     # …now reports only new findings
+goverify check --diff-base origin/main ./...   # PR-scoped report
+```
+
+`--format sarif`/`--format json` are deterministic byte-for-byte across
+cold/warm cache runs and emit no absolute paths. `baseline write`
+records the current finding set; a later `check` reports only findings
+absent from the baseline (exit 0 once fully suppressed). `--diff-base
+<rev>` restricts the report to functions reachable from those changed
+since `<rev>` (comment-only edits report nothing).
 
 ## Development
 

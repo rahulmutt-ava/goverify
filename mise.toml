@@ -46,6 +46,7 @@ run = [
   "cargo test -p goverify-analysis --test engine_corpus",
   "cargo test -p goverify-checkers --test nil_corpus --test bounds_corpus --test knownfp_corpus --test ensures_corpus --test scc_cache_invalidation",
   "cargo test -p goverify-cli --test debug_integration",
+  "cargo test -p goverify-cli --test formats_corpus",
 ]
 
 [tasks.bench]

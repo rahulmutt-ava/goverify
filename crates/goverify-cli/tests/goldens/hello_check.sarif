@@ -1,0 +1,44 @@
+{
+  "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "goverify",
+          "semanticVersion": "0.1.0",
+          "rules": [
+            {
+              "id": "nil-deref",
+              "shortDescription": {
+                "text": "possible nil pointer dereference"
+              }
+            },
+            {
+              "id": "bounds",
+              "shortDescription": {
+                "text": "possible out-of-range index or slice bound"
+              }
+            },
+            {
+              "id": "div-zero",
+              "shortDescription": {
+                "text": "possible integer division by zero"
+              }
+            },
+            {
+              "id": "overflow",
+              "shortDescription": {
+                "text": "possible integer conversion overflow"
+              }
+            }
+          ]
+        }
+      },
+      "results": [],
+      "properties": {
+        "suppressedByBaseline": 0
+      }
+    }
+  ]
+}

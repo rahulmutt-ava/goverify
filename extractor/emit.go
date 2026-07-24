@@ -253,6 +253,34 @@ func canonicalize(t types.Type) types.Type {
 		if changed {
 			return types.NewStruct(fields, tags)
 		}
+	case *types.Interface:
+		// Anonymous/structural interfaces render their explicit method
+		// SIGNATURES via types.TypeString — with parameter names and
+		// alias spellings — but fillType's Interface case emits only Kind,
+		// so those spellings survive solely in Type.Repr and race exactly
+		// like standalone signatures. Rebuild with each method signature
+		// canonicalized (param names blanked, aliases resolved) and each
+		// embedded type canonicalized. Named interfaces (io.Reader) never
+		// reach here as a *types.Interface — they are *types.Named and
+		// render as a bare qualified name, so the Named barrier holds.
+		nm, ne := t.NumExplicitMethods(), t.NumEmbeddeds()
+		if nm == 0 && ne == 0 {
+			return t // interface{} / any: nothing to canonicalize
+		}
+		methods := make([]*types.Func, nm)
+		for i := range methods {
+			m := t.ExplicitMethod(i)
+			sig := m.Type().(*types.Signature)
+			// Interface methods carry no explicit receiver here;
+			// NewInterfaceType sets it. Blank names, canonicalize types.
+			csig := types.NewSignatureType(nil, nil, nil, blankTuple(sig.Params()), blankTuple(sig.Results()), sig.Variadic())
+			methods[i] = types.NewFunc(token.NoPos, m.Pkg(), m.Name(), csig)
+		}
+		embeddeds := make([]types.Type, ne)
+		for i := range embeddeds {
+			embeddeds[i] = canonicalize(t.EmbeddedType(i))
+		}
+		return types.NewInterfaceType(methods, embeddeds).Complete()
 	case *types.Signature:
 		// Uninstantiated generic signatures carry free type params that a
 		// rebuilt tuple would still reference; leave them be (they render

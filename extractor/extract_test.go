@@ -376,6 +376,30 @@ func TestAliasCanonicalization(t *testing.T) {
 	if !sawCanon {
 		t.Errorf("canonical shared-instance callee %q not found; fixture did not instantiate as expected", canonCallee)
 	}
+
+	// Anonymous-interface method signatures must also canonicalize: the
+	// pkgalias.UseIface param `interface{ Peek(e Entry) Entry }` must emit
+	// with the alias resolved AND the parameter name blanked. A
+	// deterministic single-extraction check (the racing is
+	// scheduling-dependent; the canonical form is the stable invariant).
+	const wantIface = "interface{Peek(example.com/aliasgen/base.U) example.com/aliasgen/base.U}"
+	sawIface := false
+	for _, ty := range pkgs["example.com/aliasgen/pkgalias"].GetTypes() {
+		r := ty.GetRepr()
+		// Only the standalone anonymous-interface type entry (not the
+		// func(interface{...}) signature that embeds it).
+		if !strings.HasPrefix(r, "interface{Peek") {
+			continue
+		}
+		if r == wantIface {
+			sawIface = true
+		} else {
+			t.Errorf("anonymous-interface Repr not canonical: got %q, want %q", r, wantIface)
+		}
+	}
+	if !sawIface {
+		t.Errorf("canonical anonymous-interface Repr %q not found", wantIface)
+	}
 }
 
 // TestAliasgenDeterministicBytes double-extracts the aliasgen fixture and

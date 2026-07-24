@@ -104,6 +104,28 @@ fn dependency_traversal_extracts_the_import_closure() {
 }
 
 #[test]
+fn manifest_returns_closure_with_deps_and_files() {
+    // testdata/corpus/withdeps already imports "strings" (see its
+    // main.go) so it doubles as this test's fixture — no need for a
+    // separate temp module.
+    let pkgs = sidecar()
+        .manifest(&repo_root().join("testdata/corpus/withdeps"), &["./..."])
+        .expect("Sidecar::manifest");
+    let root = pkgs
+        .iter()
+        .find(|p| p.import_path == "example.com/withdeps")
+        .expect("root package in manifest");
+    assert!(!root.files.is_empty(), "root package lists its files");
+    for f in &root.files {
+        assert!(f.is_absolute(), "manifest file paths are absolute");
+        assert!(f.exists(), "manifest file paths exist");
+    }
+    // Closure includes deps: the fixture module imports "strings".
+    assert!(pkgs.iter().any(|p| p.import_path == "strings"));
+    assert!(root.deps.contains(&"strings".to_string()));
+}
+
+#[test]
 fn gvir_contains_no_absolute_paths() {
     let out = tempfile::tempdir().unwrap();
     let files = sidecar()

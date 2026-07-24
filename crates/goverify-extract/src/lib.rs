@@ -10,4 +10,4 @@ mod load;
 mod sidecar;
 
 pub use load::{LoadError, SCHEMA_VERSION, load_package};
-pub use sidecar::{Sidecar, SidecarError};
+pub use sidecar::{ManifestPkg, Sidecar, SidecarError};

@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"net/url"
 	"os"
 	"os/exec"
@@ -135,4 +137,49 @@ func run(dir string, patterns []string, outDir string, deps bool) ([]string, err
 	}
 	slices.Sort(written)
 	return written, nil
+}
+
+// manifest prints the go-list-level import closure of patterns: per
+// package (sorted by import path) its deps and source files. No
+// type-checking — this is the extraction-cache handshake (phase-5a
+// spec §3): the Rust side hashes the listed files' CONTENT to compute
+// per-package cache keys. File paths are printed absolute on purpose:
+// unlike .gvir artifacts the manifest is never cached or persisted, so
+// the no-absolute-paths determinism rule does not bind it.
+func manifest(dir string, patterns []string, w io.Writer) error {
+	cfg := &packages.Config{
+		Dir: dir,
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
+			packages.NeedImports | packages.NeedDeps | packages.NeedModule,
+		Env: append(os.Environ(), "CGO_ENABLED=0"),
+	}
+	roots, err := packages.Load(cfg, patterns...)
+	if err != nil {
+		return err
+	}
+	var all []*packages.Package
+	packages.Visit(roots, nil, func(p *packages.Package) { all = append(all, p) })
+	slices.SortFunc(all, func(a, b *packages.Package) int {
+		return strings.Compare(a.PkgPath, b.PkgPath)
+	})
+	for _, p := range all {
+		if len(p.Errors) > 0 {
+			// Degrade, never die: an errored package is omitted; the
+			// Rust side then treats it as uncacheable and the extract
+			// pass reports the real diagnostic.
+			fmt.Fprintf(os.Stderr, "goverify: manifest: skipping %s: %v\n", p.PkgPath, p.Errors[0])
+			continue
+		}
+		fmt.Fprintf(w, "pkg %s\n", p.PkgPath)
+		deps := slices.Sorted(maps.Keys(p.Imports))
+		for _, d := range deps {
+			fmt.Fprintf(w, "dep %s\n", d)
+		}
+		files := slices.Clone(p.CompiledGoFiles)
+		slices.Sort(files)
+		for _, f := range files {
+			fmt.Fprintf(w, "file %s\n", f)
+		}
+	}
+	return nil
 }

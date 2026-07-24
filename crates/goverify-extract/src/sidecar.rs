@@ -12,6 +12,17 @@ use std::process::Command;
 /// version)`).
 pub struct Sidecar {
     bin: PathBuf,
+    key: String,
+}
+
+/// One package's go-list-level manifest entry: its deps and source
+/// files, as parsed from the `pkg`/`dep`/`file` line protocol emitted
+/// by `extractor -manifest` (phase-5a spec §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestPkg {
+    pub import_path: String,
+    pub deps: Vec<String>,
+    pub files: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -79,7 +90,14 @@ impl Sidecar {
             }
             fs::rename(&tmp, &bin)?;
         }
-        Ok(Sidecar { bin })
+        Ok(Sidecar { bin, key: hash })
+    }
+
+    /// The content hash `build` derived from extractor sources + Go
+    /// version — the "extractor identity" component of extraction-cache
+    /// keys (phase-5a spec §2).
+    pub fn content_key(&self) -> &str {
+        &self.key
     }
 
     pub fn extract(
@@ -113,6 +131,55 @@ impl Sidecar {
             .collect();
         files.sort();
         Ok(files)
+    }
+
+    /// go-list-level closure enumeration (no type-checking). Parses the
+    /// line protocol printed by `extractor -manifest`; any unrecognized
+    /// line is an error (fail -> caller falls back to uncached).
+    pub fn manifest(
+        &self,
+        module_dir: &Path,
+        patterns: &[&str],
+    ) -> Result<Vec<ManifestPkg>, SidecarError> {
+        let output = Command::new(&self.bin)
+            .arg("-manifest")
+            .args(patterns)
+            .current_dir(module_dir)
+            .output()?;
+        if !output.status.success() {
+            return Err(SidecarError::Extractor(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        if !output.stderr.is_empty() {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut pkgs: Vec<ManifestPkg> = Vec::new();
+        for line in text.lines() {
+            if let Some(p) = line.strip_prefix("pkg ") {
+                pkgs.push(ManifestPkg {
+                    import_path: p.to_string(),
+                    deps: Vec::new(),
+                    files: Vec::new(),
+                });
+            } else if let Some(d) = line.strip_prefix("dep ") {
+                pkgs.last_mut()
+                    .ok_or_else(|| SidecarError::Extractor("manifest: dep before pkg".into()))?
+                    .deps
+                    .push(d.to_string());
+            } else if let Some(f) = line.strip_prefix("file ") {
+                pkgs.last_mut()
+                    .ok_or_else(|| SidecarError::Extractor("manifest: file before pkg".into()))?
+                    .files
+                    .push(PathBuf::from(f));
+            } else if !line.is_empty() {
+                return Err(SidecarError::Extractor(format!(
+                    "manifest: unrecognized line {line:?}"
+                )));
+            }
+        }
+        Ok(pkgs)
     }
 }
 

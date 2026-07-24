@@ -90,6 +90,46 @@ func TestBuildExcludedPackageDegrades(t *testing.T) {
 	}
 }
 
+// writeFile writes contents to name under dir, failing the test on error.
+func writeFile(t *testing.T, dir, name, contents string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestManifestListsClosureWithDepsAndFiles pins the extraction-cache
+// handshake (phase-5a spec §3): -manifest emits the go-list-level
+// import closure (pkg/dep/file lines) without type-checking, with
+// absolute file paths (deliberate — see manifest's doc comment).
+func TestManifestListsClosureWithDepsAndFiles(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "go.mod", "module example.com/m\n\ngo 1.25\n")
+	writeFile(t, dir, "main.go", "package m\n\nimport \"strings\"\n\nfunc F(s string) string { return strings.ToUpper(s) }\n")
+	var buf bytes.Buffer
+	if err := manifest(dir, []string{"./..."}, &buf); err != nil {
+		t.Fatalf("manifest: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "pkg example.com/m\n") {
+		t.Errorf("manifest missing root package:\n%s", out)
+	}
+	if !strings.Contains(out, "dep strings\n") {
+		t.Errorf("manifest missing dep edge to strings:\n%s", out)
+	}
+	if !strings.Contains(out, "pkg strings\n") {
+		t.Errorf("manifest missing closure package strings:\n%s", out)
+	}
+	// Every file line must be an absolute path to an existing file.
+	for _, line := range strings.Split(out, "\n") {
+		if f, ok := strings.CutPrefix(line, "file "); ok {
+			if !filepath.IsAbs(f) {
+				t.Errorf("relative file path in manifest: %q", f)
+			}
+		}
+	}
+}
+
 func keys[V any](m map[string]*V) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

@@ -66,10 +66,15 @@ fn ctx_hash(pkg: &gvir::Package) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// blake3 hash of a function-with-a-body: the domain tag, its package's
-/// `ctx_hash`, and the length-prefixed `encode_to_vec()` of its own
-/// `gvir::Function` message. Function messages embed their positions, so
-/// a line shift invalidates exactly the shifted functions.
+/// blake3 hash of a function that is present as an entry in some
+/// package's `pkg.functions` (whether or not that entry has a body —
+/// `blocks` may be empty for a declared-but-bodyless function): the
+/// domain tag, its package's `ctx_hash`, and the length-prefixed
+/// `encode_to_vec()` of its own `gvir::Function` message. Function
+/// messages embed their positions, so a line shift invalidates exactly
+/// the shifted functions. Only a function that never appears as an
+/// entry in any package (purely referenced, e.g. from a call site or
+/// method set) falls through to `external_hash` instead.
 fn func_hash(ctx: &[u8; 32], f: &gvir::Function) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(b"goverify-func-ir\0");
@@ -123,17 +128,31 @@ impl Program {
         // Pass 3: per-function content hashes (Task 7's SCC cache key
         // input). Every interned name defaults to a name-only external
         // hash; functions with a `gvir::Function` entry in some package
-        // are then overwritten with a package-context + own-IR hash. If
-        // the same function id appears in more than one package, the
-        // last package processed (packages are sorted by import_path,
-        // above) wins — the same order pass 2's `set_func_body` resolves
-        // duplicates in.
+        // are then overwritten with a package-context + own-IR hash.
+        //
+        // Duplicate ids across packages must track `lower_package`'s
+        // winner (lower.rs): a bodyless entry (`blocks` empty) is
+        // skipped there — it never calls `set_func_body` and so can
+        // never clobber an already-lowered body — while a bodied entry
+        // always overwrites. Mirror that here with a `bodied` flag per
+        // FuncId: a bodied entry always overwrites the hash (and wins
+        // permanently, matching the body table); a bodyless entry only
+        // fills the hash in if no bodied entry has won yet.
         p.func_hashes = p.func_names.iter().map(|n| external_hash(n)).collect();
+        let mut bodied = vec![false; p.func_names.len()];
         for pkg in &pkgs {
             let ctx = ctx_hash(pkg);
             for f in &pkg.functions {
                 if let Some(&id) = p.by_name.get(f.id.as_str()) {
-                    p.func_hashes[id.0 as usize] = func_hash(&ctx, f);
+                    let idx = id.0 as usize;
+                    if f.blocks.is_empty() {
+                        if !bodied[idx] {
+                            p.func_hashes[idx] = func_hash(&ctx, f);
+                        }
+                    } else {
+                        p.func_hashes[idx] = func_hash(&ctx, f);
+                        bodied[idx] = true;
+                    }
                 }
             }
         }
@@ -368,6 +387,89 @@ mod tests {
             p1.func_ir_hash(f),
             p3.func_ir_hash(f),
             "a position change must change the hash"
+        );
+    }
+
+    #[test]
+    fn duplicate_id_hash_follows_lowerings_bodied_winner() {
+        // A duplicate function id spanning two packages: `a` (sorts
+        // first) declares it with a real body, `b` redeclares it as a
+        // bodyless stub. `lower_package` skips bodyless entries (they
+        // never call `set_func_body`, so they can't clobber an
+        // already-lowered body) — the hash winner must follow that same
+        // rule, not just "last package processed".
+        use goverify_extract::gvir;
+        fn bodied(import_path: &str, line: u32) -> gvir::Package {
+            gvir::Package {
+                import_path: import_path.into(),
+                functions: vec![gvir::Function {
+                    id: "dup.F".into(),
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![gvir::Instruction {
+                            kind: "Return".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    pos: Some(gvir::Position {
+                        file: 0,
+                        line,
+                        col: 1,
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+        fn stub(import_path: &str, line: u32) -> gvir::Package {
+            gvir::Package {
+                import_path: import_path.into(),
+                functions: vec![gvir::Function {
+                    id: "dup.F".into(),
+                    blocks: vec![],
+                    pos: Some(gvir::Position {
+                        file: 0,
+                        line,
+                        col: 1,
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+
+        let a_only = Program::from_packages(vec![bodied("a", 1)]);
+        let combined = Program::from_packages(vec![bodied("a", 1), stub("b", 1)]);
+        let stub_moved = Program::from_packages(vec![bodied("a", 1), stub("b", 2)]);
+        let body_moved = Program::from_packages(vec![bodied("a", 2), stub("b", 1)]);
+
+        let fa = a_only.lookup_func("dup.F").expect("lookup_func a_only");
+        let fc = combined.lookup_func("dup.F").expect("lookup_func combined");
+        let fs = stub_moved
+            .lookup_func("dup.F")
+            .expect("lookup_func stub_moved");
+        let fb = body_moved
+            .lookup_func("dup.F")
+            .expect("lookup_func body_moved");
+
+        assert_eq!(
+            a_only.func_ir_hash(fa),
+            combined.func_ir_hash(fc),
+            "package a's bodied entry must win the hash over b's stub, \
+             matching lower_package's body winner"
+        );
+        assert_eq!(
+            combined.func_ir_hash(fc),
+            stub_moved.func_ir_hash(fs),
+            "moving the losing stub's position must not change the hash \
+             once a bodied entry has won"
+        );
+        assert_ne!(
+            combined.func_ir_hash(fc),
+            body_moved.func_ir_hash(fb),
+            "moving the winning bodied entry's position must change the \
+             hash"
         );
     }
 }

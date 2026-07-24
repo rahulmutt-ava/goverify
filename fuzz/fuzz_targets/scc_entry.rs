@@ -8,5 +8,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-	let _ = goverify_analysis::decode_entry_bytes(data);
+    let _ = goverify_analysis::decode_entry_bytes(data);
 });

@@ -66,9 +66,14 @@ struct CheckArgs {
     /// function-sized formulas get more room (spec §8).
     #[arg(long, default_value_t = 250)]
     obligation_timeout_ms: u32,
-    /// Query-cache directory (omit to run uncached).
+    /// Cache directory (default: $XDG_CACHE_HOME/goverify, falling back
+    /// to ~/.cache/goverify — spec §9). Project-local hermetic mode:
+    /// pass an explicit dir (the shakeout does).
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+    /// Disable all cache layers (extract, scc, query).
+    #[arg(long, conflicts_with = "cache_dir")]
+    no_cache: bool,
     /// Import-path prefix the report is scoped to (defaults to the
     /// module path from the nearest `go.mod`). Extraction walks the whole
     /// import closure — stdlib and deps included — so inference stays
@@ -352,8 +357,50 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // §6 rider 1 / G4). stderr only: stdout is the cold/warm
     // byte-identity surface.
     let timings = std::env::var_os("GOVERIFY_TIMINGS").is_some();
+    // Cache-root resolution (spec §9): --no-cache disables every layer
+    // (extract, scc, query) by leaving cache_root at None; otherwise an
+    // explicit --cache-dir wins, falling back to the user cache root.
+    // No root resolvable (no XDG_CACHE_HOME or HOME) degrades to an
+    // uncached run rather than failing.
+    let cache_root: Option<PathBuf> = if ca.no_cache {
+        None
+    } else {
+        match ca.cache_dir.clone().or_else(user_cache_root) {
+            Some(r) => Some(r),
+            None => {
+                eprintln!("goverify: no cache root (no XDG_CACHE_HOME or HOME); running uncached");
+                None
+            }
+        }
+    };
     let t_extract = std::time::Instant::now();
-    let program = load_program(&dargs)?;
+    // Program acquisition: --gvir-dir (or no cache root) takes the plain
+    // load_program path (no extraction-cache interaction, spec §9);
+    // otherwise extract through the cache and fall back to plain
+    // extraction on any cache failure (degrade, never die).
+    let program = match (&ca.gvir_dir, &cache_root) {
+        (Some(_), _) | (None, None) => load_program(&dargs)?,
+        (None, Some(root)) => {
+            let sidecar = Sidecar::build(&extractor_dir()?, &sidecar_build_dir())?;
+            let patterns: Vec<&str> = ca.patterns.iter().map(String::as_str).collect();
+            match goverify_extract::load_packages_cached(&sidecar, Path::new("."), &patterns, root)
+            {
+                Ok((pkgs, stats)) => {
+                    if timings {
+                        eprintln!(
+                            "goverify: timing: extract cache {} hit / {} extracted",
+                            stats.cached, stats.extracted
+                        );
+                    }
+                    goverify_ir::Program::from_packages(pkgs)
+                }
+                Err(e) => {
+                    eprintln!("goverify: extraction cache unavailable ({e}); extracting uncached");
+                    load_program(&dargs)?
+                }
+            }
+        }
+    };
     if timings {
         eprintln!(
             "goverify: timing: extract+load {:.2}s",
@@ -383,7 +430,7 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     });
     let cfg = goverify_analysis::EngineConfig {
         opts: goverify_analysis::Options::default(),
-        cache_dir: ca.cache_dir.clone(),
+        cache_dir: cache_root.clone(),
         emit_smt: ca.emit_smt.clone(),
     };
     let checkers: Vec<&dyn goverify_analysis::Checker> = vec![
@@ -396,6 +443,10 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         eprintln!(
             "goverify: timing: analyze {:.2}s",
             t_analyze.elapsed().as_secs_f64()
+        );
+        eprintln!(
+            "goverify: timing: scc cache {} hit / {} miss",
+            a.scc_cache_hits, a.scc_cache_misses
         );
     }
     for d in &a.diagnostics {
@@ -521,24 +572,32 @@ fn extractor_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Err("cannot locate extractor sources; set GOVERIFY_EXTRACTOR_DIR".into())
 }
 
-/// Sidecar build cache root: user-scoped (`$XDG_CACHE_HOME/goverify` or
-/// `$HOME/.cache/goverify`, spec §9), created 0700. A predictable,
-/// world-writable-parent path (bare `temp_dir()`) would let another local
-/// user pre-plant a binary for `Sidecar::build` to execute unchecked
-/// (CWE-377); temp_dir() is used only as a last-resort fallback.
-fn sidecar_build_dir() -> PathBuf {
+/// The user cache root: `$XDG_CACHE_HOME/goverify` or
+/// `$HOME/.cache/goverify` (spec §9), created 0700. `None` when neither
+/// env var is set — callers degrade (uncached run, or a temp-dir
+/// fallback for the sidecar build below).
+fn user_cache_root() -> Option<PathBuf> {
     let cache_root = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
-    let Some(cache_root) = cache_root else {
-        return std::env::temp_dir().join("goverify-extractor-bin");
-    };
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
     let dir = cache_root.join("goverify");
     let _ = std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&dir);
-    dir.join("extractor-bin")
+    Some(dir)
+}
+
+/// Sidecar build cache root: user-scoped (`user_cache_root()`), created
+/// 0700. A predictable, world-writable-parent path (bare `temp_dir()`)
+/// would let another local user pre-plant a binary for `Sidecar::build`
+/// to execute unchecked (CWE-377); temp_dir() is used only as a
+/// last-resort fallback.
+fn sidecar_build_dir() -> PathBuf {
+    match user_cache_root() {
+        Some(dir) => dir.join("extractor-bin"),
+        None => std::env::temp_dir().join("goverify-extractor-bin"),
+    }
 }
 
 #[cfg(test)]

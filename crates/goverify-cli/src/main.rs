@@ -14,6 +14,7 @@ use goverify_solver::TextSolver;
 
 mod json;
 mod render;
+mod sarif;
 
 #[derive(Parser)]
 #[command(
@@ -52,6 +53,8 @@ enum OutputFormat {
     Human,
     /// Native machine schema (schema_version 1).
     Json,
+    /// SARIF 2.1.0 for GitHub code scanning.
+    Sarif,
 }
 
 #[derive(clap::Args)]
@@ -497,6 +500,7 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             print!("{}", render::render_findings(&scoped, Path::new(".")));
         }
         OutputFormat::Json => print!("{}", json::render_json(&scoped, &fps, &summary)),
+        OutputFormat::Sarif => print!("{}", sarif::render_sarif(&scoped, &fps, 0)),
     }
     if timings {
         eprintln!(

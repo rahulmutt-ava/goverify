@@ -27,6 +27,7 @@ pub struct Program {
     by_name: HashMap<String, FuncId>,
     funcs: Vec<Option<Function>>, // FuncId → lowered body (None = external)
     func_hashes: Vec<[u8; 32]>,   // FuncId → content hash (see func_ir_hash)
+    func_sem_hashes: Vec<[u8; 32]>, // FuncId → position-blind hash (see func_semantic_hash)
     /// Method sets of named types, keyed by the type's global TypeId,
     /// sorted entries. Used by Task 9's invoke resolution.
     pub method_sets: std::collections::BTreeMap<crate::types::TypeId, Vec<MethodInfo>>,
@@ -111,6 +112,63 @@ fn external_hash(name: &str) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// Position-blind context hash (phase-5b spec §5): `ctx_hash` with
+/// `Pragma.pos` cleared — a comment shift above a pragma must not mark
+/// every function in the package as changed for `--diff-base`.
+fn semantic_ctx_hash(pkg: &gvir::Package) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"goverify-func-semctx\0");
+    let mut field = |bytes: &[u8]| {
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    };
+    field(pkg.schema_version.as_bytes());
+    field(pkg.go_version.as_bytes());
+    field(pkg.extractor_version.as_bytes());
+    field(pkg.import_path.as_bytes());
+    for t in &pkg.types {
+        field(&t.encode_to_vec());
+    }
+    for m in &pkg.method_sets {
+        field(&m.encode_to_vec());
+    }
+    for f in &pkg.files {
+        field(f.path.as_bytes());
+    }
+    for pr in &pkg.pragmas {
+        let mut pr = pr.clone();
+        pr.pos = None;
+        field(&pr.encode_to_vec());
+    }
+    *h.finalize().as_bytes()
+}
+
+/// Position-blind sibling of `func_hash` (phase-5b spec §5): the
+/// function re-encoded with `Function.pos`, every `Instruction.pos`,
+/// and every `Instruction.detail` cleared. `--diff-base` compares these
+/// across git refs, so a comment-only edit (positions shift, semantics
+/// don't) yields an empty changed set (gate G4). `detail` is debug-only
+/// prose (gvir.proto) and is dropped for the same reason.
+/// NEVER a cache-key input: cache keys stay position-sensitive
+/// (`func_hash`) so warm replays render exact positions.
+fn semantic_func_hash(ctx: &[u8; 32], f: &gvir::Function) -> [u8; 32] {
+    let mut g = f.clone();
+    g.pos = None;
+    for b in &mut g.blocks {
+        for i in &mut b.instrs {
+            i.pos = None;
+            i.detail = String::new();
+        }
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"goverify-func-sem\0");
+    h.update(ctx);
+    let bytes = g.encode_to_vec();
+    h.update(&(bytes.len() as u64).to_le_bytes());
+    h.update(&bytes);
+    *h.finalize().as_bytes()
+}
+
 impl Program {
     /// Build from decoded packages. Infallible: malformed content degrades
     /// to diagnostics + havoc (fuzz target decodes arbitrary bytes into
@@ -154,18 +212,22 @@ impl Program {
         // permanently, matching the body table); a bodyless entry only
         // fills the hash in if no bodied entry has won yet.
         p.func_hashes = p.func_names.iter().map(|n| external_hash(n)).collect();
+        p.func_sem_hashes = p.func_hashes.clone(); // externals: same name-only hash
         let mut bodied = vec![false; p.func_names.len()];
         for pkg in &pkgs {
             let ctx = ctx_hash(pkg);
+            let sem_ctx = semantic_ctx_hash(pkg);
             for f in &pkg.functions {
                 if let Some(&id) = p.by_name.get(f.id.as_str()) {
                     let idx = id.0 as usize;
                     if f.blocks.is_empty() {
                         if !bodied[idx] {
                             p.func_hashes[idx] = func_hash(&ctx, f);
+                            p.func_sem_hashes[idx] = semantic_func_hash(&sem_ctx, f);
                         }
                     } else {
                         p.func_hashes[idx] = func_hash(&ctx, f);
+                        p.func_sem_hashes[idx] = semantic_func_hash(&sem_ctx, f);
                         bodied[idx] = true;
                     }
                 }
@@ -263,6 +325,15 @@ impl Program {
     /// `Root::Global` (goverify-analysis effects.rs) together.
     pub fn func_ir_hash(&self, id: FuncId) -> [u8; 32] {
         self.func_hashes
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or([0u8; 32])
+    }
+
+    /// Position-blind sibling of `func_ir_hash` (phase-5b spec §5) —
+    /// `--diff-base`'s changed-function comparator. Not a cache key.
+    pub fn func_semantic_hash(&self, id: FuncId) -> [u8; 32] {
+        self.func_sem_hashes
             .get(id.0 as usize)
             .copied()
             .unwrap_or([0u8; 32])
@@ -557,6 +628,152 @@ mod tests {
             body_moved.func_ir_hash(fb),
             "moving the winning bodied entry's position must change the \
              hash"
+        );
+    }
+
+    #[test]
+    fn semantic_hash_ignores_positions_and_detail_but_not_semantics() {
+        use goverify_extract::gvir;
+        fn pkg(line: u32, op: &str, detail: &str) -> gvir::Package {
+            gvir::Package {
+                schema_version: goverify_extract::SCHEMA_VERSION.to_string(),
+                go_version: "go1.25.10".to_string(),
+                extractor_version: "0.1.0".to_string(),
+                import_path: "example.com/h".to_string(),
+                files: vec![],
+                types: vec![],
+                functions: vec![gvir::Function {
+                    id: "example.com/h.F".to_string(),
+                    name: "F".to_string(),
+                    r#type: 0,
+                    params: vec![],
+                    aux: vec![],
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![gvir::Instruction {
+                            kind: "BinOp".to_string(),
+                            register: 1,
+                            r#type: 0,
+                            operands: vec![],
+                            pos: Some(gvir::Position {
+                                file: 0,
+                                line,
+                                col: 1,
+                            }),
+                            detail: detail.to_string(),
+                            sem: Some(gvir::instruction::Sem::Binop(gvir::BinOpSem {
+                                op: op.to_string(),
+                            })),
+                        }],
+                        succs: vec![],
+                        preds: vec![],
+                    }],
+                    pos: Some(gvir::Position {
+                        file: 0,
+                        line,
+                        col: 1,
+                    }),
+                }],
+                method_sets: vec![],
+                pragmas: vec![],
+            }
+        }
+        let base = Program::from_packages(vec![pkg(1, "+", "a + b")]);
+        let shifted = Program::from_packages(vec![pkg(50, "+", "a + b")]);
+        let redetailed = Program::from_packages(vec![pkg(1, "+", "x + y")]);
+        let changed = Program::from_packages(vec![pkg(1, "*", "a + b")]);
+        let f = base.lookup_func("example.com/h.F").expect("lookup_func");
+
+        // Position shift: ir hash moves (asserted invariant), semantic
+        // hash must NOT (G4: comment-only edits are diff-invisible).
+        assert_ne!(base.func_ir_hash(f), shifted.func_ir_hash(f));
+        assert_eq!(
+            base.func_semantic_hash(f),
+            shifted.func_semantic_hash(f),
+            "positions must not reach the semantic hash"
+        );
+        // detail is debug-only prose: also excluded.
+        assert_eq!(
+            base.func_semantic_hash(f),
+            redetailed.func_semantic_hash(f),
+            "Instruction.detail must not reach the semantic hash"
+        );
+        // A real semantic change moves both.
+        assert_ne!(
+            base.func_semantic_hash(f),
+            changed.func_semantic_hash(f),
+            "operator change is a semantic change"
+        );
+    }
+
+    #[test]
+    fn semantic_hash_of_externals_pins_identity() {
+        // A function only referenced, never declared (an `aux` call-site
+        // reference to an undeclared id): externals hash by name only,
+        // so two identically-built Programs must agree even though
+        // `example.com/h.Ext` never appears as a `gvir::Function` entry.
+        use goverify_extract::gvir;
+        fn pkg() -> gvir::Package {
+            gvir::Package {
+                schema_version: goverify_extract::SCHEMA_VERSION.to_string(),
+                go_version: "go1.25.10".to_string(),
+                extractor_version: "0.1.0".to_string(),
+                import_path: "example.com/h".to_string(),
+                files: vec![],
+                types: vec![],
+                functions: vec![gvir::Function {
+                    id: "example.com/h.F".to_string(),
+                    name: "F".to_string(),
+                    r#type: 0,
+                    params: vec![],
+                    aux: vec![gvir::AuxValue {
+                        id: 1,
+                        kind: "Function".to_string(),
+                        repr: "example.com/h.Ext".to_string(),
+                        r#type: 0,
+                        r#const: None,
+                    }],
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![gvir::Instruction {
+                            kind: "Call".to_string(),
+                            register: 1,
+                            r#type: 0,
+                            operands: vec![1],
+                            pos: None,
+                            detail: String::new(),
+                            sem: Some(gvir::instruction::Sem::Call(gvir::CallSem {
+                                static_callee: "example.com/h.Ext".to_string(),
+                                method: String::new(),
+                                iface_type: 0,
+                                invoke: false,
+                                builtin: String::new(),
+                                method_sig: 0,
+                            })),
+                        }],
+                        succs: vec![],
+                        preds: vec![],
+                    }],
+                    pos: None,
+                }],
+                method_sets: vec![],
+                pragmas: vec![],
+            }
+        }
+        // `lower_package` must actually intern the callee for this test to
+        // exercise the external path; if it doesn't, `lookup_func` below
+        // returns None and the test fails loudly rather than vacuously
+        // passing.
+        let p1 = Program::from_packages(vec![pkg()]);
+        let p2 = Program::from_packages(vec![pkg()]);
+        let ext = p1
+            .lookup_func("example.com/h.Ext")
+            .expect("callee must be interned as an external");
+        assert_eq!(
+            p1.func_semantic_hash(ext),
+            p2.func_semantic_hash(ext),
+            "external semantic hash is name-only and must be stable across \
+             identically-built Programs"
         );
     }
 }

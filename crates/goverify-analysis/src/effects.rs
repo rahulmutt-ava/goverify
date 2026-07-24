@@ -50,6 +50,10 @@ pub enum Spawns {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Root {
     Param(u32),
+    /// Identity-only: analyses key globals by name, never by
+    /// initializer value. If that changes, the SCC cache's ctx-hash
+    /// (goverify-ir func_ir_hash) must start keying file content —
+    /// see its INVARIANT note.
     Global(String),
     /// Alloc-site identity: the allocating instruction's dst ValueId —
     /// only meaningful within its own function; `rebase` maps it to

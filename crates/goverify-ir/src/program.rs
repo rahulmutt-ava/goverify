@@ -253,6 +253,14 @@ impl Program {
     /// see `ctx_hash`'s doc comment). See phase-5a spec §2: this is the
     /// member-hash input to the SCC cache key. Externals hash their name
     /// only.
+    ///
+    /// INVARIANT (SCC-cache soundness): dropping file content from the
+    /// package context is sound only while checkers treat globals and
+    /// externals as identity-only (no checker reads a global's literal
+    /// initializer value or an external's link target). A future checker
+    /// that derives facts from global VALUES needs an invalidation edge
+    /// the call-graph SCC key cannot express — revisit this hash and
+    /// `Root::Global` (goverify-analysis effects.rs) together.
     pub fn func_ir_hash(&self, id: FuncId) -> [u8; 32] {
         self.func_hashes
             .get(id.0 as usize)

@@ -63,14 +63,34 @@ pub fn wants_in(dir: &Path) -> Vec<(String, u32, String)> {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let text = std::fs::read_to_string(&path).unwrap();
         for (i, line) in text.lines().enumerate() {
-            let Some(rest) = line.split("// want:").nth(1) else {
+            // Trailing-comment position only (wave-2 follow-up, twice
+            // bitten by prose): the marker must be the line's LAST `//`
+            // comment, there must be real code before it, and every tag
+            // must be a bare [a-z0-9-]+ token. Anything else is prose.
+            let Some(idx) = line.rfind("//") else {
                 continue;
             };
-            for tag in rest.split(',') {
-                let tag = tag.trim();
-                if !tag.is_empty() {
-                    out.push((name.clone(), (i + 1) as u32, tag.to_string()));
-                }
+            let (code, comment) = line.split_at(idx);
+            let Some(rest) = comment.strip_prefix("//") else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix("want:") else {
+                continue;
+            };
+            if code.trim().is_empty() || code.trim_start().starts_with("//") {
+                continue; // whole-line or comment-only prefix: prose, not a pin
+            }
+            let tags: Vec<&str> = rest.split(',').map(str::trim).collect();
+            let valid = |t: &str| {
+                !t.is_empty()
+                    && t.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            };
+            if !tags.iter().all(|t| valid(t)) {
+                continue; // prose after "want:" — not a tag list
+            }
+            for tag in tags {
+                out.push((name.clone(), (i + 1) as u32, tag.to_string()));
             }
         }
     }
@@ -97,6 +117,31 @@ mod tests {
                 ("a.go".into(), 3, "bounds".into()),
                 ("a.go".into(), 3, "div-zero".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn wants_ignores_prose_and_whole_line_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.go"),
+            concat!(
+                "package a\n",
+                "// This pin exists because the // want: parser used to\n", // prose: whole-line comment
+                "// match `// want: overflow` anywhere in a line.\n", // prose: marker mid-comment
+                "func F(x int) int {\n",
+                "\treturn x + x // want: overflow\n", // real pin
+                "}\n",
+                "// want: nil-deref\n", // whole-line marker: NOT a pin
+                "func G() { _ = 1 } // want: not a valid tag list\n", // invalid tags: NOT a pin
+            ),
+        )
+        .unwrap();
+        let got = wants_in(dir.path());
+        assert_eq!(
+            got,
+            vec![("a.go".to_string(), 5, "overflow".to_string())],
+            "wants_in(): only the trailing-comment marker with valid tags parses"
         );
     }
 }

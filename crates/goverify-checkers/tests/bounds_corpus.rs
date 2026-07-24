@@ -30,6 +30,38 @@ fn run(emit: Option<std::path::PathBuf>) -> String {
     dump_findings(&a, Some("example.com/bounds"))
 }
 
+fn run_with_cache(cache_dir: std::path::PathBuf) -> (String, u64, u64) {
+    let p = goverify_ir::testutil::load_corpus("bounds");
+    let cfg = EngineConfig {
+        opts: Options::default(),
+        cache_dir: Some(cache_dir),
+        emit_smt: None,
+    };
+    let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&BoundsChecker];
+    let a = analyze_full(&p, &cfg, &checkers, &|_role| {
+        Box::new(Z3Native::new(limits()))
+    });
+    (
+        dump_findings(&a, Some("example.com/bounds")),
+        a.scc_cache_hits,
+        a.scc_cache_misses,
+    )
+}
+
+#[test]
+fn cold_and_warm_cache_runs_are_byte_identical() {
+    let cache = tempfile::tempdir().unwrap();
+    let (cold, cold_hits, cold_misses) = run_with_cache(cache.path().to_path_buf());
+    let (warm, warm_hits, warm_misses) = run_with_cache(cache.path().to_path_buf());
+    assert_eq!(cold, warm, "cold vs warm findings must be byte-identical");
+    assert_eq!(cold_hits, 0, "first run must be all misses");
+    assert!(cold_misses > 0, "cold run must populate the cache");
+    assert_eq!(warm_misses, 0, "warm run must be all hits");
+    assert_eq!(warm_hits, cold_misses, "every SCC replays from cache");
+    // Not vacuous: the uncached baseline must agree too.
+    assert_eq!(cold, run(None), "cached output equals uncached output");
+}
+
 #[test]
 fn bounds_corpus_findings_match_want_comments() {
     let p = goverify_ir::testutil::load_corpus("bounds");

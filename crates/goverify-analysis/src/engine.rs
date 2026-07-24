@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rayon::prelude::*;
 
@@ -69,6 +70,11 @@ pub struct Analysis {
     pub prepass: BTreeMap<FuncId, Domains>,
     pub diagnostics: Vec<String>,
     pub findings: Vec<Finding>,
+    /// Per-SCC cache accounting (phase-5a spec §4). Both 0 when
+    /// `cfg.cache_dir` is `None` or `checkers` is empty (no cache is
+    /// constructed in either case).
+    pub scc_cache_hits: u64,
+    pub scc_cache_misses: u64,
 }
 
 /// Phase-2-compatible entry point: no checkers, no findings, `StubSolver`
@@ -147,9 +153,69 @@ pub fn analyze_full(
     // resulting `Vec<String>` order independent of rayon's scheduling.
     let diag_slots: Vec<Mutex<Option<String>>> = (0..n_funcs).map(|_| Mutex::new(None)).collect();
 
+    // Per-SCC cache (phase-5a spec §4). Only constructed when a cache dir
+    // is configured AND there are checkers: the checker-less debug
+    // prepass/summary paths run the fixpoint with no findings and must
+    // stay allocation-free (and never poison entries). Probe one backend
+    // per role for identity/limits — with the lazy escalated tier this
+    // allocates one Z3 context per probe, freed immediately.
+    let scc_cache = cfg
+        .cache_dir
+        .clone()
+        .filter(|_| !checkers.is_empty())
+        .map(|root| {
+            let infer_probe = mk_backend(BackendRole::Infer);
+            let findings_probe = mk_backend(BackendRole::Findings);
+            crate::scc_cache::SccCache::open(
+                root,
+                &crate::scc_cache::CacheConfigKey {
+                    solver_identity: infer_probe.identity(),
+                    infer_limits: infer_probe.limits(),
+                    findings_limits: findings_probe.limits(),
+                    widen_after: cfg.opts.widen_after,
+                    checkers: checkers.iter().map(|c| (c.name(), c.version())).collect(),
+                },
+            )
+        });
+    let scc_keys = scc_cache.as_ref().map(|c| c.keys(p, &sccs));
+    let hits = AtomicU64::new(0);
+    let misses = AtomicU64::new(0);
+    // Replay payload per function: findings + findings-phase diags from a
+    // cache hit, consumed by the sequential findings pass below.
+    struct Replay {
+        findings: Vec<Finding>,
+        findings_diags: Vec<String>,
+    }
+    let replay_slots: Vec<Mutex<Option<Replay>>> = (0..n_funcs).map(|_| Mutex::new(None)).collect();
+    // Track which schedule positions were misses (need a `put` later).
+    let fresh_sccs: Vec<AtomicBool> = (0..n_sccs).map(|_| AtomicBool::new(false)).collect();
+
     for wave in &waves {
         wave.par_iter().for_each(|&si| {
             let members = &sccs.schedule()[si];
+            // Cache hit: replay this SCC's cached summaries/diags/findings
+            // straight into the slots, skipping analysis entirely. The
+            // integrity guard (`entry_matches`) turns any decoded entry
+            // whose member names don't line up with this SCC into a miss.
+            if let (Some(cache), Some(keys)) = (scc_cache.as_ref(), scc_keys.as_ref())
+                && let Some(entry) = cache.get(&keys[si])
+                && entry_matches(members, &entry, p)
+            {
+                hits.fetch_add(1, Ordering::Relaxed);
+                for (m, me) in members.iter().zip(entry.members) {
+                    *slots[m.0 as usize].lock().unwrap() = Some(me.summary);
+                    *diag_slots[m.0 as usize].lock().unwrap() = me.analysis_diag;
+                    *replay_slots[m.0 as usize].lock().unwrap() = Some(Replay {
+                        findings: me.findings,
+                        findings_diags: me.findings_diags,
+                    });
+                }
+                return;
+            }
+            if scc_cache.is_some() {
+                misses.fetch_add(1, Ordering::Relaxed);
+                fresh_sccs[si].store(true, Ordering::Relaxed);
+            }
             let recursive =
                 members.len() > 1 || members.iter().any(|&m| graph.callees(m).contains(&m));
             let mut current: BTreeMap<FuncId, Summary> = members
@@ -239,10 +305,24 @@ pub fn analyze_full(
     // pattern as summaries above if profiling asks.
     let mut findings: Vec<Finding> = Vec::new();
     let mut findings_diagnostics: Vec<String> = Vec::new();
+    // Per-function fresh-path capture, consumed by the post-findings `put`
+    // below. Only written meaningfully when the cache is on; a `None`-vec
+    // is cheap otherwise.
+    let mut fresh_out: Vec<Option<Vec<Finding>>> = vec![None; n_funcs];
+    let mut fresh_diags: Vec<Vec<String>> = vec![Vec::new(); n_funcs];
     if !checkers.is_empty() {
         let mut backend = mk_backend(BackendRole::Findings);
         let summary_of = |f: FuncId| summaries.get(&f).cloned().unwrap_or_else(Summary::havoc);
         for f in p.func_ids() {
+            // Cache-hit replay: this function's SCC was served from cache,
+            // so replay its stored (pre-sorted) findings and findings-phase
+            // diagnostics without encoding or solving anything.
+            if let Some(r) = replay_slots[f.0 as usize].lock().unwrap().take() {
+                findings.extend(r.findings);
+                findings_diagnostics.extend(r.findings_diags);
+                continue;
+            }
+            let diags_before = findings_diagnostics.len();
             // Spec §8 ("oversized function → skip with diagnostic"): every
             // checker encodes `f` internally and bails silently on an
             // `encode_func_with` error (e.g. a function past the assertion
@@ -317,6 +397,9 @@ pub fn analyze_full(
                 Ok(mut per_func) => {
                     per_func
                         .sort_by(|a, b| a.pos.cmp(&b.pos).then_with(|| a.message.cmp(&b.message)));
+                    if scc_cache.is_some() {
+                        fresh_out[f.0 as usize] = Some(per_func.clone());
+                    }
                     findings.extend(per_func);
                 }
                 Err(_) => {
@@ -324,17 +407,59 @@ pub fn analyze_full(
                         "internal: panic while checking {}; findings for this function dropped",
                         p.func_name(f)
                     ));
+                    // A panicked function still caches its (empty findings +
+                    // panic diagnostic) result: the empty findings are set
+                    // explicitly here, the diagnostic is picked up by the
+                    // `diags_before..` delta below.
+                    if scc_cache.is_some() {
+                        fresh_out[f.0 as usize] = Some(Vec::new());
+                    }
                 }
+            }
+            if scc_cache.is_some() {
+                fresh_diags[f.0 as usize] = findings_diagnostics[diags_before..].to_vec();
             }
         }
     }
     diagnostics.extend(findings_diagnostics);
+
+    // Post-findings put: persist every SCC that was freshly analyzed this
+    // run (hits are already on disk). Members are written in schedule
+    // order, matching what `entry_matches` expects on replay.
+    if let (Some(cache), Some(keys)) = (scc_cache.as_ref(), scc_keys.as_ref()) {
+        for si in 0..sccs.schedule().len() {
+            if !fresh_sccs[si].load(Ordering::Relaxed) {
+                continue;
+            }
+            let members = &sccs.schedule()[si];
+            let entry = crate::scc_cache::SccEntry {
+                members: members
+                    .iter()
+                    .map(|&m| crate::scc_cache::MemberEntry {
+                        func: p.func_name(m).to_string(),
+                        summary: slots[m.0 as usize]
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .unwrap_or_else(Summary::havoc),
+                        analysis_diag: diag_slots[m.0 as usize].lock().unwrap().clone(),
+                        findings: fresh_out[m.0 as usize].clone().unwrap_or_default(),
+                        findings_diags: fresh_diags[m.0 as usize].clone(),
+                    })
+                    .collect(),
+            };
+            // Write failure degrades to slower, never wrong (spec §5).
+            let _ = cache.put(&keys[si], &entry);
+        }
+    }
 
     Analysis {
         summaries,
         prepass: pre,
         diagnostics,
         findings,
+        scc_cache_hits: hits.load(Ordering::Relaxed),
+        scc_cache_misses: misses.load(Ordering::Relaxed),
     }
 }
 
@@ -345,6 +470,18 @@ pub fn analyze_full(
 fn is_param_binding(name: &str) -> bool {
     name.strip_prefix('p')
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Integrity guard for a decoded cache entry: its member list must line
+/// up name-for-name with this SCC's schedule-order members. A hash
+/// collision or stale-format entry that decodes but doesn't match is
+/// treated as a miss (re-analyzed and overwritten), never a mismatch.
+fn entry_matches(members: &[FuncId], entry: &crate::scc_cache::SccEntry, p: &Program) -> bool {
+    members.len() == entry.members.len()
+        && members
+            .iter()
+            .zip(&entry.members)
+            .all(|(m, me)| p.func_name(*m) == me.func)
 }
 
 /// Reconstruct the violating path for a Sat finding: re-encode (cheap,

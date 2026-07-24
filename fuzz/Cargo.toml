@@ -14,6 +14,7 @@ goverify-extract = { path = "../crates/goverify-extract" }
 goverify-ir = { path = "../crates/goverify-ir" }
 goverify-solver = { path = "../crates/goverify-solver" }
 goverify-analysis = { path = "../crates/goverify-analysis" }
+goverify-cli = { path = "../crates/goverify-cli" }
 
 [[bin]]
 name = "gvir_decode"
@@ -46,6 +47,13 @@ bench = false
 [[bin]]
 name = "scc_entry"
 path = "fuzz_targets/scc_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "baseline_parse"
+path = "fuzz_targets/baseline_parse.rs"
 test = false
 doc = false
 bench = false

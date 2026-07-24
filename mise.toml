@@ -77,6 +77,7 @@ run = [
   "mkdir -p fuzz/corpus/ir_encode",
   "cargo +nightly fuzz run ir_encode fuzz/corpus/ir_encode fuzz/seeds/ir_encode -- -max_total_time=60",
   "cargo +nightly fuzz run scc_entry -- -max_total_time=60",
+  "cargo +nightly fuzz run baseline_parse -- -max_total_time=60",
 ]
 dir = "{{cwd}}"
 

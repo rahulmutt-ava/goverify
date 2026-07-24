@@ -14,16 +14,21 @@ pub fn repo_root() -> PathBuf {
         .unwrap()
 }
 
-/// Extract testdata/corpus/<module> (whole DAG) into a kept temp dir and
-/// load it. Panics on failure — test-only code.
-pub fn load_corpus(module: &str) -> Program {
+/// Extract + load an arbitrary Go module directory (invalidation tests
+/// write fixtures to a tempdir and re-extract between runs).
+pub fn load_module(module_dir: &Path) -> Program {
     let root = repo_root();
     let sc = Sidecar::build(&root.join("extractor"), &root.join("target/extractor-bin"))
         .expect("Sidecar::build");
     let dir = tempfile::tempdir().expect("tempdir").keep();
-    sc.extract(&root.join("testdata/corpus").join(module), &["./..."], &dir)
-        .expect("extract");
+    sc.extract(module_dir, &["./..."], &dir).expect("extract");
     Program::load_dir(&dir).expect("load_dir")
+}
+
+/// Extract testdata/corpus/<module> (whole DAG) into a kept temp dir and
+/// load it. Panics on failure — test-only code.
+pub fn load_corpus(module: &str) -> Program {
+    load_module(&repo_root().join("testdata/corpus").join(module))
 }
 
 /// Byte-exact golden comparison. UPDATE_GOLDENS=1 rewrites the file;

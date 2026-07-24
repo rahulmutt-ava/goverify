@@ -109,6 +109,14 @@ struct CheckArgs {
     /// formats for CI. Machine formats are byte-identical across runs.
     #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
     format: OutputFormat,
+    /// Baseline file to suppress known findings (default:
+    /// .goverify/baseline.json when it exists — spec §4). The exit code
+    /// gates on the post-suppression count.
+    #[arg(long, conflicts_with = "no_baseline")]
+    baseline: Option<PathBuf>,
+    /// Ignore any baseline file.
+    #[arg(long)]
+    no_baseline: bool,
 }
 
 #[derive(clap::Args)]
@@ -547,21 +555,76 @@ fn acquire_program(
     }
 }
 
+/// Baseline filtering (spec §4). An explicit --baseline must exist; the
+/// implicit .goverify/baseline.json applies only when present. A
+/// malformed or unreadable file is a hard error (exit 2 via run()) —
+/// the documented degrade-never-die exception: this is user-authored
+/// gate configuration, and silently reporting unfiltered findings would
+/// flood CI and misreport the gate. Returns (kept findings, their
+/// fingerprints, suppressed count).
+#[allow(clippy::type_complexity)] // interface fixed by the phase-5b plan (Task 10 relocates this call)
+fn apply_baseline(
+    ca: &CheckArgs,
+    findings: Vec<goverify_analysis::Finding>,
+    fps: Vec<String>,
+) -> Result<(Vec<goverify_analysis::Finding>, Vec<String>, usize), Box<dyn std::error::Error>> {
+    let path: Option<PathBuf> = if ca.no_baseline {
+        None
+    } else {
+        match &ca.baseline {
+            Some(p) => {
+                if !p.is_file() {
+                    return Err(format!("baseline {} not found", p.display()).into());
+                }
+                Some(p.clone())
+            }
+            None => {
+                let implied = Path::new(".goverify").join("baseline.json");
+                implied.is_file().then_some(implied)
+            }
+        }
+    };
+    let Some(path) = path else {
+        return Ok((findings, fps, 0));
+    };
+    let bytes = std::fs::read(&path).map_err(|e| format!("baseline {}: {e}", path.display()))?;
+    let b = goverify_cli::baseline::parse(&bytes)
+        .map_err(|e| format!("baseline {}: {e}", path.display()))?;
+    let set: std::collections::HashSet<&str> =
+        b.entries.iter().map(|e| e.fingerprint.as_str()).collect();
+    let mut kept = Vec::new();
+    let mut kept_fps = Vec::new();
+    let mut suppressed = 0usize;
+    for (f, fp) in findings.into_iter().zip(fps) {
+        if set.contains(fp.as_str()) {
+            suppressed += 1;
+        } else {
+            kept.push(f);
+            kept_fps.push(fp);
+        }
+    }
+    Ok((kept, kept_fps, suppressed))
+}
+
 fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let a = analyze_module(&ca)?;
     let t_render = std::time::Instant::now();
     let fps = goverify_cli::fingerprint::fingerprints(&a.scoped);
+    let (scoped, fps, suppressed) = apply_baseline(&ca, a.scoped, fps)?;
     let summary = json::Summary {
-        total: a.scoped.len(),
-        suppressed_by_baseline: 0,
+        total: scoped.len(),
+        suppressed_by_baseline: suppressed,
         diff_base_scoped: false,
     };
     match ca.format {
         OutputFormat::Human => {
-            print!("{}", render::render_findings(&a.scoped, Path::new(".")));
+            print!("{}", render::render_findings(&scoped, Path::new(".")));
+            if suppressed > 0 {
+                println!("goverify: baseline: {suppressed} finding(s) suppressed");
+            }
         }
-        OutputFormat::Json => print!("{}", json::render_json(&a.scoped, &fps, &summary)),
-        OutputFormat::Sarif => print!("{}", sarif::render_sarif(&a.scoped, &fps, 0)),
+        OutputFormat::Json => print!("{}", json::render_json(&scoped, &fps, &summary)),
+        OutputFormat::Sarif => print!("{}", sarif::render_sarif(&scoped, &fps, suppressed)),
     }
     if a.timings {
         eprintln!(
@@ -569,7 +632,7 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             t_render.elapsed().as_secs_f64()
         );
     }
-    Ok(if a.scoped.is_empty() {
+    Ok(if scoped.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -581,6 +644,11 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
 /// success regardless of finding count — recording findings is the
 /// point.
 fn run_baseline_write(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    if ca.baseline.is_some() || ca.no_baseline {
+        return Err("baseline write records the full finding set; \
+                    --baseline/--no-baseline do not apply"
+            .into());
+    }
     let a = analyze_module(&ca)?;
     let fps = goverify_cli::fingerprint::fingerprints(&a.scoped);
     let dir = Path::new(".goverify");

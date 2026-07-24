@@ -21,7 +21,7 @@ pub use discharge::discharge_query;
 pub use printer::{Logic, Query};
 pub use process::SmtLib2Process;
 pub use reader::{ReadError, SExpr, parse_query, parse_response, parse_sexpr};
-pub use retry::{RetryBackend, escalation_count};
+pub use retry::{LazySolver, RetryBackend, escalation_count};
 pub use sort::{CtorDecl, DatatypeDecl, Sort, SortError, ptr_datatype, ptr_sort};
 pub use term::Term; // Term is now THE typed term; the AstTerm alias is gone.
 pub use term::{BvBinOp, BvCmpOp, ptr_is_nil, ptr_nil};

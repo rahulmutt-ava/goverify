@@ -50,3 +50,99 @@ impl TextSolver for RetryBackend {
         Some(&mut *self.escalated)
     }
 }
+
+/// A TextSolver whose inner backend is constructed on first
+/// `solve_text` (wave-2 follow-up: the escalated tier's Z3 context was
+/// allocated per SCC but used only when a query actually escalates).
+/// `identity`/`limits` are carried as data so the query-cache key can
+/// be computed without forcing construction.
+pub struct LazySolver {
+    identity: String,
+    limits: SolverLimits,
+    make: Box<dyn FnMut() -> Box<dyn TextSolver> + Send>,
+    inner: Option<Box<dyn TextSolver>>,
+}
+
+impl LazySolver {
+    pub fn new(
+        identity: String,
+        limits: SolverLimits,
+        make: Box<dyn FnMut() -> Box<dyn TextSolver> + Send>,
+    ) -> LazySolver {
+        LazySolver {
+            identity,
+            limits,
+            make,
+            inner: None,
+        }
+    }
+}
+
+impl TextSolver for LazySolver {
+    fn identity(&self) -> String {
+        self.identity.clone()
+    }
+    fn limits(&self) -> SolverLimits {
+        self.limits
+    }
+    fn solve_text(&mut self, canonical: &str) -> QueryOutcome {
+        if self.inner.is_none() {
+            self.inner = Some((self.make)());
+        }
+        self.inner
+            .as_mut()
+            .expect("just constructed")
+            .solve_text(canonical)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+    use crate::{QueryOutcome, SatResult};
+
+    struct CountingFake;
+    impl TextSolver for CountingFake {
+        fn identity(&self) -> String {
+            "fake".to_string()
+        }
+        fn limits(&self) -> SolverLimits {
+            SolverLimits::default()
+        }
+        fn solve_text(&mut self, _canonical: &str) -> QueryOutcome {
+            QueryOutcome {
+                result: SatResult::Unsat,
+                model: None,
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_solver_defers_construction_until_first_solve() {
+        let built = Arc::new(AtomicU32::new(0));
+        let b = built.clone();
+        let mut lazy = LazySolver::new(
+            "fake".to_string(),
+            SolverLimits::default(),
+            Box::new(move || {
+                b.fetch_add(1, Ordering::SeqCst);
+                Box::new(CountingFake)
+            }),
+        );
+        // identity/limits answer WITHOUT constructing the inner solver.
+        assert_eq!(lazy.identity(), "fake", "LazySolver::identity()");
+        assert_eq!(
+            lazy.limits(),
+            SolverLimits::default(),
+            "LazySolver::limits()"
+        );
+        assert_eq!(built.load(Ordering::SeqCst), 0, "no construction yet");
+        // First solve constructs exactly once; second reuses.
+        let _ = lazy.solve_text("(check-sat)\n");
+        let _ = lazy.solve_text("(check-sat)\n");
+        assert_eq!(built.load(Ordering::SeqCst), 1, "constructed exactly once");
+    }
+}

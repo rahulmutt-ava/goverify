@@ -10,6 +10,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use goverify_extract::Sidecar;
+use goverify_solver::TextSolver;
 
 mod render;
 
@@ -262,14 +263,34 @@ fn retry_backend(
 ) -> Box<dyn goverify_solver::TextSolver> {
     let esc = escalated(lim);
     match cmd {
-        Some(c) => Box::new(goverify_solver::RetryBackend::new(
-            Box::new(goverify_solver::SmtLib2Process::new(c, lim)),
-            Box::new(goverify_solver::SmtLib2Process::new(c, esc)),
-        )),
-        None => Box::new(goverify_solver::RetryBackend::new(
-            Box::new(goverify_solver::Z3Native::new(lim)),
-            Box::new(goverify_solver::Z3Native::new(esc)),
-        )),
+        Some(c) => {
+            let base = goverify_solver::SmtLib2Process::new(c, lim);
+            let identity = base.identity();
+            let c = c.clone();
+            Box::new(goverify_solver::RetryBackend::new(
+                Box::new(base),
+                Box::new(goverify_solver::LazySolver::new(
+                    identity,
+                    esc,
+                    Box::new(move || Box::new(goverify_solver::SmtLib2Process::new(&c, esc))),
+                )),
+            ))
+        }
+        None => {
+            let base = goverify_solver::Z3Native::new(lim);
+            // Same z3 build, same identity string — safe to carry as
+            // data; the escalated tier's cache entries stay keyed
+            // identically to the eager construction they replace.
+            let identity = base.identity();
+            Box::new(goverify_solver::RetryBackend::new(
+                Box::new(base),
+                Box::new(goverify_solver::LazySolver::new(
+                    identity,
+                    esc,
+                    Box::new(move || Box::new(goverify_solver::Z3Native::new(esc))),
+                )),
+            ))
+        }
     }
 }
 

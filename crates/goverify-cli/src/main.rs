@@ -327,7 +327,18 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         func: None,
         patterns: ca.patterns.clone(),
     };
+    // Phase wall-clocks on stderr, opt-in via GOVERIFY_TIMINGS=1 (spec
+    // §6 rider 1 / G4). stderr only: stdout is the cold/warm
+    // byte-identity surface.
+    let timings = std::env::var_os("GOVERIFY_TIMINGS").is_some();
+    let t_extract = std::time::Instant::now();
     let program = load_program(&dargs)?;
+    if timings {
+        eprintln!(
+            "goverify: timing: extract+load {:.2}s",
+            t_extract.elapsed().as_secs_f64()
+        );
+    }
     for d in program.diagnostics() {
         eprintln!("goverify: {d}");
     }
@@ -358,7 +369,14 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         &goverify_checkers::NilChecker,
         &goverify_checkers::BoundsChecker,
     ];
+    let t_analyze = std::time::Instant::now();
     let a = goverify_analysis::analyze_full(&program, &cfg, &checkers, &*mk);
+    if timings {
+        eprintln!(
+            "goverify: timing: analyze {:.2}s",
+            t_analyze.elapsed().as_secs_f64()
+        );
+    }
     for d in &a.diagnostics {
         eprintln!("goverify: {d}");
     }
@@ -366,6 +384,7 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     if esc > 0 {
         eprintln!("goverify: solver: {esc} queries escalated to the retry tier");
     }
+    let t_render = std::time::Instant::now();
     // Scope findings to the analyzed module: extraction walks the whole
     // import closure (stdlib + deps), so `a.findings` covers far more than
     // the user asked to check. Inference/summaries above already used the
@@ -383,6 +402,12 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
     };
     print!("{}", render::render_findings(&scoped, Path::new(".")));
+    if timings {
+        eprintln!(
+            "goverify: timing: scope+render {:.2}s",
+            t_render.elapsed().as_secs_f64()
+        );
+    }
     Ok(if scoped.is_empty() {
         ExitCode::SUCCESS
     } else {

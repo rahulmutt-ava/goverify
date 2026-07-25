@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	schemaVersion    = "3"
+	schemaVersion    = "4"
 	extractorVersion = "0.1.0"
 )
 
@@ -32,7 +32,8 @@ const (
 type emitter struct {
 	fset    *token.FileSet
 	pkg     *packages.Package
-	goroot  string // resolved via `go env GOROOT` by the caller; "" if unresolved
+	prog    *ssa.Program // for resolving a *types.Func to its SSA function (pragma decl-id alignment)
+	goroot  string       // resolved via `go env GOROOT` by the caller; "" if unresolved
 	out     *gvirpb.Package
 	typeIDs map[string]uint32
 	fileIDs map[string]uint32
@@ -42,6 +43,7 @@ func extractPackage(fset *token.FileSet, p *packages.Package, sp *ssa.Package, f
 	e := &emitter{
 		fset:    fset,
 		pkg:     p,
+		prog:    sp.Prog,
 		goroot:  goroot,
 		typeIDs: map[string]uint32{},
 		fileIDs: map[string]uint32{},
@@ -437,6 +439,12 @@ func (e *emitter) emitFunction(fn *ssa.Function) *gvirpb.Function {
 			Type: e.typeID(p.Type()),
 		})
 	}
+	// Result names come from the ORIGINAL signature, never the
+	// canonicalized one (canonicalization blanks names for determinism).
+	sig := fn.Signature
+	for i := range sig.Results().Len() {
+		f.ResultNames = append(f.ResultNames, sig.Results().At(i).Name())
+	}
 	for _, fv := range fn.FreeVars {
 		f.Aux = append(f.Aux, &gvirpb.AuxValue{
 			Id:   assign(fv),
@@ -656,7 +664,14 @@ func (e *emitter) emitPragmas() {
 			case *ast.FuncDecl:
 				doc = d.Doc
 				if obj, ok := e.pkg.TypesInfo.Defs[d.Name].(*types.Func); ok {
-					declID = obj.FullName()
+					// Prefer the SSA id so Rust-side pragma->function
+					// matching is exact; generic origins fall back to
+					// FullName() and match instantiations by prefix.
+					if ssaFn := e.prog.FuncValue(obj); ssaFn != nil {
+						declID = canonFuncID(ssaFn)
+					} else {
+						declID = obj.FullName()
+					}
 				}
 			case *ast.GenDecl:
 				doc = d.Doc

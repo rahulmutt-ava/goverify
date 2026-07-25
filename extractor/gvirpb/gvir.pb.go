@@ -102,7 +102,7 @@ func (TypeKind) EnumDescriptor() ([]byte, []int) {
 
 type Package struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
-	SchemaVersion    string                 `protobuf:"bytes,1,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`          // gvir schema version; loader rejects mismatches
+	SchemaVersion    string                 `protobuf:"bytes,1,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`          // gvir schema version; loader rejects mismatches; current value "4"
 	GoVersion        string                 `protobuf:"bytes,2,opt,name=go_version,json=goVersion,proto3" json:"go_version,omitempty"`                      // Go toolchain, e.g. "go1.25.5"
 	ExtractorVersion string                 `protobuf:"bytes,3,opt,name=extractor_version,json=extractorVersion,proto3" json:"extractor_version,omitempty"` // extractor's own version constant
 	ImportPath       string                 `protobuf:"bytes,4,opt,name=import_path,json=importPath,proto3" json:"import_path,omitempty"`
@@ -683,14 +683,19 @@ func (x *Position) GetCol() uint32 {
 // (const/global/function/builtin) is assigned the next id as an
 // AuxValue at first encounter. The walk is deterministic, so ids are.
 type Function struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"` // ssa.Function.String(), e.g. "(*example.com/m.T).Close"
-	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	Type          uint32                 `protobuf:"varint,3,opt,name=type,proto3" json:"type,omitempty"`    // signature type id
-	Params        []*Param               `protobuf:"bytes,4,rep,name=params,proto3" json:"params,omitempty"` // declaration order
-	Aux           []*AuxValue            `protobuf:"bytes,5,rep,name=aux,proto3" json:"aux,omitempty"`       // ascending id
-	Blocks        []*BasicBlock          `protobuf:"bytes,6,rep,name=blocks,proto3" json:"blocks,omitempty"` // by block index; empty for bodyless funcs
-	Pos           *Position              `protobuf:"bytes,7,opt,name=pos,proto3" json:"pos,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Id     string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"` // ssa.Function.String(), e.g. "(*example.com/m.T).Close"
+	Name   string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Type   uint32                 `protobuf:"varint,3,opt,name=type,proto3" json:"type,omitempty"`    // signature type id
+	Params []*Param               `protobuf:"bytes,4,rep,name=params,proto3" json:"params,omitempty"` // declaration order
+	Aux    []*AuxValue            `protobuf:"bytes,5,rep,name=aux,proto3" json:"aux,omitempty"`       // ascending id
+	Blocks []*BasicBlock          `protobuf:"bytes,6,rep,name=blocks,proto3" json:"blocks,omitempty"` // by block index; empty for bodyless funcs
+	Pos    *Position              `protobuf:"bytes,7,opt,name=pos,proto3" json:"pos,omitempty"`
+	// Signature result names in declaration order ("" for unnamed).
+	// Length always equals the signature's result count. Names come from
+	// the ORIGINAL signature (canonicalized signature types blank names
+	// for determinism; this field is the sole carrier of result names).
+	ResultNames   []string `protobuf:"bytes,8,rep,name=result_names,json=resultNames,proto3" json:"result_names,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -770,6 +775,13 @@ func (x *Function) GetBlocks() []*BasicBlock {
 func (x *Function) GetPos() *Position {
 	if x != nil {
 		return x.Pos
+	}
+	return nil
+}
+
+func (x *Function) GetResultNames() []string {
+	if x != nil {
+		return x.ResultNames
 	}
 	return nil
 }
@@ -1867,10 +1879,12 @@ func (x *MethodSet) GetMethods() []*Method {
 }
 
 type Pragma struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	DeclId        string                 `protobuf:"bytes,1,opt,name=decl_id,json=declId,proto3" json:"decl_id,omitempty"` // types.Func.FullName() or "pkgpath.Name" of the decl
-	Text          string                 `protobuf:"bytes,2,opt,name=text,proto3" json:"text,omitempty"`                   // full comment line including "//goverify:"
-	Pos           *Position              `protobuf:"bytes,3,opt,name=pos,proto3" json:"pos,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	DeclId string                 `protobuf:"bytes,1,opt,name=decl_id,json=declId,proto3" json:"decl_id,omitempty"` // the SSA function id (== Function.id) for func decls
+	// when resolvable, else types.Func.FullName();
+	// "pkgpath.Name" for type/var decls
+	Text          string    `protobuf:"bytes,2,opt,name=text,proto3" json:"text,omitempty"` // full comment line including "//goverify:"
+	Pos           *Position `protobuf:"bytes,3,opt,name=pos,proto3" json:"pos,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1979,7 +1993,7 @@ const file_proto_gvir_v1_gvir_proto_rawDesc = "" +
 	"\bPosition\x12\x12\n" +
 	"\x04file\x18\x01 \x01(\rR\x04file\x12\x12\n" +
 	"\x04line\x18\x02 \x01(\rR\x04line\x12\x10\n" +
-	"\x03col\x18\x03 \x01(\rR\x03col\"\xe1\x01\n" +
+	"\x03col\x18\x03 \x01(\rR\x03col\"\x84\x02\n" +
 	"\bFunction\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +
@@ -1987,7 +2001,8 @@ const file_proto_gvir_v1_gvir_proto_rawDesc = "" +
 	"\x06params\x18\x04 \x03(\v2\x0e.gvir.v1.ParamR\x06params\x12#\n" +
 	"\x03aux\x18\x05 \x03(\v2\x11.gvir.v1.AuxValueR\x03aux\x12+\n" +
 	"\x06blocks\x18\x06 \x03(\v2\x13.gvir.v1.BasicBlockR\x06blocks\x12#\n" +
-	"\x03pos\x18\a \x01(\v2\x11.gvir.v1.PositionR\x03pos\"?\n" +
+	"\x03pos\x18\a \x01(\v2\x11.gvir.v1.PositionR\x03pos\x12!\n" +
+	"\fresult_names\x18\b \x03(\tR\vresultNames\"?\n" +
 	"\x05Param\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\rR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +

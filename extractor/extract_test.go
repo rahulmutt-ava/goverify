@@ -44,8 +44,8 @@ func TestExtractHelloMetadata(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing package example.com/hello; got %v", keys(pkgs))
 	}
-	if p.GetSchemaVersion() != "3" {
-		t.Errorf("schema_version = %q, want \"3\"", p.GetSchemaVersion())
+	if p.GetSchemaVersion() != "4" {
+		t.Errorf("schema_version = %q, want \"4\"", p.GetSchemaVersion())
 	}
 	if !strings.HasPrefix(p.GetGoVersion(), "go") {
 		t.Errorf("go_version = %q, want go1.x", p.GetGoVersion())
@@ -226,6 +226,12 @@ func TestExtractHelloFunctions(t *testing.T) {
 	findFunc(t, p, "(*example.com/hello.Counter).Inc")
 	findFunc(t, p, "example.com/hello.Spawn$1") // the goroutine closure
 
+	// result_names: Deref has one unnamed result.
+	deref := findFunc(t, p, "example.com/hello.Deref")
+	if len(deref.GetResultNames()) != 1 || deref.GetResultNames()[0] != "" {
+		t.Errorf("Deref result_names = %v, want [\"\"]", deref.GetResultNames())
+	}
+
 	// Every instruction register/operand id must resolve to a param,
 	// aux value, or another instruction's register.
 	for _, fn := range p.GetFunctions() {
@@ -291,6 +297,12 @@ func TestExtractPragmas(t *testing.T) {
 	}
 	if pr.GetPos().GetLine() == 0 {
 		t.Error("pragma has no position")
+	}
+	// Pragma decl_id must equal the Function.id of the SSA function it
+	// annotates (the alignment task 2's Rust-side matching relies on).
+	deref := findFunc(t, p, "example.com/hello.Deref")
+	if pr.GetDeclId() != deref.GetId() {
+		t.Errorf("pragma decl_id = %q, want Function.id %q", pr.GetDeclId(), deref.GetId())
 	}
 }
 

@@ -11,7 +11,7 @@ option go_package = "goverify.dev/extractor/gvirpb";
 // byte-identical .gvir files. No timestamps, no absolute paths.
 
 message Package {
-  string schema_version = 1;     // gvir schema version; loader rejects mismatches
+  string schema_version = 1;     // gvir schema version; loader rejects mismatches; current value "4"
   string go_version = 2;         // Go toolchain, e.g. "go1.25.5"
   string extractor_version = 3;  // extractor's own version constant
   string import_path = 4;
@@ -98,6 +98,11 @@ message Function {
   repeated AuxValue aux = 5;       // ascending id
   repeated BasicBlock blocks = 6;  // by block index; empty for bodyless funcs
   Position pos = 7;
+  // Signature result names in declaration order ("" for unnamed).
+  // Length always equals the signature's result count. Names come from
+  // the ORIGINAL signature (canonicalized signature types blank names
+  // for determinism; this field is the sole carrier of result names).
+  repeated string result_names = 8;
 }
 
 message Param {
@@ -179,7 +184,9 @@ message MethodSet {
 }
 
 message Pragma {
-  string decl_id = 1;  // types.Func.FullName() or "pkgpath.Name" of the decl
+  string decl_id = 1;  // the SSA function id (== Function.id) for func decls
+                       // when resolvable, else types.Func.FullName();
+                       // "pkgpath.Name" for type/var decls
   string text = 2;     // full comment line including "//goverify:"
   Position pos = 3;
 }

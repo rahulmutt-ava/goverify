@@ -58,13 +58,21 @@ pub fn compile_program(p: &Program, known_checkers: &[&str]) -> Annotations {
     out
 }
 
+/// Strip control characters from untrusted text before it reaches a
+/// message a renderer will print. Shared by `expr_text` (the quoted
+/// expression) and `bad` (the parse/resolve error string) — both can
+/// carry raw pragma bytes verbatim (`parse_pragma`'s "unknown directive
+/// `{other}`"/"unexpected character `{c}`" arms embed the offending
+/// bytes directly), and the human renderer sanitizes file paths but NOT
+/// finding messages.
+fn strip_control(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// The expression/payload part of the pragma line, for messages: the
 /// `//goverify:` prefix AND the directive keyword (`requires`/`ensures`)
 /// are both stripped, leaving just the expression text (mirrors
-/// `parse_pragma`'s own directive/payload split). Control characters are
-/// stripped: this string is quoted into finding messages, and the human
-/// renderer sanitizes file paths but NOT messages — untrusted bytes must
-/// not reach the terminal raw.
+/// `parse_pragma`'s own directive/payload split).
 fn expr_text(text: &str) -> String {
     let rest = text.strip_prefix("//goverify:").unwrap_or(text);
     let rest = match rest.find("//") {
@@ -76,7 +84,7 @@ fn expr_text(text: &str) -> String {
         Some(i) => rest[i..].trim(),
         None => "",
     };
-    payload.chars().filter(|c| !c.is_control()).collect()
+    strip_control(payload)
 }
 
 fn bad(func: &str, pos: Option<goverify_ir::Pos>, msg: &str) -> Finding {
@@ -85,7 +93,7 @@ fn bad(func: &str, pos: Option<goverify_ir::Pos>, msg: &str) -> Finding {
         tag: BAD_ANNOTATION.to_string(),
         func: func.to_string(),
         pos,
-        message: format!("invalid annotation: {msg}"),
+        message: format!("invalid annotation: {}", strip_control(msg)),
         trace: Vec::new(),
         model: Vec::new(),
         severity: Severity::Error,
@@ -489,12 +497,305 @@ mod tests {
     }
 
     #[test]
-    fn compile_program_reports_bad_annotations_as_findings() {
+    fn compile_program_over_hello_corpus_has_no_bad_annotations() {
         let p = load_corpus("hello");
         let ann = compile_program(&p, &["nil"]);
         // hello.go's real pragma is well-formed; findings must stay empty
         // (regression guard: a bug here would silently swallow every
         // future corpus fixture's bad-annotation coverage).
         assert!(ann.findings.is_empty());
+    }
+
+    // ---- bad() itself: Finding shape + control-char sanitization -----
+
+    #[test]
+    fn bad_produces_error_finding_with_invalid_annotation_prefix() {
+        let f = bad("f", None, "boom");
+        assert_eq!(f.checker, BAD_ANNOTATION);
+        assert_eq!(f.tag, BAD_ANNOTATION);
+        assert_eq!(f.func, "f");
+        assert_eq!(f.severity, Severity::Error);
+        assert_eq!(f.message, "invalid annotation: boom");
+        assert!(f.trace.is_empty());
+        assert!(f.model.is_empty());
+    }
+
+    #[test]
+    fn unmatched_pragma_message_matches_compile_program_wording() {
+        // Pins the exact literal `compile_program`'s unmatched-pragma arm
+        // passes to `bad` with func "-" (no corpus fixture currently
+        // carries a genuinely unmatched pragma to round-trip through
+        // `Program::unmatched_pragmas` end-to-end).
+        let f = bad(
+            "-",
+            None,
+            "annotation is not attached to a function declaration",
+        );
+        assert_eq!(f.func, "-");
+        assert_eq!(
+            f.message,
+            "invalid annotation: annotation is not attached to a function declaration"
+        );
+    }
+
+    #[test]
+    fn compile_program_bad_annotation_findings_have_expected_shape() {
+        let p = load_corpus("hello");
+        let f = p.lookup_func("example.com/hello.Deref").unwrap();
+        let err = compile_one(&p, f, "//goverify:requires q != nil", &["nil"]).unwrap_err();
+        let finding = bad(p.func_name(f), None, &err);
+        assert_eq!(finding.checker, BAD_ANNOTATION);
+        assert_eq!(finding.tag, BAD_ANNOTATION);
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(
+            finding.message.starts_with("invalid annotation: "),
+            "{}",
+            finding.message
+        );
+        assert!(
+            finding.message.contains("unknown name"),
+            "{}",
+            finding.message
+        );
+    }
+
+    #[test]
+    fn bad_annotation_message_strips_control_chars_from_untrusted_pragma_bytes() {
+        let p = load_corpus("hello");
+        let f = p.lookup_func("example.com/hello.Deref").unwrap();
+        // `parse_pragma`'s "unknown directive" arm embeds the raw
+        // directive token verbatim; an ESC[2J clear-screen sequence here
+        // models a hostile pragma line the extractor captured byte-exact
+        // from a Go comment.
+        let raw = "//goverify:\u{1b}[2Jfoo bar";
+        let err = compile_one(&p, f, raw, &["nil"]).expect_err("unknown directive");
+        assert!(
+            err.chars().any(|c| c.is_control()),
+            "sanity check: compile_one's raw error must still carry the control byte \
+             (compile_one itself does not sanitize — only `bad` does)"
+        );
+        let finding = bad(p.func_name(f), None, &err);
+        assert!(
+            !finding.message.chars().any(|c| c.is_control()),
+            "bad() must strip control chars before they reach a finding message: {:?}",
+            finding.message
+        );
+    }
+
+    // ---- riskiest lowering rules: swap, signedness, literal masking, --
+    // ---- len/cap accessors, unnamed/named result binding, name -------
+    // ---- precedence, top-level sort, nil/int edge cases ---------------
+
+    fn canonical(t: Term) -> String {
+        goverify_solver::Query::for_asserts(goverify_solver::Logic::All, vec![t]).canonical_text()
+    }
+
+    /// `bounds` corpus: `get(s []int, i int) int` — one slice operand, one
+    /// signed-int operand, loaded once for every assertion below.
+    #[test]
+    fn swap_signedness_and_seq_accessors_over_bounds_corpus() {
+        let p = load_corpus("bounds");
+        let f = p.lookup_func("example.com/bounds.get").expect("get");
+        let requires = |text: &str| -> Term {
+            let Compiled::Requires(c) = compile_one(&p, f, text, &["nil", "bounds"])
+                .unwrap_or_else(|e| panic!("{text}: {e}"))
+            else {
+                panic!("expected Requires")
+            };
+            c.formula.term
+        };
+
+        // `>` swaps to `0 < i` (Slt, signed: i is a plain `int`).
+        let text = canonical(requires("//goverify:requires i > 0"));
+        assert!(
+            text.contains("(bvslt (_ bv0 64) p1)"),
+            "`i > 0` must lower via operand swap to `0 < i`, signed:\n{text}"
+        );
+
+        // `>=` swaps to `0 <= i` (Sle).
+        let text = canonical(requires("//goverify:requires i >= 0"));
+        assert!(
+            text.contains("(bvsle (_ bv0 64) p1)"),
+            "`i >= 0` must lower via operand swap to `0 <= i`:\n{text}"
+        );
+
+        // `len(s)` accessor + forced-signed comparison (documented quirk:
+        // len/cap are unsigned 64-bit values but compared SIGNED).
+        let text = canonical(requires("//goverify:requires len(s) > 0"));
+        assert!(
+            text.contains("(seq-len p0)"),
+            "len must use seq-len:\n{text}"
+        );
+        assert!(
+            text.contains("(bvslt (_ bv0 64) (seq-len p0))"),
+            "len() comparisons stay signed even though seq-len is unsigned:\n{text}"
+        );
+
+        // `cap(s)` accessor.
+        let text = canonical(requires("//goverify:requires cap(s) > 0"));
+        assert!(
+            text.contains("(seq-cap p0)"),
+            "cap must use seq-cap:\n{text}"
+        );
+
+        // Negative-literal masking: -1 at width 64 is all-ones.
+        let text = canonical(requires("//goverify:requires i == -1"));
+        assert!(
+            text.contains("(_ bv18446744073709551615 64)"),
+            "negative literal must two's-complement-mask to all-ones at width 64:\n{text}"
+        );
+
+        // Sort mismatch: Seq vs BitVec.
+        let err = compile_one(&p, f, "//goverify:requires s == i", &["nil", "bounds"])
+            .expect_err("s (slice) and i (int) have different sorts");
+        assert!(err.contains("different types"), "got: {err}");
+
+        // Out-of-range literal: 2^63 does not fit a 64-bit signed int.
+        let err = compile_one(
+            &p,
+            f,
+            "//goverify:requires i == 9223372036854775808",
+            &["nil", "bounds"],
+        )
+        .expect_err("2^63 overflows a signed 64-bit int");
+        assert!(err.contains("does not fit"), "got: {err}");
+    }
+
+    /// `knownfp` corpus: `BranchElemOffset(base uintptr, idx uint16)
+    /// uintptr` — a genuinely unsigned-typed operand, which `bounds`/
+    /// `hello`/`ensures` don't have; needed to exercise the Ult/Ule (not
+    /// Slt/Sle) side of the signed/unsigned dispatch.
+    #[test]
+    fn unsigned_operand_selection_over_knownfp_corpus() {
+        let p = load_corpus("knownfp");
+        let f = p
+            .lookup_func("example.com/knownfp.BranchElemOffset")
+            .expect("BranchElemOffset");
+        let text = canonical(
+            match compile_one(&p, f, "//goverify:requires idx > 0", &["nil"]).unwrap() {
+                Compiled::Requires(c) => c.formula.term,
+                _ => panic!("expected Requires"),
+            },
+        );
+        assert!(
+            text.contains("(bvult (_ bv0 16) p1)"),
+            "unsigned `idx > 0` must swap to unsigned Ult, not Slt:\n{text}"
+        );
+
+        // Negative literal on an unsigned operand: out of range.
+        let err = compile_one(&p, f, "//goverify:requires idx == -1", &["nil"])
+            .expect_err("-1 does not fit a uint16 operand");
+        assert!(err.contains("does not fit"), "got: {err}");
+    }
+
+    /// `ensures` corpus: `NewT(fail bool) (*T, error)` (two UNNAMED
+    /// results: ret0/ret1) and `NewTNamed(fail bool) (t *T, err error)`
+    /// (two NAMED results: t/err) — the unnamed-fallback and
+    /// declared-name paths of `bindings()`'s per-result loop.
+    #[test]
+    fn unnamed_and_named_result_binding_over_ensures_corpus() {
+        let p = load_corpus("ensures");
+
+        let new_t = p.lookup_func("example.com/ensures.NewT").expect("NewT");
+        let ensures = |f: goverify_ir::FuncId, text: &str| -> Term {
+            let Compiled::Ensures(c) =
+                compile_one(&p, f, text, &["nil"]).unwrap_or_else(|e| panic!("{text}: {e}"))
+            else {
+                panic!("expected Ensures")
+            };
+            c.formula.term
+        };
+
+        // Unnamed results: ret0/ret1 bind to r0/r1.
+        let vars = ensures(new_t, "//goverify:ensures ret0 != nil").free_vars();
+        assert_eq!(vars.keys().collect::<Vec<_>>(), vec!["r0"], "ret0 -> r0");
+        let vars = ensures(new_t, "//goverify:ensures ret1 == nil").free_vars();
+        assert_eq!(vars.keys().collect::<Vec<_>>(), vec!["r1"], "ret1 -> r1");
+
+        let new_t_named = p
+            .lookup_func("example.com/ensures.NewTNamed")
+            .expect("NewTNamed");
+
+        // Named results: declared names (t, err) bind to r0/r1 directly.
+        let vars = ensures(new_t_named, "//goverify:ensures t != nil").free_vars();
+        assert_eq!(vars.keys().collect::<Vec<_>>(), vec!["r0"], "t -> r0");
+        let vars = ensures(new_t_named, "//goverify:ensures err == nil").free_vars();
+        assert_eq!(vars.keys().collect::<Vec<_>>(), vec!["r1"], "err -> r1");
+
+        // Declared-name precedence: once results are NAMED, the synthetic
+        // ret0/ret1 aliases do not exist at all — only the declared names
+        // resolve (spec §3 "declared names win").
+        let err = compile_one(&p, new_t_named, "//goverify:ensures ret0 != nil", &["nil"])
+            .expect_err("NewTNamed's results are named; ret0 must not resolve");
+        assert!(err.contains("unknown name"), "got: {err}");
+    }
+
+    /// A hand-built temp module with a genuine name COLLISION: a param
+    /// literally named `ret` on a function whose single result is
+    /// UNNAMED (whose synthetic aliases are exactly "ret"/"ret0", spec
+    /// §3). No existing corpus fixture has this shape, so this
+    /// constructs one directly via `testutil::load_module` rather than
+    /// relying on indirect reasoning from named-vs-unnamed functions.
+    #[test]
+    fn declared_name_wins_over_synthetic_ret_alias() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/collide\n\ngo 1.25.10\n",
+        )
+        .expect("write go.mod");
+        std::fs::write(
+            dir.path().join("collide.go"),
+            "package collide\n\nfunc F(ret int) int { return ret }\n",
+        )
+        .expect("write collide.go");
+        let p = goverify_ir::testutil::load_module(dir.path());
+        let f = p.lookup_func("example.com/collide.F").expect("F");
+        let Compiled::Requires(c) = compile_one(&p, f, "//goverify:requires ret > 0", &["nil"])
+            .expect("declared param `ret` must resolve")
+        else {
+            panic!("expected Requires")
+        };
+        let vars = c.formula.term.free_vars();
+        assert_eq!(
+            vars.keys().collect::<Vec<_>>(),
+            vec!["p0"],
+            "`ret` must resolve to the declared PARAM (p0), never the synthetic \
+             unnamed-result alias (r0) — declared names win (spec §3)"
+        );
+    }
+
+    /// `hello` corpus (`Deref(p *int) int`): top-level sort enforcement
+    /// and every nil/literal edge case that doesn't need a slice/result/
+    /// unsigned operand.
+    #[test]
+    fn top_level_sort_and_nil_literal_edge_cases_over_hello_corpus() {
+        let p = load_corpus("hello");
+        let f = p.lookup_func("example.com/hello.Deref").expect("Deref");
+        let reject = |text: &str| -> String { compile_one(&p, f, text, &["nil"]).expect_err(text) };
+
+        // Top-level non-Bool: `p` alone is Ptr-sorted, not Bool.
+        let err = reject("//goverify:requires p");
+        assert!(err.contains("expected a boolean condition"), "got: {err}");
+
+        // Bare `nil`.
+        let err = reject("//goverify:requires nil");
+        assert!(err.contains("only usable in == / !="), "got: {err}");
+
+        // Bare integer literal.
+        let err = reject("//goverify:requires 5");
+        assert!(err.contains("not a condition"), "got: {err}");
+
+        // `nil == nil`.
+        let err = reject("//goverify:requires nil == nil");
+        assert!(err.contains("not a useful condition"), "got: {err}");
+
+        // `nil` with an ordered comparator.
+        let err = reject("//goverify:requires p < nil");
+        assert!(err.contains("only supports == and !="), "got: {err}");
+
+        // Two integer literals compared.
+        let err = reject("//goverify:requires 1 == 2");
+        assert!(err.contains("comparing two integer literals"), "got: {err}");
     }
 }

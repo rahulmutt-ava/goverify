@@ -395,6 +395,7 @@ dependencies = [
  "goverify-analysis",
  "goverify-ir",
  "goverify-solver",
+ "tempfile",
 ]
 
 [[package]]

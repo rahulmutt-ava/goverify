@@ -8,3 +8,9 @@ license.workspace = true
 goverify-ir.workspace = true
 goverify-solver.workspace = true
 goverify-analysis.workspace = true
+
+# `declared_name_wins_over_synthetic_ret_alias` builds a hand-written temp
+# module (a name-collision shape no existing corpus fixture has) via
+# `goverify_ir::testutil::load_module`.
+[dev-dependencies]
+tempfile.workspace = true

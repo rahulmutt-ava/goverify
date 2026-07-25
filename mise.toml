@@ -15,7 +15,7 @@ cmake = "4.3.3"
 # GitHub release tags are "z3-<ver>" (not bare "<ver>"). Matches the
 # bundled Z3 (z3-src 416.0.2) so the differential isolates the process
 # plumbing rather than comparing solver versions.
-"ubi:Z3Prover/z3" = { version = "z3-4.16.0", exe = "z3" }
+"github:Z3Prover/z3" = { version = "z3-4.16.0", exe = "z3" }
 
 [tasks.build]
 description = "build all workspace crates"

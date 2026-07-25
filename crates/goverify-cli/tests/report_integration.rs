@@ -226,12 +226,21 @@ func twice() int {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid --format json");
+    assert_eq!(
+        v["schema_version"], 2,
+        "phase-6 spec §5: JSON schema bumped to 2: {v}"
+    );
     let findings = v["findings"].as_array().unwrap();
     assert_eq!(findings.len(), 2, "two sibling findings expected: {v}");
     assert_eq!(
         findings[0]["message"], findings[1]["message"],
         "identical shape"
     );
+    assert_eq!(
+        findings[0]["severity"], "error",
+        "nil-deref findings are Error severity: {v}"
+    );
+    assert_eq!(findings[1]["severity"], "error");
     assert_ne!(
         findings[0]["fingerprint"], findings[1]["fingerprint"],
         "ordinals separate identical siblings"
@@ -450,6 +459,41 @@ fn diff_base_comment_only_edit_reports_nothing() {
         v["summary"]["total"], 0,
         "comment-only edit -> empty report: {v}"
     );
+}
+
+/// SARIF `level` follows severity (phase-6 spec §5): every finding in
+/// the nil corpus is Error-severity (no annotations wired yet), so the
+/// deliberate non-additive flip (`level: "warning"` -> `"error"` for
+/// existing findings, documented in the Task 14 shakeout addendum) must
+/// show up on a real `check --format sarif` run, not just the in-file
+/// sarif.rs unit tests.
+#[test]
+fn sarif_level_reflects_severity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("nil");
+    copy_dir(&repo_root().join("testdata/corpus/nil"), &module);
+
+    let out = goverify(
+        &["check", "--format", "sarif", "./..."],
+        &module,
+        cache.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid --format sarif");
+    let results = v["runs"][0]["results"].as_array().unwrap();
+    assert!(!results.is_empty(), "nil corpus has findings: {v}");
+    for r in results {
+        assert_eq!(
+            r["level"], "error",
+            "all-Error findings must report SARIF level \"error\": {r}"
+        );
+    }
 }
 
 #[test]

@@ -3,16 +3,21 @@
 //! is fixed by struct declaration, escaping is owned by serde_json. No
 //! timestamps, no absolute paths (Pos.file is extractor-relative).
 
-use goverify_analysis::Finding;
+use goverify_analysis::{Finding, Severity};
 use serde::Serialize;
 
 /// Bump on any change to the emitted shape (consumers key on it).
-pub const JSON_SCHEMA_VERSION: u32 = 1;
+/// v2 (phase-6 spec §5): adds per-finding `severity` and
+/// `summary.suppressed_pragma`.
+pub const JSON_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Serialize)]
 pub struct Summary {
     pub total: usize,
     pub suppressed_by_baseline: usize,
+    /// Pragma-suppressed count (phase-6 spec §5). Wired to a real count
+    /// in Task 10; every current call site passes 0.
+    pub suppressed_pragma: usize,
     pub diff_base_scoped: bool,
 }
 
@@ -28,6 +33,7 @@ struct JsonFinding<'a> {
     fingerprint: &'a str,
     checker: &'a str,
     tag: &'a str,
+    severity: &'static str,
     func: &'a str,
     file: Option<&'a str>,
     line: Option<u32>,
@@ -57,6 +63,10 @@ pub fn render_json(findings: &[Finding], fps: &[String], summary: &Summary) -> S
             fingerprint: fp,
             checker: &f.checker,
             tag: &f.tag,
+            severity: match f.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+            },
             func: &f.func,
             file: f.pos.as_ref().map(|p| p.file.as_str()),
             line: f.pos.as_ref().map(|p| p.line),
@@ -125,16 +135,18 @@ mod tests {
         let summary = Summary {
             total: 1,
             suppressed_by_baseline: 0,
+            suppressed_pragma: 0,
             diff_base_scoped: false,
         };
         let got = render_json(&[f], &fps, &summary);
         let want = r#"{
-  "schema_version": 1,
+  "schema_version": 2,
   "findings": [
     {
       "fingerprint": "v1:00112233445566778899aabbccddeeff",
       "checker": "nil",
       "tag": "nil-deref",
+      "severity": "error",
       "func": "example.com/m.F",
       "file": "m.go",
       "line": 7,
@@ -157,6 +169,7 @@ mod tests {
   "summary": {
     "total": 1,
     "suppressed_by_baseline": 0,
+    "suppressed_pragma": 0,
     "diff_base_scoped": false
   }
 }
@@ -169,10 +182,35 @@ mod tests {
         let summary = Summary {
             total: 0,
             suppressed_by_baseline: 0,
+            suppressed_pragma: 0,
             diff_base_scoped: false,
         };
         let got = render_json(&[], &[], &summary);
         assert!(got.starts_with('{') && got.ends_with("}\n"), "{got}");
         assert!(got.contains("\"findings\": []"), "{got}");
+    }
+
+    #[test]
+    fn render_json_maps_warning_severity() {
+        let f = Finding {
+            checker: "annotation".to_string(),
+            tag: "unverified-annotation".to_string(),
+            func: "example.com/m.F".to_string(),
+            pos: None,
+            message: "requires clause could not be verified".to_string(),
+            trace: Vec::new(),
+            model: Vec::new(),
+            severity: goverify_analysis::Severity::Warning,
+        };
+        let fps = vec!["v1:00".to_string()];
+        let summary = Summary {
+            total: 1,
+            suppressed_by_baseline: 0,
+            suppressed_pragma: 0,
+            diff_base_scoped: false,
+        };
+        let got = render_json(&[f], &fps, &summary);
+        let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+        assert_eq!(v["findings"][0]["severity"], "warning", "{got}");
     }
 }

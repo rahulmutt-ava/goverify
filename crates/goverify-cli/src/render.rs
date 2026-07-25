@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use goverify_analysis::Finding;
+use goverify_analysis::{Finding, Severity};
 
 /// Fixed gutter width for the line-number column (the source-echo
 /// snippet and its caret line share it so the `|` separators line up).
@@ -45,7 +45,18 @@ fn render_one(f: &Finding, source_root: &Path) -> String {
         Some(p) => format!("{}:{}:{}", sanitize(&p.file), p.line, p.col),
         None => "-:-:-".to_string(),
     };
-    lines.push(format!("{pos_str}: {}: {} [{}]", f.tag, f.message, f.func));
+    // Error findings keep the EXACT current line format (bbolt G1
+    // byte-identity depends on it); warnings (phase-6 spec §5, e.g.
+    // unverified-annotation) get a `warning: ` marker inserted before
+    // the tag.
+    let sev = match f.severity {
+        Severity::Error => "",
+        Severity::Warning => "warning: ",
+    };
+    lines.push(format!(
+        "{pos_str}: {sev}{}: {} [{}]",
+        f.tag, f.message, f.func
+    ));
 
     if let Some(p) = &f.pos
         && let Some(src) = read_source_line(source_root, &p.file, p.line)
@@ -170,6 +181,32 @@ m.go:3:9: nil-deref: nil passed to t.F (violates its nil-deref requirement) [t.B
     with: p0 = (ptr-nil)
 ";
         assert_eq!(got, want, "renderer output must match the frozen format");
+    }
+
+    #[test]
+    fn warning_severity_finding_gets_the_warning_marker() {
+        // Pins the `warning: ` form (phase-6 spec §5): identical to the
+        // frozen Error format above, but with the marker inserted
+        // between the position and the tag.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("m.go"),
+            "package m\nfunc Bad() int {\n    return deref(nil)\n}\n",
+        )
+        .unwrap();
+        let mut f = base_finding();
+        f.severity = Severity::Warning;
+
+        let got = render_findings(&[f], dir.path());
+        let want = "\
+m.go:3:9: warning: nil-deref: nil passed to t.F (violates its nil-deref requirement) [t.Bad]
+    3 |     return deref(nil)
+      |         ^
+";
+        assert_eq!(
+            got, want,
+            "warning severity must insert the `warning: ` marker before the tag"
+        );
     }
 
     #[test]

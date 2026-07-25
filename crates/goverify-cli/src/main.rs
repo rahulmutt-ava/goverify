@@ -64,7 +64,7 @@ enum BaselineWhat {
 enum OutputFormat {
     /// Labeled source spans with traces (default).
     Human,
-    /// Native machine schema (schema_version 1).
+    /// Native machine schema (schema_version 2).
     Json,
     /// SARIF 2.1.0 for GitHub code scanning.
     Sarif,
@@ -123,6 +123,19 @@ struct CheckArgs {
     /// everything; only the report is scoped. Requires git.
     #[arg(long, value_name = "GIT_REF")]
     diff_base: Option<String>,
+    /// Promote finding classes for CI gating. `--deny warnings` makes
+    /// warning-severity findings (unverified-annotation) fail the run
+    /// and report as errors in every format.
+    #[arg(long, value_enum, value_name = "CLASS")]
+    deny: Vec<DenyClass>,
+}
+
+/// `--deny` classes (phase-6 spec §5). Currently a single class:
+/// promoting warning-severity findings (only `unverified-annotation`,
+/// Task 8) to errors for CI gating.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum DenyClass {
+    Warnings,
 }
 
 #[derive(clap::Args)]
@@ -658,10 +671,22 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
     };
     let fps = goverify_cli::fingerprint::fingerprints(&scoped);
-    let (scoped, fps, suppressed) = apply_baseline(&ca, scoped, fps)?;
+    let (mut scoped, fps, suppressed) = apply_baseline(&ca, scoped, fps)?;
+    // --deny warnings (spec §5): promote kept warning-severity findings
+    // to errors, after the baseline filter (Task 10 settles the final
+    // filter-chain position once suppressed_pragma is wired) and before
+    // summary construction so every rendered format sees the promoted
+    // severity.
+    if ca.deny.contains(&DenyClass::Warnings) {
+        for f in &mut scoped {
+            f.severity = goverify_analysis::Severity::Error;
+        }
+    }
     let summary = json::Summary {
         total: scoped.len(),
         suppressed_by_baseline: suppressed,
+        // Wired to a real count in Task 10 (pragma-suppression filter).
+        suppressed_pragma: 0,
         diff_base_scoped,
     };
     match ca.format {
@@ -680,11 +705,19 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
             t_render.elapsed().as_secs_f64()
         );
     }
-    Ok(if scoped.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
-    })
+    // Exit predicate (spec §5): gate on severity, not mere presence — a
+    // kept warning (unverified-annotation, absent --deny warnings) must
+    // not fail the run; any kept error does.
+    Ok(
+        if scoped
+            .iter()
+            .any(|f| f.severity == goverify_analysis::Severity::Error)
+        {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        },
+    )
 }
 
 /// `baseline write` (spec §4): the identical pipeline as `check`,

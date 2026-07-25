@@ -5,7 +5,7 @@
 //! absent. Suppressed-by-baseline results are OMITTED (not emitted with
 //! `suppressions`); the count goes in run.properties.
 
-use goverify_analysis::Finding;
+use goverify_analysis::{Finding, Severity};
 use serde::Serialize;
 
 const SARIF_VERSION: &str = "2.1.0";
@@ -181,7 +181,14 @@ pub fn render_sarif(findings: &[Finding], fps: &[String], suppressed_by_baseline
                 .collect();
             SarifResult {
                 rule_id: &f.tag,
-                level: "warning",
+                // SARIF level from severity (phase-6 spec §5): a
+                // deliberate, documented non-additive change — existing
+                // findings (all Error before annotations) flip from
+                // "warning" to "error" (Task 14 shakeout addendum).
+                level: match f.severity {
+                    Severity::Error => "error",
+                    Severity::Warning => "warning",
+                },
                 message: Text {
                     text: message_text(f),
                 },
@@ -260,7 +267,8 @@ mod tests {
         assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "goverify");
         let r = &v["runs"][0]["results"][0];
         assert_eq!(r["ruleId"], "nil-deref");
-        assert_eq!(r["level"], "warning");
+        // Error severity -> SARIF level "error" (phase-6 spec §5).
+        assert_eq!(r["level"], "error");
         assert_eq!(
             r["partialFingerprints"]["goverify/v1"],
             "v1:00112233445566778899aabbccddeeff"
@@ -325,5 +333,30 @@ mod tests {
             r.get("codeFlows").is_none(),
             "no trace -> no codeFlows: {r}"
         );
+    }
+
+    #[test]
+    fn render_sarif_level_reflects_severity() {
+        let mk = |severity| Finding {
+            checker: "annotation".to_string(),
+            tag: "unverified-annotation".to_string(),
+            func: "example.com/m.F".to_string(),
+            pos: None,
+            message: "m".to_string(),
+            trace: Vec::new(),
+            model: Vec::new(),
+            severity,
+        };
+        let got = render_sarif(
+            &[
+                mk(goverify_analysis::Severity::Error),
+                mk(goverify_analysis::Severity::Warning),
+            ],
+            &["v1:0".to_string(), "v1:1".to_string()],
+            0,
+        );
+        let v: serde_json::Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(v["runs"][0]["results"][0]["level"], "error");
+        assert_eq!(v["runs"][0]["results"][1]["level"], "warning");
     }
 }

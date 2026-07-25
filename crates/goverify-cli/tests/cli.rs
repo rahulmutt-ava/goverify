@@ -91,6 +91,50 @@ fn no_cache_flag_runs_uncached() {
 }
 
 #[test]
+fn check_help_lists_the_deny_flag() {
+    // Phase-6 spec §5: --deny <CLASS> (repeatable, one class so far).
+    let output = goverify()
+        .current_dir(repo_root().join("testdata/corpus/hello"))
+        .arg("check")
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--deny <CLASS>"),
+        "--help must document --deny <CLASS>: {stdout}"
+    );
+}
+
+#[test]
+fn deny_warnings_flag_is_accepted_and_does_not_error() {
+    // The hello corpus has no findings (warning or otherwise) yet — no
+    // CLI-visible warning findings exist until annotations are wired
+    // (Task 10+) — but --deny warnings must parse and run cleanly.
+    let cache_home = tempfile::tempdir().unwrap();
+    let out = goverify()
+        .current_dir(repo_root().join("testdata/corpus/hello"))
+        .arg("check")
+        .arg("--deny")
+        .arg("warnings")
+        .arg("./...")
+        .env("XDG_CACHE_HOME", cache_home.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn extract_outside_a_module_exits_two() {
     let dir = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();

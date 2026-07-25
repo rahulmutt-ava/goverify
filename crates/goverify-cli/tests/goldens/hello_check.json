@@ -1,9 +1,10 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "findings": [],
   "summary": {
     "total": 0,
     "suppressed_by_baseline": 0,
+    "suppressed_pragma": 0,
     "diff_base_scoped": false
   }
 }

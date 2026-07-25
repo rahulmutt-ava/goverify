@@ -25,6 +25,7 @@ fn findings(module: &str, process: bool) -> String {
         opts: Options::default(),
         cache_dir: None,
         emit_smt: None,
+        annotations: Default::default(),
     };
     let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&NilChecker, &BoundsChecker];
     let a = analyze_full(&p, &cfg, &checkers, &|_role: BackendRole| {

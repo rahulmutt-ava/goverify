@@ -23,10 +23,11 @@ use goverify_cache::QueryCache;
 use goverify_ir::{CallGraph, FuncId, Program, Sccs};
 use goverify_solver::{Query, SatResult, StubSolver, TextSolver, discharge_query};
 
+use crate::annotations::{Annotations, FuncAnnotations};
 use crate::checker::{Checker, Finding};
 use crate::effects::{self, Effects, Loc, Root};
 use crate::prepass::{self, Domains};
-use crate::summary::{Provenance, Summary};
+use crate::summary::{self, Provenance, Summary};
 
 /// Which of the two solver-timeout tiers a `mk_backend` call is for: the
 /// fixpoint's per-SCC requires-inference backend runs many small queries
@@ -62,6 +63,10 @@ pub struct EngineConfig {
     pub opts: Options,
     pub cache_dir: Option<PathBuf>,
     pub emit_smt: Option<PathBuf>,
+    /// Compiled `//goverify:` annotations (phase-6 spec §3-§5). Default
+    /// empty — every existing caller that builds `EngineConfig` without
+    /// annotation support keeps behaving exactly as before.
+    pub annotations: Annotations,
 }
 
 #[derive(Debug)]
@@ -109,6 +114,7 @@ pub fn analyze_full(
 ) -> Analysis {
     let cache = cfg.cache_dir.clone().map(QueryCache::open);
     let emit_dir = cfg.emit_smt.clone();
+    let annotations = &cfg.annotations;
     // Deterministic requires order (parent spec's determinism invariant):
     // the caller's checker order is not guaranteed sorted, so sort once by
     // name here rather than trusting call sites.
@@ -252,6 +258,7 @@ pub fn analyze_full(
                         cache.as_ref(),
                         emit_dir.as_deref(),
                         &diag_slots,
+                        annotations.funcs.get(&m),
                     );
                     if current[&m] != new {
                         current.insert(m, new);
@@ -264,9 +271,12 @@ pub fn analyze_full(
                 if rounds >= cfg.opts.widen_after {
                     // Widen: havoc every member. Widening only ever moves
                     // up the lattice (toward top), never invents
-                    // constraints — `Summary::havoc()` has no requires.
+                    // inferred constraints — `Summary::havoc()` has no
+                    // requires. Annotated clauses are constants, not
+                    // fixpoint state (phase-6 spec §4): they survive
+                    // widening via `havoc_with`.
                     for &m in members {
-                        current.insert(m, Summary::havoc());
+                        current.insert(m, summary::havoc_with(annotations.funcs.get(&m)));
                     }
                     break;
                 }
@@ -284,11 +294,15 @@ pub fn analyze_full(
     let mut summaries = BTreeMap::new();
     let mut pre = BTreeMap::new();
     for f in p.func_ids() {
+        // Missing slot -> no summary was ever computed for `f` (fully
+        // external, never scheduled into any SCC): havoc, plus whatever
+        // annotations its own defining package attached (phase-6 spec
+        // §4) — an external function's pragma still helps its callers.
         let s = slots[f.0 as usize]
             .lock()
             .unwrap()
             .clone()
-            .unwrap_or_else(Summary::havoc);
+            .unwrap_or_else(|| summary::havoc_with(annotations.funcs.get(&f)));
         pre.insert(
             f,
             Domains {
@@ -547,10 +561,14 @@ fn analyze_function(
     cache: Option<&QueryCache>,
     emit_dir: Option<&Path>,
     diag_slots: &[Mutex<Option<String>>],
+    ann: Option<&FuncAnnotations>,
 ) -> Summary {
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if p.func(f).is_none() {
-            return Summary::havoc(); // external / bodyless
+            // External / bodyless: no body to infer from, but a pragma
+            // attached to the declaration (in its defining package)
+            // still contributes a contract (phase-6 spec §4).
+            return summary::havoc_with(ann);
         }
         let effects = effects::collect(p, f, graph, &|c| summary_of(c).effects);
 
@@ -567,12 +585,18 @@ fn analyze_function(
             ensures.extend(checker.infer_ensures(p, f, summary_of, &mut discharge));
         }
 
-        Summary {
+        let mut s = Summary {
             effects,
             requires,
             ensures,
             ..Summary::default()
-        }
+        };
+        // Merge in this function's own annotated clauses (phase-6 spec
+        // §4): dedup against what the checkers just inferred so a
+        // contract they already prove doesn't double-report at call
+        // sites.
+        summary::merge_annotations(&mut s, ann);
+        s
     }));
     match run {
         Ok(s) => s,
@@ -583,7 +607,7 @@ fn analyze_function(
                     p.func_name(f)
                 ));
             }
-            Summary::havoc()
+            summary::havoc_with(ann)
         }
     }
 }
@@ -707,10 +731,11 @@ mod tests {
     use goverify_ir::Program;
 
     use super::*;
+    use crate::annotations::{AnnClause, CONTRACT};
     use crate::effects::{Effects, LockOp};
     use crate::summary::Provenance;
-    use crate::testpkg::{block, call, func, instr, pkg};
-    use goverify_solver::SolverLimits;
+    use crate::testpkg::{block, call, func, func_with_params, instr, pkg};
+    use goverify_solver::{SolverLimits, Term, ptr_is_nil, ptr_sort};
 
     fn straight(
         id: &str,
@@ -991,6 +1016,213 @@ mod tests {
         assert!(
             a.summaries[&even].ensures.is_empty(),
             "widening must drop ensures: {:?}",
+            a.summaries[&even]
+        );
+    }
+
+    fn named_param(id: u32, name: &str) -> goverify_extract::gvir::Param {
+        goverify_extract::gvir::Param {
+            id,
+            name: name.into(),
+            r#type: 0,
+        }
+    }
+
+    /// Infers exactly one requires clause (`¬is_nil(p0)`, tag
+    /// "nil-deref") for every function it is asked about: the
+    /// checker-side of the merge/dedup fixture.
+    struct RequiresChecker;
+    impl Checker for RequiresChecker {
+        fn name(&self) -> &'static str {
+            "requires-probe"
+        }
+        fn infer_requires(
+            &self,
+            _p: &Program,
+            _f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
+            _discharge: &mut dyn FnMut(&Query) -> SatResult,
+        ) -> Vec<crate::summary::Clause> {
+            let p0 = Term::var("p0", ptr_sort());
+            vec![crate::summary::Clause {
+                tag: "nil-deref".into(),
+                formula: crate::summary::Formula {
+                    term: Term::not(ptr_is_nil(p0).unwrap()).unwrap(),
+                },
+                provenance: Provenance::Inferred,
+            }]
+        }
+        fn obligations(
+            &self,
+            _p: &Program,
+            _f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
+        ) -> Vec<crate::checker::Obligation> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn merge_dedups_duplicate_annotated_requires_keeps_distinct_one() {
+        // t.F has no body-derived facts of its own beyond RequiresChecker's
+        // inferred ¬is_nil(p0). Two annotated requires are attached: one
+        // whose formula duplicates that inferred clause exactly (dedup
+        // rule, phase-6 spec §4 — must collapse to the single inferred
+        // clause, original tag/provenance intact) and one with a distinct
+        // formula (must survive as tag "contract", provenance Annotated).
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![func_with_params(
+                "t.F",
+                vec![named_param(1, "x")],
+                vec![block(0, vec![instr("Return")], vec![])],
+            )],
+        )]);
+        let f = p.lookup_func("t.F").unwrap();
+
+        let p0 = Term::var("p0", ptr_sort());
+        let dup_ann = AnnClause {
+            clause: crate::summary::Clause {
+                tag: CONTRACT.into(),
+                formula: crate::summary::Formula {
+                    term: Term::not(ptr_is_nil(p0.clone()).unwrap()).unwrap(),
+                },
+                provenance: Provenance::Annotated,
+            },
+            text: "x != nil".into(),
+            pos: None,
+        };
+        // Deliberately the dup formula's negation: just needs to be a
+        // DIFFERENT formula from the checker's inferred clause so the
+        // dedup rule (formula equality) treats it as new.
+        let new_ann = AnnClause {
+            clause: crate::summary::Clause {
+                tag: CONTRACT.into(),
+                formula: crate::summary::Formula {
+                    term: ptr_is_nil(p0).unwrap(),
+                },
+                provenance: Provenance::Annotated,
+            },
+            text: "test-only distinguishing formula".into(),
+            pos: None,
+        };
+        let mut funcs = BTreeMap::new();
+        funcs.insert(
+            f,
+            FuncAnnotations {
+                requires: vec![dup_ann.clone(), new_ann.clone()],
+                ensures: Vec::new(),
+                ignores: Vec::new(),
+            },
+        );
+        let cfg = EngineConfig {
+            annotations: Annotations {
+                funcs,
+                findings: Vec::new(),
+            },
+            ..EngineConfig::default()
+        };
+        let checkers: Vec<&dyn Checker> = vec![&RequiresChecker];
+        let a = analyze_full(&p, &cfg, &checkers, &|_role| Box::new(StubSolver));
+        let reqs = &a.summaries[&f].requires;
+        assert_eq!(
+            reqs.len(),
+            2,
+            "duplicate annotated clause must collapse into the inferred one, \
+             distinct one must be added: {reqs:?}"
+        );
+        let dup_survivor = reqs
+            .iter()
+            .find(|c| c.formula == dup_ann.clause.formula)
+            .expect("the duplicated formula must still be present exactly once");
+        assert_eq!(
+            dup_survivor.tag, "nil-deref",
+            "the surviving clause must be the ORIGINAL inferred one, not the annotated \
+             duplicate: {dup_survivor:?}"
+        );
+        assert_eq!(
+            dup_survivor.provenance,
+            Provenance::Inferred,
+            "dedup must keep the inferred clause's own provenance: {dup_survivor:?}"
+        );
+        let new_survivor = reqs
+            .iter()
+            .find(|c| c.formula == new_ann.clause.formula)
+            .expect("the non-duplicate annotated clause must be present");
+        assert_eq!(
+            new_survivor.tag, CONTRACT,
+            "a non-duplicate annotated clause keeps the contract tag: {new_survivor:?}"
+        );
+        assert_eq!(
+            new_survivor.provenance,
+            Provenance::Annotated,
+            "a non-duplicate annotated clause keeps Annotated provenance: {new_survivor:?}"
+        );
+    }
+
+    #[test]
+    fn widening_preserves_annotated_requires() {
+        // Same recursive-SCC + widen_after:0 fixture as
+        // `widening_drops_ensures`, but t.Even carries an annotated
+        // requires. Widening discards fixpoint state, never human facts
+        // (phase-6 spec §4): the widened (havoc-shaped) summary must
+        // still carry exactly the annotated clause.
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                straight("t.Even", vec![call("(*sync.Mutex).Lock"), call("t.Odd")]),
+                straight("t.Odd", vec![call("t.Even")]),
+            ],
+        )]);
+        let even = p.lookup_func("t.Even").unwrap();
+
+        let p0 = Term::var("p0", ptr_sort());
+        let ann_clause = crate::summary::Clause {
+            tag: CONTRACT.into(),
+            formula: crate::summary::Formula {
+                term: Term::not(ptr_is_nil(p0).unwrap()).unwrap(),
+            },
+            provenance: Provenance::Annotated,
+        };
+        let mut funcs = BTreeMap::new();
+        funcs.insert(
+            even,
+            FuncAnnotations {
+                requires: vec![AnnClause {
+                    clause: ann_clause.clone(),
+                    text: "p != nil".into(),
+                    pos: None,
+                }],
+                ensures: Vec::new(),
+                ignores: Vec::new(),
+            },
+        );
+        let cfg = EngineConfig {
+            opts: Options { widen_after: 0 },
+            annotations: Annotations {
+                funcs,
+                findings: Vec::new(),
+            },
+            ..EngineConfig::default()
+        };
+        let no_checkers: &[&dyn Checker] = &[];
+        let a = analyze_full(&p, &cfg, no_checkers, &|_role| Box::new(StubSolver));
+        assert_eq!(
+            a.summaries[&even].provenance,
+            Provenance::Havoc,
+            "widen_after 0 must widen this recursive SCC to Havoc: {:?}",
+            a.summaries[&even]
+        );
+        assert_eq!(
+            a.summaries[&even].effects,
+            Effects::top(),
+            "widened summary must have top (havoc-shaped) effects: {:?}",
+            a.summaries[&even]
+        );
+        assert_eq!(
+            a.summaries[&even].requires,
+            vec![ann_clause],
+            "widening must preserve the annotated requires exactly: {:?}",
             a.summaries[&even]
         );
     }

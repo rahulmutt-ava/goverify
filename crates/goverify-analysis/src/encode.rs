@@ -799,9 +799,12 @@ fn call_result_terms(
     out
 }
 
-/// Assert every bindable ensures clause of every static callee with an
-/// Inferred summary, gated on the call's block guard. Havoc-provenance
-/// summaries are never consulted for facts.
+/// Assert every bindable ensures clause of every static callee, gated on
+/// the call's block guard. Trust rule (phase-6 spec §4): an Inferred
+/// summary contributes ALL its ensures; a Havoc summary (bodyless,
+/// widened, or external) contributes ONLY its Annotated clauses — human
+/// facts survive widening/bodylessness, but an inferred fact from a
+/// summary the engine gave up on never gets trusted.
 fn encode_call_ensures(
     func: &Function,
     summary_of: &dyn Fn(FuncId) -> crate::summary::Summary,
@@ -818,9 +821,22 @@ fn encode_call_ensures(
                 continue;
             };
             let s = summary_of(*c);
-            if s.provenance != crate::summary::Provenance::Inferred || s.ensures.is_empty() {
+            let usable: Vec<crate::summary::Clause> = s
+                .ensures
+                .iter()
+                .filter(|cl| {
+                    s.provenance == crate::summary::Provenance::Inferred
+                        || cl.provenance == crate::summary::Provenance::Annotated
+                })
+                .cloned()
+                .collect();
+            if usable.is_empty() {
                 continue;
             }
+            let s = crate::summary::Summary {
+                ensures: usable,
+                ..s
+            };
             let arg_terms: Vec<Option<Term>> =
                 args.iter().map(|a| enc.values.get(a).cloned()).collect();
             let result_terms = call_result_terms(func, *dst, enc);
@@ -2998,10 +3014,13 @@ mod tests {
     }
 
     /// Same fixture as `call_ensures_constrain_single_result`, but the
-    /// callee summary carries `Provenance::Havoc` ensures: the encoder
-    /// must never consult a havoc'd summary for facts, so the assertion
-    /// stays absent and `is_nil(dst)` remains Sat even under
-    /// `encode_func_with`.
+    /// callee summary carries `Provenance::Havoc` ensures with an
+    /// Inferred (not Annotated) clause: the trust rule (phase-6 spec §4)
+    /// never consults an Inferred clause on a havoc'd summary for facts,
+    /// so the assertion stays absent and `is_nil(dst)` remains Sat even
+    /// under `encode_func_with`. See `encode_call_ensures_trusts_only_
+    /// annotated_clause_on_havoc_summary` below for the Annotated-clause
+    /// counterpart.
     #[test]
     fn havoc_provenance_summaries_assert_nothing() {
         use goverify_extract::gvir;
@@ -3106,6 +3125,144 @@ mod tests {
             discharge(&q),
             goverify_solver::SatResult::Sat,
             "a Havoc-provenance summary's ensures must never be asserted"
+        );
+    }
+
+    /// Same fixture as `havoc_provenance_summaries_assert_nothing`, but
+    /// the Havoc-provenance callee summary carries TWO ensures clauses
+    /// over the same `r0` var: an Annotated one (`¬is_nil(r0)`) and an
+    /// Inferred one (`is_nil(r0)`, deliberately its negation — the two
+    /// are mutually exclusive so any test that let both through would
+    /// make the encoding's own asserts self-contradictory, a directly
+    /// observable difference from asserting only one). Trust rule
+    /// (phase-6 spec §4): Havoc summaries contribute ONLY their
+    /// Annotated clauses, so exactly the first must land.
+    #[test]
+    fn encode_call_ensures_trusts_only_annotated_clause_on_havoc_summary() {
+        use goverify_extract::gvir;
+        use goverify_extract::gvir::instruction::Sem;
+        let mut call = gvir::Instruction {
+            kind: "Call".into(),
+            register: 2,
+            r#type: 2, // *T
+            operands: vec![0],
+            ..Default::default()
+        };
+        call.sem = Some(Sem::Call(gvir::CallSem {
+            static_callee: "t.Mk".into(),
+            ..Default::default()
+        }));
+        let package = gvir::Package {
+            import_path: "t".into(),
+            types: vec![
+                gvir::Type {
+                    id: 1,
+                    repr: "T".into(),
+                    kind: gvir::TypeKind::Struct as i32,
+                    ..Default::default()
+                },
+                gvir::Type {
+                    id: 2,
+                    repr: "*T".into(),
+                    kind: gvir::TypeKind::Pointer as i32,
+                    elem: 1,
+                    ..Default::default()
+                },
+            ],
+            functions: vec![
+                gvir::Function {
+                    id: "t.Mk".into(),
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![gvir::Instruction {
+                            kind: "Return".into(),
+                            ..Default::default()
+                        }],
+                        succs: vec![],
+                        preds: vec![],
+                    }],
+                    ..Default::default()
+                },
+                gvir::Function {
+                    id: "t.Caller".into(),
+                    blocks: vec![gvir::BasicBlock {
+                        index: 0,
+                        instrs: vec![
+                            call,
+                            gvir::Instruction {
+                                kind: "Return".into(),
+                                ..Default::default()
+                            },
+                        ],
+                        succs: vec![],
+                        preds: vec![],
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let p = goverify_ir::Program::from_packages(vec![package]);
+        let mk = p.lookup_func("t.Mk").unwrap();
+        let caller = p.lookup_func("t.Caller").unwrap();
+
+        let r0 = Term::var("r0", ptr_sort());
+        let mk_summary = crate::summary::Summary {
+            ensures: vec![
+                crate::summary::Clause {
+                    tag: crate::annotations::CONTRACT.into(),
+                    formula: crate::summary::Formula {
+                        term: Term::not(ptr_is_nil(r0.clone()).unwrap()).unwrap(),
+                    },
+                    provenance: crate::summary::Provenance::Annotated,
+                },
+                crate::summary::Clause {
+                    tag: "nil-deref".into(),
+                    formula: crate::summary::Formula {
+                        term: ptr_is_nil(r0).unwrap(),
+                    },
+                    provenance: crate::summary::Provenance::Inferred,
+                },
+            ],
+            provenance: crate::summary::Provenance::Havoc,
+            ..crate::summary::Summary::default()
+        };
+        let summary_of = move |f: goverify_ir::FuncId| {
+            if f == mk {
+                mk_summary.clone()
+            } else {
+                crate::summary::Summary::default()
+            }
+        };
+
+        let mut solver = goverify_solver::Z3Native::new(goverify_solver::SolverLimits {
+            timeout_ms: 5_000,
+            mem_mb: 1024,
+        });
+        let mut discharge = |q: &goverify_solver::Query| {
+            goverify_solver::discharge_query(q, &mut solver, None, None).result
+        };
+
+        let with = encode_func_with(&p, caller, &summary_of).unwrap();
+        let dst = with.value(goverify_ir::ValueId(2)).unwrap().clone();
+
+        // Base asserts alone must stay satisfiable: if the Inferred
+        // clause had ALSO been asserted, it would directly contradict
+        // the Annotated one and this would be Unsat regardless of any
+        // extra conjunct.
+        let base = with.reach_query(0, vec![]);
+        assert_eq!(
+            discharge(&base),
+            goverify_solver::SatResult::Sat,
+            "only the Annotated clause may be asserted, not both (would self-contradict)"
+        );
+
+        // The Annotated clause's fact must actually be in force.
+        let q = with.reach_query(0, vec![ptr_is_nil(dst).unwrap()]);
+        assert_eq!(
+            discharge(&q),
+            goverify_solver::SatResult::Unsat,
+            "the Annotated ensures clause on a Havoc summary must still be asserted"
         );
     }
 

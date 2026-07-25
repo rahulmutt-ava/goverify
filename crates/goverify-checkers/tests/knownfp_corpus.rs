@@ -25,6 +25,7 @@ fn knownfp_corpus_findings_match_want_comments() {
         opts: Options::default(),
         cache_dir: None,
         emit_smt: None,
+        annotations: Default::default(),
     };
     let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&NilChecker, &BoundsChecker];
     let a = analyze_full(&p, &cfg, &checkers, &|_role| {

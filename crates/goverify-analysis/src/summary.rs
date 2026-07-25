@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use goverify_solver::Term;
 
+use crate::annotations::FuncAnnotations;
 use crate::effects::Effects;
 
 /// A variable of the function's symbolic interface.
@@ -81,6 +82,38 @@ impl Summary {
             provenance: Provenance::Havoc,
         }
     }
+}
+
+/// Merge annotated clauses into a summary (phase-6 spec §4). Dedup is
+/// FORMULA-equality, tag- and provenance-blind: a contract the checkers
+/// already infer keeps single ownership (its original tag/provenance),
+/// so the same fact never produces two call-site findings. Non-duplicate
+/// annotated clauses are appended as-is (tag "contract", provenance
+/// Annotated).
+pub fn merge_annotations(s: &mut Summary, ann: Option<&FuncAnnotations>) {
+    let Some(ann) = ann else { return };
+    for ac in &ann.requires {
+        if !s.requires.iter().any(|c| c.formula == ac.clause.formula) {
+            s.requires.push(ac.clause.clone());
+        }
+    }
+    for ac in &ann.ensures {
+        if !s.ensures.iter().any(|c| c.formula == ac.clause.formula) {
+            s.ensures.push(ac.clause.clone());
+        }
+    }
+}
+
+/// The widened/bodyless/panic-fallback shape: havoc (top effects, no
+/// requires/ensures) plus whatever the function's own annotations state.
+/// Annotated clauses are constants, not fixpoint state (phase-6 spec
+/// §4) — widening discards inferred facts but must never discard human
+/// ones, and a bodyless/external function has no inferred facts to lose
+/// in the first place.
+pub fn havoc_with(ann: Option<&FuncAnnotations>) -> Summary {
+    let mut s = Summary::havoc();
+    merge_annotations(&mut s, ann);
+    s
 }
 
 /// A callee requires-clause instantiated at a call site: `bound` is the

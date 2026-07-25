@@ -30,6 +30,6 @@ pub use engine::{
 pub use prepass::{Domains, value_clean};
 pub use scc_cache::{CacheConfigKey, MemberEntry, SccCache, SccEntry, decode_entry_bytes};
 pub use summary::{
-    BoundClause, Clause, Formula, IfaceVar, Provenance, Summary, iface_var_name,
-    instantiate_ensures, instantiate_requires,
+    BoundClause, Clause, Formula, IfaceVar, Provenance, Summary, havoc_with, iface_var_name,
+    instantiate_ensures, instantiate_requires, merge_annotations,
 };

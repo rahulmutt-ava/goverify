@@ -20,6 +20,7 @@ fn run(emit: Option<std::path::PathBuf>) -> String {
         opts: Options::default(),
         cache_dir: None,
         emit_smt: emit,
+        annotations: Default::default(),
     };
     let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&NilChecker];
     let a = analyze_full(&p, &cfg, &checkers, &|_role| {
@@ -36,6 +37,7 @@ fn run_with_cache(cache_dir: std::path::PathBuf) -> (String, u64, u64) {
         opts: Options::default(),
         cache_dir: Some(cache_dir),
         emit_smt: None,
+        annotations: Default::default(),
     };
     let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&NilChecker];
     let a = analyze_full(&p, &cfg, &checkers, &|_role| {
@@ -69,6 +71,7 @@ fn nil_corpus_findings_match_want_comments() {
         opts: Options::default(),
         cache_dir: None,
         emit_smt: None,
+        annotations: Default::default(),
     };
     let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&NilChecker];
     let a = analyze_full(&p, &cfg, &checkers, &|_role| {
@@ -96,6 +99,7 @@ fn run_with_cache_and_emit(cache_dir: std::path::PathBuf, emit: std::path::PathB
         opts: Options::default(),
         cache_dir: Some(cache_dir),
         emit_smt: Some(emit),
+        annotations: Default::default(),
     };
     let checkers: Vec<&dyn goverify_analysis::Checker> = vec![&NilChecker];
     let a = analyze_full(&p, &cfg, &checkers, &|_role| {

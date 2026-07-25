@@ -20,6 +20,7 @@ fn run(module_dir: &std::path::Path, cache_dir: &std::path::Path) -> (String, u6
         cache_dir: Some(cache_dir.to_path_buf()),
         emit_smt: None,
         annotations: Default::default(),
+        annotation_version: 0,
     };
     let checkers: Vec<&dyn Checker> = vec![&NilChecker];
     let a = analyze_full(&p, &cfg, &checkers, &|_role| {

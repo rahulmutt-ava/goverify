@@ -67,6 +67,16 @@ pub struct EngineConfig {
     /// empty — every existing caller that builds `EngineConfig` without
     /// annotation support keeps behaving exactly as before.
     pub annotations: Annotations,
+    /// `goverify_spec::ANNOTATION_VERSION` (phase-6 spec §4), salted into
+    /// the SCC cache alongside `SCC_CACHE_VERSION`: a compiler-semantics
+    /// change to how pragmas lower to clauses must rotate every cached
+    /// entry even though the pragma TEXT (already in `func_ir_hash`) and
+    /// the engine-pass code (covered by `SCC_CACHE_VERSION`) haven't
+    /// changed. `goverify-analysis` deliberately does not depend on
+    /// `goverify-spec` (crate boundary), so this is a bare `u32` the CLI
+    /// populates from the real constant; default 0 keeps every existing
+    /// caller/test byte-identical until Task 10 wires it up.
+    pub annotation_version: u32,
 }
 
 #[derive(Debug)]
@@ -188,6 +198,7 @@ pub fn analyze_full(
                     findings_limits: findings_probe.limits(),
                     widen_after: cfg.opts.widen_after,
                     checkers: checkers.iter().map(|c| (c.name(), c.version())).collect(),
+                    annotation_version: cfg.annotation_version,
                 },
             )
         });
@@ -252,7 +263,7 @@ pub fn analyze_full(
                         p,
                         &graph,
                         m,
-                        &|f| read_slot(&slots, f, &current),
+                        &|f| read_slot(&slots, f, &current, annotations),
                         checkers,
                         &mut *backend,
                         cache.as_ref(),
@@ -414,6 +425,89 @@ pub fn analyze_full(
                         }
                     }
                 }
+                // Phase-6 annotation findings (spec §4-§5): call-site
+                // obligations against callees' ANNOTATED requires, plus
+                // best-effort verification of this function's own
+                // annotated ensures. Deliberately inside this same
+                // catch_unwind + per-function scan as the checker loop
+                // above, so these findings enter `fresh_out` -> the SCC
+                // cache entry -> warm replay exactly like any checker
+                // finding. Only reachable when `!checkers.is_empty()`
+                // (the whole findings pass is gated on that above) — a
+                // no-checker run (`analyze`, debug paths) never promised
+                // annotation findings either.
+                let ann_of = |c: FuncId| annotations.funcs.get(&c).cloned();
+                // Re-encode `f`: the probe above (for the encode-skip
+                // diagnostic) discards its `Ok` value, and every
+                // checker's `obligations`/`infer_*` already re-encodes
+                // internally per call (see the loop above and
+                // `analyze_function`'s per-round re-inference) — one
+                // more encode here is the same wasteful-but-harmless
+                // tradeoff, not a new one. `None` covers both "bodyless"
+                // (`p.func(f)` itself is `None`) and "encode failed"
+                // (oversized): contract obligations need call sites to
+                // scan, so they only run in the `Some` case, while
+                // `verify_ensures` handles the `None` case itself (warns
+                // every annotated ensures rather than silently dropping
+                // it).
+                let enc_opt = p
+                    .func(f)
+                    .and_then(|_| crate::encode::encode_func_with(p, f, &summary_of).ok());
+                if let (Some(func), Some(enc)) = (p.func(f), enc_opt.as_ref()) {
+                    let own = summary_of(f);
+                    for ob in crate::annotations::contract_obligations(p, func, enc, &own, &ann_of)
+                    {
+                        // Same bug-finder semantics as the checker loop
+                        // above: only a confirmed Sat verdict becomes a
+                        // Finding.
+                        let outcome = discharge_query(
+                            &ob.query,
+                            &mut *backend,
+                            cache.as_ref(),
+                            emit_dir.as_deref(),
+                        );
+                        if outcome.result == SatResult::Sat {
+                            let trace = outcome
+                                .model
+                                .as_deref()
+                                .and_then(|m| trace_for(p, f, m))
+                                .unwrap_or_default();
+                            let model = outcome
+                                .model
+                                .as_deref()
+                                .map(|m| {
+                                    crate::encode::model_bindings(m)
+                                        .into_iter()
+                                        .filter(|(name, _)| is_param_binding(name))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            per_func.push(Finding {
+                                checker: crate::annotations::CONTRACT.to_string(),
+                                tag: ob.tag.clone(),
+                                func: p.func_name(f).to_string(),
+                                pos: ob.pos,
+                                message: ob.message,
+                                trace,
+                                model,
+                                severity: crate::Severity::Error,
+                            });
+                        }
+                    }
+                }
+                if let Some(fa) = annotations.funcs.get(&f) {
+                    let mut discharge = |q: &Query| {
+                        discharge_query(q, &mut *backend, cache.as_ref(), emit_dir.as_deref())
+                            .result
+                    };
+                    per_func.extend(crate::annotations::verify_ensures(
+                        p,
+                        f,
+                        enc_opt.as_ref(),
+                        fa,
+                        &mut discharge,
+                    ));
+                }
                 per_func
             }));
             match run {
@@ -464,7 +558,7 @@ pub fn analyze_full(
                             .lock()
                             .unwrap()
                             .clone()
-                            .unwrap_or_else(Summary::havoc),
+                            .unwrap_or_else(|| summary::havoc_with(annotations.funcs.get(&m))),
                         analysis_diag: diag_slots[m.0 as usize].lock().unwrap().clone(),
                         findings: fresh_out[m.0 as usize].clone().unwrap_or_default(),
                         findings_diags: fresh_diags[m.0 as usize].clone(),
@@ -535,11 +629,15 @@ fn trace_for(p: &Program, f: FuncId, model: &str) -> Option<Vec<crate::checker::
 /// (same-SCC callee, not yet committed to `slots`), falling back to the
 /// already-finalized cross-SCC slot; a function with no summary anywhere
 /// yet (shouldn't happen given wave ordering, but degrade rather than
-/// panic) is havoc.
+/// panic) is havoc plus whatever that function's own annotations state
+/// (phase-6 spec §4: annotated clauses must survive every havoc
+/// fallback, never just the widening one, so no un-merged summary can
+/// ever reach a caller).
 fn read_slot(
     slots: &[Mutex<Option<Summary>>],
     f: FuncId,
     current: &BTreeMap<FuncId, Summary>,
+    annotations: &Annotations,
 ) -> Summary {
     if let Some(s) = current.get(&f) {
         return s.clone();
@@ -547,7 +645,7 @@ fn read_slot(
     slots
         .get(f.0 as usize)
         .and_then(|slot| slot.lock().unwrap().clone())
-        .unwrap_or_else(Summary::havoc)
+        .unwrap_or_else(|| summary::havoc_with(annotations.funcs.get(&f)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -728,14 +826,15 @@ pub fn dump_findings(a: &Analysis, filter: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use goverify_ir::Program;
+    use goverify_ir::{Pos, Program};
 
     use super::*;
-    use crate::annotations::{AnnClause, CONTRACT};
+    use crate::annotations::{AnnClause, CONTRACT, UNVERIFIED_ANNOTATION};
+    use crate::checker::Severity;
     use crate::effects::{Effects, LockOp};
     use crate::summary::Provenance;
     use crate::testpkg::{block, call, func, func_with_params, instr, pkg};
-    use goverify_solver::{SolverLimits, Term, ptr_is_nil, ptr_sort};
+    use goverify_solver::{SolverLimits, Sort, Term, Z3Native, ptr_is_nil, ptr_sort};
 
     fn straight(
         id: &str,
@@ -1518,6 +1617,450 @@ mod tests {
             found.contains("t.Small"),
             "an encodable function still reports: {:?}",
             a.findings
+        );
+    }
+
+    // ---- Task 8: contract call-site obligations, ensures verification,
+    // cache salt ----
+
+    /// Infers/raises nothing: the minimal non-empty checker set needed to
+    /// exercise the annotation findings pass, which (like every finding)
+    /// only runs when `!checkers.is_empty()` — see the comment at the
+    /// integration site in `analyze_full`.
+    struct NoOpChecker;
+    impl Checker for NoOpChecker {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+        fn infer_requires(
+            &self,
+            _p: &Program,
+            _f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
+            _discharge: &mut dyn FnMut(&Query) -> SatResult,
+        ) -> Vec<crate::summary::Clause> {
+            Vec::new()
+        }
+        fn obligations(
+            &self,
+            _p: &Program,
+            _f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
+        ) -> Vec<crate::checker::Obligation> {
+            Vec::new()
+        }
+    }
+
+    fn z3_backend(_role: BackendRole) -> Box<dyn TextSolver> {
+        Box::new(Z3Native::new(SolverLimits {
+            timeout_ms: 5_000,
+            mem_mb: 1024,
+        }))
+    }
+
+    /// `p0 != 0` (BitVec-64), tag "contract"/Annotated: the shared
+    /// requires clause both contract-obligation tests attach to
+    /// `t.Callee`, `text` distinguishing the two only in the pos.
+    fn nonzero_ann_clause(text: &str) -> AnnClause {
+        let p0 = Term::var("p0", Sort::BitVec(64));
+        AnnClause {
+            clause: crate::summary::Clause {
+                tag: CONTRACT.into(),
+                formula: crate::summary::Formula {
+                    term: Term::not(Term::eq(p0, Term::bv_lit(64, 0)).unwrap()).unwrap(),
+                },
+                provenance: Provenance::Annotated,
+            },
+            text: text.into(),
+            pos: None,
+        }
+    }
+
+    fn int_aux(id: u32, val: i64) -> goverify_extract::gvir::AuxValue {
+        goverify_extract::gvir::AuxValue {
+            id,
+            kind: "Const".into(),
+            r#type: 1, // int
+            r#const: Some(goverify_extract::gvir::ConstValue {
+                value: Some(goverify_extract::gvir::const_value::Value::Int(val)),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// `t.Caller` calling `t.Callee(<arg_reg>)`, `arg_reg` naming a value
+    /// already declared (aux constant or param) in the caller.
+    fn caller_calling_callee(arg_reg: u32) -> goverify_extract::gvir::Function {
+        goverify_extract::gvir::Function {
+            id: "t.Caller".into(),
+            blocks: vec![block(
+                0,
+                vec![
+                    goverify_extract::gvir::Instruction {
+                        kind: "Call".into(),
+                        operands: vec![0, arg_reg], // [callee slot (unused), arg]
+                        sem: Some(goverify_extract::gvir::instruction::Sem::Call(
+                            goverify_extract::gvir::CallSem {
+                                static_callee: "t.Callee".into(),
+                                ..Default::default()
+                            },
+                        )),
+                        ..Default::default()
+                    },
+                    instr("Return"),
+                ],
+                vec![],
+            )],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn contract_obligation_fires_on_violating_call_site_constant() {
+        // t.Callee has an annotated requires `p0 != 0` (never given a
+        // body — an external/bodyless callee's pragma still binds its
+        // callers, phase-6 spec §4). t.Caller passes the literal
+        // constant 0, which violates it outright — no caller-side
+        // requires to contradict the violation, so the obligation must
+        // be Sat and produce exactly one Error finding.
+        let mut caller = caller_calling_callee(1);
+        caller.aux = vec![int_aux(1, 0)];
+        let p = program_with_int_type(vec![caller]);
+        let callee = p.lookup_func("t.Callee").unwrap();
+
+        let mut funcs = BTreeMap::new();
+        funcs.insert(
+            callee,
+            FuncAnnotations {
+                requires: vec![nonzero_ann_clause("p != 0")],
+                ensures: Vec::new(),
+                ignores: Vec::new(),
+            },
+        );
+        let cfg = EngineConfig {
+            annotations: Annotations {
+                funcs,
+                findings: Vec::new(),
+            },
+            ..EngineConfig::default()
+        };
+        let checkers: Vec<&dyn Checker> = vec![&NoOpChecker];
+        let a = analyze_full(&p, &cfg, &checkers, &z3_backend);
+
+        let contract_findings: Vec<&Finding> = a
+            .findings
+            .iter()
+            .filter(|f| f.checker == CONTRACT)
+            .collect();
+        assert_eq!(
+            contract_findings.len(),
+            1,
+            "a violating call-site constant must yield exactly one contract finding: {:?}",
+            a.findings
+        );
+        assert_eq!(contract_findings[0].severity, Severity::Error);
+        assert!(
+            contract_findings[0].message.contains("p != 0"),
+            "message must quote the annotation text: {:?}",
+            contract_findings[0]
+        );
+    }
+
+    #[test]
+    fn contract_obligation_silent_when_caller_already_requires_it() {
+        // Same t.Callee contract as above, but t.Caller forwards its OWN
+        // param (itself annotated `p0 != 0`) instead of a bare constant.
+        // Precision parity with the checkers (phase-6 spec §4): the
+        // caller's own requires terms are asserted as `pre`, so the
+        // instantiated violation directly contradicts them — Unsat,
+        // silent.
+        let mut caller = caller_calling_callee(1);
+        caller.params = vec![goverify_extract::gvir::Param {
+            id: 1,
+            name: "x".into(),
+            r#type: 1,
+        }];
+        let p = program_with_int_type(vec![caller]);
+        let caller_id = p.lookup_func("t.Caller").unwrap();
+        let callee = p.lookup_func("t.Callee").unwrap();
+
+        let mut funcs = BTreeMap::new();
+        funcs.insert(
+            callee,
+            FuncAnnotations {
+                requires: vec![nonzero_ann_clause("p != 0")],
+                ensures: Vec::new(),
+                ignores: Vec::new(),
+            },
+        );
+        funcs.insert(
+            caller_id,
+            FuncAnnotations {
+                requires: vec![nonzero_ann_clause("x != 0")],
+                ensures: Vec::new(),
+                ignores: Vec::new(),
+            },
+        );
+        let cfg = EngineConfig {
+            annotations: Annotations {
+                funcs,
+                findings: Vec::new(),
+            },
+            ..EngineConfig::default()
+        };
+        let checkers: Vec<&dyn Checker> = vec![&NoOpChecker];
+        let a = analyze_full(&p, &cfg, &checkers, &z3_backend);
+
+        let contract_findings: Vec<&Finding> = a
+            .findings
+            .iter()
+            .filter(|f| f.checker == CONTRACT)
+            .collect();
+        assert!(
+            contract_findings.is_empty(),
+            "a caller that already requires the callee's precondition must get no \
+             contract finding: {:?}",
+            a.findings
+        );
+    }
+
+    fn sig_and_int_types() -> Vec<goverify_extract::gvir::Type> {
+        use goverify_extract::gvir;
+        vec![
+            gvir::Type {
+                id: 1,
+                repr: "int".into(),
+                kind: gvir::TypeKind::Basic as i32,
+                name: "int".into(),
+                ..Default::default()
+            },
+            gvir::Type {
+                id: 2,
+                repr: "func() int".into(),
+                kind: gvir::TypeKind::Signature as i32,
+                results: vec![1],
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// `t.F() int { return 5 }`.
+    fn returns_five() -> goverify_extract::gvir::Function {
+        goverify_extract::gvir::Function {
+            id: "t.F".into(),
+            r#type: 2,
+            aux: vec![int_aux(1, 5)],
+            blocks: vec![block(
+                0,
+                vec![goverify_extract::gvir::Instruction {
+                    kind: "Return".into(),
+                    operands: vec![1],
+                    ..Default::default()
+                }],
+                vec![],
+            )],
+            ..Default::default()
+        }
+    }
+
+    fn ensures_ann_clause(rhs: i64, text: &str, pos: Option<Pos>) -> AnnClause {
+        let r0 = Term::var("r0", Sort::BitVec(64));
+        AnnClause {
+            clause: crate::summary::Clause {
+                tag: CONTRACT.into(),
+                formula: crate::summary::Formula {
+                    term: Term::eq(r0, Term::bv_lit(64, rhs as u128)).unwrap(),
+                },
+                provenance: Provenance::Annotated,
+            },
+            text: text.into(),
+            pos,
+        }
+    }
+
+    fn program_with_returns_five(annotations: Annotations) -> (Program, EngineConfig) {
+        use goverify_extract::gvir;
+        let p = Program::from_packages(vec![gvir::Package {
+            import_path: "t".into(),
+            types: sig_and_int_types(),
+            functions: vec![returns_five()],
+            ..Default::default()
+        }]);
+        let cfg = EngineConfig {
+            annotations,
+            ..EngineConfig::default()
+        };
+        (p, cfg)
+    }
+
+    #[test]
+    fn verify_ensures_silent_when_the_body_proves_the_clause() {
+        // t.F always returns 5; the annotated ensures `r0 == 5` is
+        // proven Unsat(body ∧ r0 != 5) at the function's one return
+        // site — no unverified-annotation finding.
+        let mut funcs = BTreeMap::new();
+        let (p, _) = program_with_returns_five(Annotations::default());
+        let f = p.lookup_func("t.F").unwrap();
+        funcs.insert(
+            f,
+            FuncAnnotations {
+                requires: Vec::new(),
+                ensures: vec![ensures_ann_clause(5, "r == 5", None)],
+                ignores: Vec::new(),
+            },
+        );
+        let (p, cfg) = program_with_returns_five(Annotations {
+            funcs,
+            findings: Vec::new(),
+        });
+        let checkers: Vec<&dyn Checker> = vec![&NoOpChecker];
+        let a = analyze_full(&p, &cfg, &checkers, &z3_backend);
+
+        assert!(
+            a.findings
+                .iter()
+                .all(|fnd| fnd.checker != UNVERIFIED_ANNOTATION),
+            "a body-proven ensures must never yield an unverified-annotation finding: {:?}",
+            a.findings
+        );
+    }
+
+    #[test]
+    fn verify_ensures_warns_when_the_body_violates_the_clause() {
+        // Same t.F (always returns 5), but the annotated ensures claims
+        // `r0 == 6` — flatly contradicted by the body. Sat(body ∧ r0 !=
+        // 6), so the clause is never proven: exactly one Warning at the
+        // pragma's own pos (never a source position baked into the
+        // message).
+        let pragma_pos = Pos {
+            file: "t.go".into(),
+            line: 7,
+            col: 2,
+        };
+        let mut funcs = BTreeMap::new();
+        let (p, _) = program_with_returns_five(Annotations::default());
+        let f = p.lookup_func("t.F").unwrap();
+        funcs.insert(
+            f,
+            FuncAnnotations {
+                requires: Vec::new(),
+                ensures: vec![ensures_ann_clause(6, "r == 6", Some(pragma_pos.clone()))],
+                ignores: Vec::new(),
+            },
+        );
+        let (p, cfg) = program_with_returns_five(Annotations {
+            funcs,
+            findings: Vec::new(),
+        });
+        let checkers: Vec<&dyn Checker> = vec![&NoOpChecker];
+        let a = analyze_full(&p, &cfg, &checkers, &z3_backend);
+
+        let warnings: Vec<&Finding> = a
+            .findings
+            .iter()
+            .filter(|fnd| fnd.checker == UNVERIFIED_ANNOTATION)
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a body-violated ensures must yield exactly one unverified-annotation \
+             finding: {:?}",
+            a.findings
+        );
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert_eq!(
+            warnings[0].pos,
+            Some(pragma_pos),
+            "the finding must anchor at the pragma's own position"
+        );
+        assert!(
+            !warnings[0].message.contains(".go:"),
+            "INVARIANT: message must never embed a source position: {:?}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn annotation_findings_replay_identically_from_a_warm_scc_cache() {
+        // One program exercising BOTH annotation passes at once (a
+        // violating contract call site + an unprovable ensures), run
+        // twice through the same on-disk SCC cache: the second run must
+        // replay byte-identical findings (contract AND
+        // unverified-annotation alike) without recomputing them, exactly
+        // like the existing checker-finding cache tests.
+        let mut caller = caller_calling_callee(1);
+        caller.aux = vec![int_aux(1, 0)];
+        let ensures_fn = {
+            let mut f = returns_five();
+            f.id = "t.EnsF".into();
+            f
+        };
+        let p0 = Program::from_packages(vec![goverify_extract::gvir::Package {
+            import_path: "t".into(),
+            types: sig_and_int_types(),
+            functions: vec![caller, ensures_fn],
+            ..Default::default()
+        }]);
+        let callee = p0.lookup_func("t.Callee").unwrap();
+        let ens_f = p0.lookup_func("t.EnsF").unwrap();
+
+        let mut funcs = BTreeMap::new();
+        funcs.insert(
+            callee,
+            FuncAnnotations {
+                requires: vec![nonzero_ann_clause("p != 0")],
+                ensures: Vec::new(),
+                ignores: Vec::new(),
+            },
+        );
+        funcs.insert(
+            ens_f,
+            FuncAnnotations {
+                requires: Vec::new(),
+                ensures: vec![ensures_ann_clause(6, "r == 6", None)],
+                ignores: Vec::new(),
+            },
+        );
+        let annotations = Annotations {
+            funcs,
+            findings: Vec::new(),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let build_cfg = || EngineConfig {
+            cache_dir: Some(dir.path().to_path_buf()),
+            annotations: annotations.clone(),
+            ..EngineConfig::default()
+        };
+        let checkers: Vec<&dyn Checker> = vec![&NoOpChecker];
+
+        let a1 = analyze_full(&p0, &build_cfg(), &checkers, &z3_backend);
+        assert_eq!(
+            a1.findings.iter().filter(|f| f.checker == CONTRACT).count(),
+            1,
+            "sanity: the contract finding fires on the cold run: {:?}",
+            a1.findings
+        );
+        assert_eq!(
+            a1.findings
+                .iter()
+                .filter(|f| f.checker == UNVERIFIED_ANNOTATION)
+                .count(),
+            1,
+            "sanity: the unverified-annotation finding fires on the cold run: {:?}",
+            a1.findings
+        );
+
+        let a2 = analyze_full(&p0, &build_cfg(), &checkers, &z3_backend);
+        assert_eq!(
+            a1.findings, a2.findings,
+            "warm-replayed annotation findings must be byte-identical to the cold run"
+        );
+        assert!(
+            a2.scc_cache_hits > 0,
+            "the second run must actually replay from the SCC cache: hits={} misses={}",
+            a2.scc_cache_hits,
+            a2.scc_cache_misses
         );
     }
 }

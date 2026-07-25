@@ -6,10 +6,12 @@
 
 use std::collections::BTreeMap;
 
-use goverify_ir::{FuncId, Pos};
+use goverify_ir::{Callee, FuncId, Function, Op, Pos, Program, TypeKind};
+use goverify_solver::{Query, SatResult, Term};
 
-use crate::checker::Finding;
-use crate::summary::Clause;
+use crate::checker::{Finding, Obligation, Severity};
+use crate::encode::EncodedFunc;
+use crate::summary::{Clause, Summary, instantiate_ensures, instantiate_requires};
 
 /// Tag for every compiled annotation `Clause` (both `requires` and
 /// `ensures`): annotations are one contract source, not a per-checker
@@ -49,4 +51,188 @@ pub struct Annotations {
     /// to the analysis findings — they are cheap to recompute and never
     /// enter the SCC cache.
     pub findings: Vec<Finding>,
+}
+
+/// Call-site obligations for callees' ANNOTATED requires (phase-6 spec
+/// §4). Mirrors the checkers' shared call-site-obligation pattern, but
+/// iterates the callee's `FuncAnnotations` directly rather than its
+/// merged summary: a merged `Summary.requires` interleaves inferred and
+/// annotated clauses (dedup rule, `merge_annotations`), so a summary
+/// index no longer lines up with `FuncAnnotations.requires`'s pragma
+/// texts. Walking `ann_of`'s own `FuncAnnotations` keeps every
+/// `BoundClause` paired with the exact `AnnClause` (and its `text`) it
+/// came from.
+///
+/// `pre` — the caller's own requires terms (annotated included) — is
+/// asserted alongside each violation for precision parity with the
+/// checkers' own call-site obligations: without it, a caller that
+/// itself requires (and therefore never violates) some precondition
+/// would still get a reachable-looking obligation from an unconstrained
+/// encoding.
+pub fn contract_obligations(
+    p: &Program,
+    func: &Function,
+    enc: &EncodedFunc,
+    own: &Summary,
+    ann_of: &dyn Fn(FuncId) -> Option<FuncAnnotations>,
+) -> Vec<Obligation> {
+    let pre: Vec<Term> = own
+        .requires
+        .iter()
+        .map(|c| c.formula.term.clone())
+        .collect();
+    let mut out = Vec::new();
+    for (bi, b) in func.blocks.iter().enumerate() {
+        for ins in &b.instrs {
+            let Op::Call {
+                callee: Callee::Static(c),
+                args,
+                ..
+            } = &ins.op
+            else {
+                continue;
+            };
+            let Some(fa) = ann_of(*c) else { continue };
+            if fa.requires.is_empty() {
+                continue;
+            }
+            let arg_terms: Vec<Option<Term>> =
+                args.iter().map(|a| enc.value(*a).cloned()).collect();
+            // A throwaway Summary whose `requires` is JUST this callee's
+            // annotated clauses, in the same order as `fa.requires` —
+            // `instantiate_requires`'s output is index-parallel with its
+            // input, so zipping against `fa.requires` recovers each
+            // `AnnClause` (and its `text`) for the matching `BoundClause`.
+            let tmp = Summary {
+                requires: fa.requires.iter().map(|a| a.clause.clone()).collect(),
+                ..Summary::default()
+            };
+            for (bc, ac) in instantiate_requires(&tmp, &arg_terms)
+                .into_iter()
+                .zip(&fa.requires)
+            {
+                // None = unbindable (unknown arg, sort mismatch, arity
+                // overflow): cannot evaluate, so no obligation — never a
+                // false positive from a missing term.
+                let Some(v) = bc.violation else { continue };
+                let mut extra = pre.clone();
+                extra.push(v);
+                out.push(Obligation {
+                    tag: CONTRACT.to_string(),
+                    // INVARIANT (checker.rs's `Obligation::message` doc):
+                    // never embed a source position here — `pos` below is
+                    // the sole carrier, and this text is hashed into the
+                    // finding fingerprint.
+                    message: format!(
+                        "call to {} violates annotated requires `{}`",
+                        p.func_name(*c),
+                        ac.text
+                    ),
+                    pos: ins.pos.clone(),
+                    query: enc.reach_query(bi, extra),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Best-effort verification of a function's ANNOTATED ensures (phase-6
+/// spec §4): for each clause, `body ∧ ¬clause` is discharged at every
+/// return site; `Unsat` everywhere means the clause is proven and stays
+/// silent (callers already trust it via `encode_call_ensures`'s
+/// Annotated-clause carve-out — nothing more to report). Anything short
+/// of that full proof — `Sat`, `Unknown`, an unbindable clause, a
+/// bodyless function, a function with no return sites, or a return
+/// whose arity doesn't match the signature — yields the
+/// `unverified-annotation` WARNING: the clause is still USED (trusted
+/// by callers regardless of whether the engine could confirm it), so it
+/// must be FLAGGED, never silently accepted or silently dropped.
+pub fn verify_ensures(
+    p: &Program,
+    f: FuncId,
+    enc: Option<&EncodedFunc>,
+    ann: &FuncAnnotations,
+    discharge: &mut dyn FnMut(&Query) -> SatResult,
+) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut warn = |ac: &AnnClause| {
+        out.push(Finding {
+            checker: UNVERIFIED_ANNOTATION.to_string(),
+            tag: UNVERIFIED_ANNOTATION.to_string(),
+            func: p.func_name(f).to_string(),
+            pos: ac.pos.clone(),
+            message: format!(
+                "annotated ensures `{}` not proven against the body; callers still assume it",
+                ac.text
+            ),
+            trace: Vec::new(),
+            model: Vec::new(),
+            severity: Severity::Warning,
+        });
+    };
+    let (Some(func), Some(enc)) = (p.func(f), enc) else {
+        // Bodyless (no body to verify against) or unencodable (e.g. past
+        // the assertion cap): can't even attempt a proof.
+        for ac in &ann.ensures {
+            warn(ac);
+        }
+        return out;
+    };
+    let TypeKind::Signature { results, .. } = p.types().kind(func.sig) else {
+        for ac in &ann.ensures {
+            warn(ac);
+        }
+        return out;
+    };
+    let results_len = results.len();
+    // Return sites, arity-checked: a crafted/stale `.gvir` return whose
+    // value count doesn't match the signature can never be soundly bound
+    // (nothing to say r<i> IS for an i past what this particular return
+    // provides), so any such site marks every clause unprovable rather
+    // than silently skipping just that site.
+    let mut sites: Vec<(usize, Vec<goverify_ir::ValueId>)> = Vec::new();
+    let mut malformed = false;
+    for (bi, b) in func.blocks.iter().enumerate() {
+        for ins in &b.instrs {
+            if let Op::Return { vals } = &ins.op {
+                if vals.len() != results_len {
+                    malformed = true;
+                }
+                sites.push((bi, vals.clone()));
+            }
+        }
+    }
+    let arg_terms: Vec<Option<Term>> = func.params.iter().map(|&v| enc.value(v).cloned()).collect();
+    for ac in &ann.ensures {
+        if malformed || sites.is_empty() {
+            warn(ac);
+            continue;
+        }
+        let tmp = Summary {
+            ensures: vec![ac.clause.clone()],
+            ..Summary::default()
+        };
+        let mut proven = true;
+        for (bi, vals) in &sites {
+            let result_terms: Vec<Option<Term>> =
+                vals.iter().map(|&v| enc.value(v).cloned()).collect();
+            let bcs = instantiate_ensures(&tmp, &arg_terms, &result_terms);
+            let Some(v) = bcs.into_iter().next().and_then(|bc| bc.violation) else {
+                // Unbindable at this site (missing arg/result term):
+                // cannot evaluate, so cannot prove — degrade to
+                // unverified rather than assert on a partial binding.
+                proven = false;
+                break;
+            };
+            if discharge(&enc.reach_query(*bi, vec![v])) != SatResult::Unsat {
+                proven = false;
+                break;
+            }
+        }
+        if !proven {
+            warn(ac);
+        }
+    }
+    out
 }

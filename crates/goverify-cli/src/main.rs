@@ -372,6 +372,7 @@ fn run_findings(fa: FindingsArgs) -> Result<(), Box<dyn std::error::Error>> {
         cache_dir: fa.cache_dir.clone(),
         emit_smt: fa.emit_smt.clone(),
         annotations: goverify_analysis::Annotations::default(),
+        annotation_version: 0,
     };
     let cmd = fa.solver_cmd.clone();
     // `debug findings` keeps one timeout for both backend roles; `check`
@@ -469,6 +470,7 @@ fn analyze_module(ca: &CheckArgs) -> Result<Analyzed, Box<dyn std::error::Error>
         cache_dir: cache_root.clone(),
         emit_smt: ca.emit_smt.clone(),
         annotations: goverify_analysis::Annotations::default(),
+        annotation_version: 0,
     };
     let checkers: Vec<&dyn goverify_analysis::Checker> = vec![
         &goverify_checkers::NilChecker,

@@ -48,6 +48,12 @@ pub struct CacheConfigKey {
     pub widen_after: u32,
     /// (checker name, checker version), sorted by name.
     pub checkers: Vec<(&'static str, u32)>,
+    /// `goverify_spec::ANNOTATION_VERSION` (phase-6 spec §4): a
+    /// compiler-semantics change to how `//goverify:` pragmas lower to
+    /// clauses must rotate every cached entry even though neither the
+    /// pragma TEXT (already inside `func_ir_hash`) nor the engine-pass
+    /// code (covered by `SCC_CACHE_VERSION`) changed.
+    pub annotation_version: u32,
 }
 
 pub struct SccCache {
@@ -79,6 +85,10 @@ impl SccCache {
             hash_field(&mut h, name.as_bytes());
             h.update(&version.to_le_bytes());
         }
+        // Salt-input ADDITION (same rationale as `findings_identity`
+        // above): rotates every existing key without needing a
+        // `SCC_CACHE_VERSION` bump.
+        h.update(&cfg.annotation_version.to_le_bytes());
         SccCache {
             store: Store::open(root),
             salt: *h.finalize().as_bytes(),
@@ -755,6 +765,7 @@ mod tests {
             findings_limits: goverify_solver::SolverLimits::default(),
             widen_after: 3,
             checkers: vec![("nil", 1)],
+            annotation_version: 0,
         };
         let c = SccCache::open(dir.path().to_path_buf(), &cfg);
         let key = [9u8; 32];

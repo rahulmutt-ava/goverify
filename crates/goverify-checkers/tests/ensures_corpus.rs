@@ -16,6 +16,7 @@ fn analysis() -> (goverify_ir::Program, goverify_analysis::Analysis) {
             cache_dir: None,
             emit_smt: None,
             annotations: Default::default(),
+            annotation_version: 0,
         },
         &checkers,
         &|_role| {

@@ -103,6 +103,30 @@ fn baseline_suppresses_then_resurfaces_on_entry_removal() {
         "footer reports suppression: {stdout}"
     );
 
+    // Same fully-baselined module, --format sarif: baseline-suppressed
+    // findings are now EMITTED as results carrying `"kind": "external"`
+    // (phase-6 spec §5) rather than omitted (the phase-5b behavior).
+    let sarif_check = goverify(
+        &["check", "--format", "sarif", "./..."],
+        &module,
+        cache.path(),
+    );
+    assert_eq!(sarif_check.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&sarif_check.stdout).expect("valid sarif");
+    let results = v["runs"][0]["results"].as_array().unwrap();
+    assert!(!results.is_empty(), "suppressed results are emitted: {v}");
+    assert!(
+        results
+            .iter()
+            .all(|r| r["suppressions"][0]["kind"] == "external"),
+        "every result is baseline-suppressed: {v}"
+    );
+    assert_eq!(
+        v["runs"][0]["properties"]["suppressedByBaseline"],
+        results.len(),
+        "{v}"
+    );
+
     // --no-baseline restores the full report.
     let full = goverify(&["check", "--no-baseline", "./..."], &module, cache.path());
     assert_eq!(full.status.code(), Some(1));

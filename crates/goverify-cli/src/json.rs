@@ -15,8 +15,8 @@ pub const JSON_SCHEMA_VERSION: u32 = 2;
 pub struct Summary {
     pub total: usize,
     pub suppressed_by_baseline: usize,
-    /// Pragma-suppressed count (phase-6 spec §5). Wired to a real count
-    /// in Task 10; every current call site passes 0.
+    /// Pragma-suppressed count (phase-6 spec §5): findings dropped by a
+    /// `//goverify:ignore` matching (func, checker).
     pub suppressed_pragma: usize,
     pub diff_base_scoped: bool,
 }

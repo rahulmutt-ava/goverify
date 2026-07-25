@@ -31,13 +31,32 @@
               "shortDescription": {
                 "text": "possible integer conversion overflow"
               }
+            },
+            {
+              "id": "contract",
+              "shortDescription": {
+                "text": "annotated requires violated at a call site"
+              }
+            },
+            {
+              "id": "bad-annotation",
+              "shortDescription": {
+                "text": "invalid //goverify: annotation"
+              }
+            },
+            {
+              "id": "unverified-annotation",
+              "shortDescription": {
+                "text": "annotated ensures not proven against the body"
+              }
             }
           ]
         }
       },
       "results": [],
       "properties": {
-        "suppressedByBaseline": 0
+        "suppressedByBaseline": 0,
+        "suppressedByPragma": 0
       }
     }
   ]

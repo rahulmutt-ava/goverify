@@ -19,6 +19,7 @@ goverify-ir.workspace = true
 goverify-analysis.workspace = true
 goverify-checkers.workspace = true
 goverify-solver.workspace = true
+goverify-spec.workspace = true
 tempfile.workspace = true
 blake3.workspace = true
 serde.workspace = true

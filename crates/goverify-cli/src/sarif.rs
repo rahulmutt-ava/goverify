@@ -1,9 +1,12 @@
-//! `--format sarif` (phase-5b spec §3): SARIF 2.1.0, minimal static
-//! subset for GitHub code scanning. Determinism is the root invariant:
-//! no timestamps, no invocation objects, no absolute URIs — SARIF's
-//! optional provenance fields all violate it and are deliberately
-//! absent. Suppressed-by-baseline results are OMITTED (not emitted with
-//! `suppressions`); the count goes in run.properties.
+//! `--format sarif` (phase-5b spec §3, phase-6 spec §5): SARIF 2.1.0,
+//! minimal static subset for GitHub code scanning. Determinism is the
+//! root invariant: no timestamps, no invocation objects, no absolute
+//! URIs — SARIF's optional provenance fields all violate it and are
+//! deliberately absent. Pragma- and baseline-suppressed findings are
+//! EMITTED as results carrying a `suppressions` array (`"inSource"` /
+//! `"external"`) rather than omitted — a spec-mandated change from the
+//! phase-5b behavior, which omitted baseline-suppressed results
+//! entirely; the counts also go in run.properties.
 
 use goverify_analysis::{Finding, Severity};
 use serde::Serialize;
@@ -20,6 +23,12 @@ const RULES: &[(&str, &str)] = &[
     ("bounds", "possible out-of-range index or slice bound"),
     ("div-zero", "possible integer division by zero"),
     ("overflow", "possible integer conversion overflow"),
+    ("contract", "annotated requires violated at a call site"),
+    ("bad-annotation", "invalid //goverify: annotation"),
+    (
+        "unverified-annotation",
+        "annotated ensures not proven against the body",
+    ),
 ];
 
 #[derive(Serialize)]
@@ -42,6 +51,7 @@ struct Run<'a> {
 #[serde(rename_all = "camelCase")]
 struct RunProperties {
     suppressed_by_baseline: usize,
+    suppressed_by_pragma: usize,
 }
 
 #[derive(Serialize)]
@@ -80,6 +90,18 @@ struct SarifResult<'a> {
     partial_fingerprints: PartialFingerprints<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     code_flows: Option<[CodeFlow<'a>; 1]>,
+    /// Present only for pragma-/baseline-suppressed results (phase-6
+    /// spec §5): absent for kept findings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suppressions: Option<[Suppression; 1]>,
+}
+
+/// A SARIF suppression: `"inSource"` for a `//goverify:ignore` pragma,
+/// `"external"` for a baseline entry (the two suppression mechanisms
+/// the CLI supports, spec §5).
+#[derive(Serialize)]
+struct Suppression {
+    kind: &'static str,
 }
 
 // The `goverify/v1` key below is NOT derived from `fingerprint::SCHEME`
@@ -160,46 +182,79 @@ fn message_text(f: &Finding) -> String {
     format!("{}\nwith: {}", f.message, bindings.join(", "))
 }
 
-/// `fps` is parallel to `findings` (fingerprint::fingerprints).
-pub fn render_sarif(findings: &[Finding], fps: &[String], suppressed_by_baseline: usize) -> String {
+/// Build one result for `f`/`fp`; `suppressions` is `None` for a kept
+/// finding, `Some([Suppression { kind }])` for a suppressed one — the
+/// shared shape between kept and suppressed results (only this field
+/// differs).
+fn build_result<'a>(
+    f: &'a Finding,
+    fp: &'a str,
+    suppressions: Option<[Suppression; 1]>,
+) -> SarifResult<'a> {
+    let flow: Vec<ThreadFlowLocation> = f
+        .trace
+        .iter()
+        .filter_map(|s| s.pos.as_ref())
+        .map(|p| ThreadFlowLocation {
+            location: location(p),
+        })
+        .collect();
+    SarifResult {
+        rule_id: &f.tag,
+        // SARIF level from severity (phase-6 spec §5): a deliberate,
+        // documented non-additive change — existing findings (all Error
+        // before annotations) flip from "warning" to "error" (Task 14
+        // shakeout addendum).
+        level: match f.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        },
+        message: Text {
+            text: message_text(f),
+        },
+        locations: f.pos.as_ref().map(|p| [location(p)]),
+        partial_fingerprints: PartialFingerprints { goverify_v1: fp },
+        code_flows: (!flow.is_empty()).then_some([CodeFlow {
+            thread_flows: [ThreadFlow { locations: flow }],
+        }]),
+        suppressions,
+    }
+}
+
+/// `fps` is parallel to `findings` (fingerprint::fingerprints);
+/// `sup_pragma`/`sup_baseline` are the findings suppressed by the
+/// pragma-ignore filter and the baseline filter respectively, each
+/// paired with its own fingerprint (phase-6 spec §5). Suppressed
+/// findings are emitted as results carrying a `suppressions` array
+/// rather than omitted, in this deterministic order: kept findings
+/// first (no suppression), then pragma-suppressed ("inSource"), then
+/// baseline-suppressed ("external") — each group in its input order.
+pub fn render_sarif(
+    findings: &[Finding],
+    fps: &[String],
+    sup_pragma: &[(Finding, String)],
+    sup_baseline: &[(Finding, String)],
+) -> String {
     debug_assert_eq!(
         findings.len(),
         fps.len(),
         "render_sarif: findings/fps length mismatch would silently truncate the report via zip"
     );
-    let results: Vec<SarifResult> = findings
+    let mut results: Vec<SarifResult> = findings
         .iter()
         .zip(fps)
-        .map(|(f, fp)| {
-            let flow: Vec<ThreadFlowLocation> = f
-                .trace
-                .iter()
-                .filter_map(|s| s.pos.as_ref())
-                .map(|p| ThreadFlowLocation {
-                    location: location(p),
-                })
-                .collect();
-            SarifResult {
-                rule_id: &f.tag,
-                // SARIF level from severity (phase-6 spec §5): a
-                // deliberate, documented non-additive change — existing
-                // findings (all Error before annotations) flip from
-                // "warning" to "error" (Task 14 shakeout addendum).
-                level: match f.severity {
-                    Severity::Error => "error",
-                    Severity::Warning => "warning",
-                },
-                message: Text {
-                    text: message_text(f),
-                },
-                locations: f.pos.as_ref().map(|p| [location(p)]),
-                partial_fingerprints: PartialFingerprints { goverify_v1: fp },
-                code_flows: (!flow.is_empty()).then_some([CodeFlow {
-                    thread_flows: [ThreadFlow { locations: flow }],
-                }]),
-            }
-        })
+        .map(|(f, fp)| build_result(f, fp, None))
         .collect();
+    results.extend(
+        sup_pragma
+            .iter()
+            .map(|(f, fp)| build_result(f, fp, Some([Suppression { kind: "inSource" }]))),
+    );
+    results.extend(
+        sup_baseline
+            .iter()
+            .map(|(f, fp)| build_result(f, fp, Some([Suppression { kind: "external" }]))),
+    );
     let out = Sarif {
         schema: SARIF_SCHEMA,
         version: SARIF_VERSION,
@@ -221,7 +276,8 @@ pub fn render_sarif(findings: &[Finding], fps: &[String], suppressed_by_baseline
             },
             results,
             properties: RunProperties {
-                suppressed_by_baseline,
+                suppressed_by_baseline: sup_baseline.len(),
+                suppressed_by_pragma: sup_pragma.len(),
             },
         }],
     };
@@ -260,13 +316,17 @@ mod tests {
             severity: goverify_analysis::Severity::Error,
         };
         let fps = vec!["v1:00112233445566778899aabbccddeeff".to_string()];
-        let got = render_sarif(&[f], &fps, 3);
+        let got = render_sarif(&[f], &fps, &[], &[]);
         // Structural pins (a full golden lands in Task 11's corpus suite):
         let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
         assert_eq!(v["version"], "2.1.0");
         assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "goverify");
         let r = &v["runs"][0]["results"][0];
         assert_eq!(r["ruleId"], "nil-deref");
+        assert!(
+            r.get("suppressions").is_none(),
+            "a kept finding carries no suppressions: {r}"
+        );
         // Error severity -> SARIF level "error" (phase-6 spec §5).
         assert_eq!(r["level"], "error");
         assert_eq!(
@@ -291,7 +351,8 @@ mod tests {
             msg.contains("possibly-nil") && msg.contains("with: p0 = (ptr-nil)"),
             "{msg}"
         );
-        assert_eq!(v["runs"][0]["properties"]["suppressedByBaseline"], 3);
+        assert_eq!(v["runs"][0]["properties"]["suppressedByBaseline"], 0);
+        assert_eq!(v["runs"][0]["properties"]["suppressedByPragma"], 0);
         // Determinism guards: no timestamps, no absolute paths.
         assert!(
             !got.contains("startTimeUtc") && !got.contains("invocation"),
@@ -325,7 +386,7 @@ mod tests {
             model: Vec::new(),
             severity: goverify_analysis::Severity::Error,
         };
-        let got = render_sarif(&[f], &["v1:0".to_string()], 0);
+        let got = render_sarif(&[f], &["v1:0".to_string()], &[], &[]);
         let v: serde_json::Value = serde_json::from_str(&got).unwrap();
         let r = &v["runs"][0]["results"][0];
         assert!(r.get("locations").is_none(), "no pos -> no locations: {r}");
@@ -353,10 +414,68 @@ mod tests {
                 mk(goverify_analysis::Severity::Warning),
             ],
             &["v1:0".to_string(), "v1:1".to_string()],
-            0,
+            &[],
+            &[],
         );
         let v: serde_json::Value = serde_json::from_str(&got).unwrap();
         assert_eq!(v["runs"][0]["results"][0]["level"], "error");
         assert_eq!(v["runs"][0]["results"][1]["level"], "warning");
+    }
+
+    /// One kept, one pragma-suppressed, one baseline-suppressed finding
+    /// (phase-6 spec §5): asserts result order (kept, then pragma, then
+    /// baseline), each carrying the right `suppressions` entry (or
+    /// none), the run-properties counts, and that two independent
+    /// renders are byte-identical.
+    #[test]
+    fn render_sarif_emits_suppressions_and_counts() {
+        let mk = |tag: &str, label: &str| Finding {
+            checker: "nil".to_string(),
+            tag: tag.to_string(),
+            func: "example.com/m.F".to_string(),
+            pos: None,
+            message: format!("m-{label}"),
+            trace: Vec::new(),
+            model: Vec::new(),
+            severity: goverify_analysis::Severity::Error,
+        };
+        let kept = mk("nil-deref", "kept");
+        let pragma = mk("nil-deref", "pragma");
+        let baseline = mk("nil-deref", "baseline");
+        let kept_fps = vec!["v1:0".to_string()];
+        let sup_pragma = vec![(pragma, "v1:1".to_string())];
+        let sup_baseline = vec![(baseline, "v1:2".to_string())];
+
+        let render = || {
+            render_sarif(
+                std::slice::from_ref(&kept),
+                &kept_fps,
+                &sup_pragma,
+                &sup_baseline,
+            )
+        };
+        let got = render();
+        let v: serde_json::Value = serde_json::from_str(&got).unwrap();
+        let results = v["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3, "kept + pragma + baseline: {v}");
+
+        assert_eq!(results[0]["message"]["text"], "m-kept");
+        assert!(
+            results[0].get("suppressions").is_none(),
+            "kept: {:?}",
+            results[0]
+        );
+
+        assert_eq!(results[1]["message"]["text"], "m-pragma");
+        assert_eq!(results[1]["suppressions"][0]["kind"], "inSource");
+
+        assert_eq!(results[2]["message"]["text"], "m-baseline");
+        assert_eq!(results[2]["suppressions"][0]["kind"], "external");
+
+        assert_eq!(v["runs"][0]["properties"]["suppressedByPragma"], 1);
+        assert_eq!(v["runs"][0]["properties"]["suppressedByBaseline"], 1);
+
+        // Determinism: two independent renders are byte-identical.
+        assert_eq!(render(), got, "render_sarif must be deterministic");
     }
 }

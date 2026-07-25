@@ -415,6 +415,11 @@ struct Analyzed {
     scoped: Vec<goverify_analysis::Finding>,
     cache_root: Option<PathBuf>,
     timings: bool,
+    /// (func full name, checker name) pairs compiled from
+    /// `//goverify:ignore` (phase-6 spec §5). Consumed by `run_check`'s
+    /// pragma-ignore filter, which runs after fingerprinting and before
+    /// the baseline filter.
+    pragma_ignores: Vec<(String, String)>,
 }
 
 /// `check` (spec §10, this task): the user-facing analyzer entry point.
@@ -478,17 +483,44 @@ fn analyze_module(ca: &CheckArgs) -> Result<Analyzed, Box<dyn std::error::Error>
         };
         retry_backend(&cmd, lim)
     });
+    // Compile //goverify: annotations (phase-6 spec §3-§5): the known
+    // `ignore` name set is the production checker names plus the three
+    // annotation finding classes; `default_checkers` is the single
+    // source shared between the checker vec below and this list.
+    let checkers = goverify_checkers::default_checkers();
+    let known: Vec<&str> = checkers
+        .iter()
+        .map(|c| c.name())
+        .chain([
+            goverify_analysis::CONTRACT,
+            goverify_analysis::BAD_ANNOTATION,
+            goverify_analysis::UNVERIFIED_ANNOTATION,
+        ])
+        .collect();
+    let ann = goverify_spec::compile_program(&program, &known);
+    // Bad-annotation findings are config-error diagnostics, cheap to
+    // recompute and never SCC-cached; cloned out here so they survive
+    // `cfg` taking ownership of `ann` below, and appended to the
+    // analysis findings before scoping (spec §5: never scope-filtered).
+    let pre_findings = ann.findings.clone();
+    // (func full name, checker name) ignore pairs consumed by the CLI's
+    // pragma-ignore filter (`apply_pragma_ignores`, run_check). Iterating
+    // a BTreeMap is deterministic regardless of the map's key order.
+    let pragma_ignores: Vec<(String, String)> = ann
+        .funcs
+        .iter()
+        .flat_map(|(f, fa)| {
+            let name = program.func_name(*f).to_string();
+            fa.ignores.iter().map(move |n| (name.clone(), n.clone()))
+        })
+        .collect();
     let cfg = goverify_analysis::EngineConfig {
         opts: goverify_analysis::Options::default(),
         cache_dir: cache_root.clone(),
         emit_smt: ca.emit_smt.clone(),
-        annotations: goverify_analysis::Annotations::default(),
-        annotation_version: 0,
+        annotations: ann,
+        annotation_version: goverify_spec::ANNOTATION_VERSION,
     };
-    let checkers: Vec<&dyn goverify_analysis::Checker> = vec![
-        &goverify_checkers::NilChecker,
-        &goverify_checkers::BoundsChecker,
-    ];
     let t_analyze = std::time::Instant::now();
     let a = goverify_analysis::analyze_full(&program, &cfg, &checkers, &*mk);
     if timings {
@@ -508,20 +540,29 @@ fn analyze_module(ca: &CheckArgs) -> Result<Analyzed, Box<dyn std::error::Error>
     if esc > 0 {
         eprintln!("goverify: solver: {esc} queries escalated to the retry tier");
     }
+    // Fold in the compiled-annotation config-error findings (phase-6
+    // spec §5) before scoping: they are diagnostics about the pragmas
+    // themselves (parse/resolve failures, unmatched pragmas, unknown
+    // ignore names), not analysis results, so `scope_findings` below
+    // exempts them unconditionally rather than risking one being hidden
+    // because it happens to fall outside --scope (some, like an
+    // unmatched pragma, carry no real function at all).
+    let mut all_findings = a.findings;
+    all_findings.extend(pre_findings);
     // Scope findings to the analyzed module: extraction walks the whole
-    // import closure (stdlib + deps), so `a.findings` covers far more than
-    // the user asked to check. Inference/summaries above already used the
-    // whole closure; only what we render and count is scoped. Exit code 1
-    // keys off the SCOPED set.
+    // import closure (stdlib + deps), so `all_findings` covers far more
+    // than the user asked to check. Inference/summaries above already
+    // used the whole closure; only what we render and count is scoped.
+    // Exit code 1 keys off the SCOPED set.
     let scope = ca.scope.clone().or_else(|| module_path(Path::new(".")));
     let scoped: Vec<goverify_analysis::Finding> = match &scope {
-        Some(s) => scope_findings(&a.findings, s),
+        Some(s) => scope_findings(&all_findings, s),
         None => {
             eprintln!(
                 "goverify: no module scope (no go.mod found and no --scope); \
                  reporting findings across the whole import closure"
             );
-            a.findings.clone()
+            all_findings
         }
     };
     Ok(Analyzed {
@@ -529,6 +570,7 @@ fn analyze_module(ca: &CheckArgs) -> Result<Analyzed, Box<dyn std::error::Error>
         scoped,
         cache_root,
         timings,
+        pragma_ignores,
     })
 }
 
@@ -582,13 +624,22 @@ fn acquire_program(
 /// the documented degrade-never-die exception: this is user-authored
 /// gate configuration, and silently reporting unfiltered findings would
 /// flood CI and misreport the gate. Returns (kept findings, their
-/// fingerprints, suppressed count).
+/// fingerprints, suppressed findings paired with their fingerprints —
+/// the latter feeds the SARIF `external`-suppression results, phase-6
+/// spec §5).
 #[allow(clippy::type_complexity)] // interface fixed by the phase-5b plan (Task 10 relocates this call)
 fn apply_baseline(
     ca: &CheckArgs,
     findings: Vec<goverify_analysis::Finding>,
     fps: Vec<String>,
-) -> Result<(Vec<goverify_analysis::Finding>, Vec<String>, usize), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        Vec<goverify_analysis::Finding>,
+        Vec<String>,
+        Vec<(goverify_analysis::Finding, String)>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let path: Option<PathBuf> = if ca.no_baseline {
         None
     } else {
@@ -606,7 +657,7 @@ fn apply_baseline(
         }
     };
     let Some(path) = path else {
-        return Ok((findings, fps, 0));
+        return Ok((findings, fps, Vec::new()));
     };
     let bytes = std::fs::read(&path).map_err(|e| format!("baseline {}: {e}", path.display()))?;
     let b = goverify_cli::baseline::parse(&bytes)
@@ -615,10 +666,10 @@ fn apply_baseline(
         b.entries.iter().map(|e| e.fingerprint.as_str()).collect();
     let mut kept = Vec::new();
     let mut kept_fps = Vec::new();
-    let mut suppressed = 0usize;
+    let mut suppressed = Vec::new();
     for (f, fp) in findings.into_iter().zip(fps) {
         if set.contains(fp.as_str()) {
-            suppressed += 1;
+            suppressed.push((f, fp));
         } else {
             kept.push(f);
             kept_fps.push(fp);
@@ -627,18 +678,59 @@ fn apply_baseline(
     Ok((kept, kept_fps, suppressed))
 }
 
+/// Pragma-ignore filtering (phase-6 spec §5): drops findings matching a
+/// (func, checker) pair compiled from `//goverify:ignore`. Runs AFTER
+/// fingerprints are computed (it may split an identical-sibling group —
+/// unlike diff-base, which filters whole functions) and BEFORE the
+/// baseline filter, so a finding matching both an ignore and a baseline
+/// entry counts once, under ignore. Returns (kept findings, their
+/// fingerprints, suppressed findings paired with their fingerprints).
+#[allow(clippy::type_complexity)]
+fn apply_pragma_ignores(
+    ignores: &[(String, String)],
+    findings: Vec<goverify_analysis::Finding>,
+    fps: Vec<String>,
+) -> (
+    Vec<goverify_analysis::Finding>,
+    Vec<String>,
+    Vec<(goverify_analysis::Finding, String)>,
+) {
+    if ignores.is_empty() {
+        return (findings, fps, Vec::new());
+    }
+    let set: std::collections::HashSet<(&str, &str)> = ignores
+        .iter()
+        .map(|(f, c)| (f.as_str(), c.as_str()))
+        .collect();
+    let mut kept = Vec::new();
+    let mut kept_fps = Vec::new();
+    let mut suppressed = Vec::new();
+    for (f, fp) in findings.into_iter().zip(fps) {
+        if set.contains(&(f.func.as_str(), f.checker.as_str())) {
+            suppressed.push((f, fp));
+        } else {
+            kept.push(f);
+            kept_fps.push(fp);
+        }
+    }
+    (kept, kept_fps, suppressed)
+}
+
 fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let Analyzed {
         program,
         scoped,
         cache_root,
         timings,
+        pragma_ignores,
     } = analyze_module(&ca)?;
     let t_render = std::time::Instant::now();
     // Filter order (spec §5): scope (already applied) -> diff-base ->
-    // fingerprints -> baseline. Fingerprint ordinals are stable across
-    // this: diff-base filters whole functions, so identical-sibling
-    // groups never split (spec §2).
+    // fingerprints -> pragma-ignore -> baseline -> --deny promotion.
+    // Fingerprint ordinals are stable across this: diff-base filters
+    // whole functions, so identical-sibling groups never split there
+    // (spec §2); the pragma-ignore filter runs on the already-computed
+    // fingerprints and may split such a group instead.
     let (scoped, diff_base_scoped) = match &ca.diff_base {
         None => (scoped, false),
         Some(git_ref) => {
@@ -671,12 +763,11 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
     };
     let fps = goverify_cli::fingerprint::fingerprints(&scoped);
-    let (mut scoped, fps, suppressed) = apply_baseline(&ca, scoped, fps)?;
+    let (scoped, fps, sup_pragma) = apply_pragma_ignores(&pragma_ignores, scoped, fps);
+    let (mut scoped, fps, sup_baseline) = apply_baseline(&ca, scoped, fps)?;
     // --deny warnings (spec §5): promote kept warning-severity findings
-    // to errors, after the baseline filter (Task 10 settles the final
-    // filter-chain position once suppressed_pragma is wired) and before
-    // summary construction so every rendered format sees the promoted
-    // severity.
+    // to errors, after the baseline filter and before summary
+    // construction so every rendered format sees the promoted severity.
     if ca.deny.contains(&DenyClass::Warnings) {
         for f in &mut scoped {
             f.severity = goverify_analysis::Severity::Error;
@@ -684,20 +775,33 @@ fn run_check(ca: CheckArgs) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
     let summary = json::Summary {
         total: scoped.len(),
-        suppressed_by_baseline: suppressed,
-        // Wired to a real count in Task 10 (pragma-suppression filter).
-        suppressed_pragma: 0,
+        suppressed_by_baseline: sup_baseline.len(),
+        suppressed_pragma: sup_pragma.len(),
         diff_base_scoped,
     };
     match ca.format {
         OutputFormat::Human => {
             print!("{}", render::render_findings(&scoped, Path::new(".")));
-            if suppressed > 0 {
-                println!("goverify: baseline: {suppressed} finding(s) suppressed");
+            // Filter order in the footer mirrors the filter chain:
+            // pragma-ignore before baseline.
+            if !sup_pragma.is_empty() {
+                println!(
+                    "goverify: pragma: {} finding(s) suppressed",
+                    sup_pragma.len()
+                );
+            }
+            if !sup_baseline.is_empty() {
+                println!(
+                    "goverify: baseline: {} finding(s) suppressed",
+                    sup_baseline.len()
+                );
             }
         }
         OutputFormat::Json => print!("{}", json::render_json(&scoped, &fps, &summary)),
-        OutputFormat::Sarif => print!("{}", sarif::render_sarif(&scoped, &fps, suppressed)),
+        OutputFormat::Sarif => print!(
+            "{}",
+            sarif::render_sarif(&scoped, &fps, &sup_pragma, &sup_baseline)
+        ),
     }
     if timings {
         eprintln!(
@@ -753,7 +857,16 @@ fn scope_findings(
 ) -> Vec<goverify_analysis::Finding> {
     findings
         .iter()
-        .filter(|f| in_module(&f.func, scope))
+        .filter(|f| {
+            // Bad-annotation findings are config errors (parse/resolve
+            // failures, unmatched pragmas, unknown ignore names), not
+            // analysis results — some carry no real function (e.g. an
+            // unmatched pragma's func is "-"). They must never be
+            // scope-filtered: hiding one because it falls outside
+            // --scope would silently swallow a misconfiguration
+            // diagnostic (phase-6 spec §5).
+            f.checker == goverify_analysis::BAD_ANNOTATION || in_module(&f.func, scope)
+        })
         .cloned()
         .collect()
 }
@@ -933,5 +1046,134 @@ mod tests {
         assert_eq!(parse_module_directive("go 1.25\n"), None);
         // `module`-prefixed non-directive must not match.
         assert_eq!(parse_module_directive("modulefoo bar\n"), None);
+    }
+
+    #[test]
+    fn scope_findings_never_filters_bad_annotation_findings() {
+        // Config-error findings (bad-annotation) must survive scoping
+        // unconditionally (phase-6 spec §5) — including the unmatched-
+        // pragma shape, whose func is "-" and would never match any
+        // module prefix.
+        let mut out_of_scope = finding("strings.ToUpper");
+        out_of_scope.checker = goverify_analysis::BAD_ANNOTATION.to_string();
+        let mut unmatched = finding("-");
+        unmatched.checker = goverify_analysis::BAD_ANNOTATION.to_string();
+        let findings = vec![
+            finding("example.com/nil.Bad"),
+            out_of_scope.clone(),
+            unmatched.clone(),
+        ];
+        let scoped = scope_findings(&findings, "example.com/nil");
+        assert_eq!(
+            scoped.len(),
+            3,
+            "bad-annotation findings are kept regardless of scope: {scoped:?}"
+        );
+    }
+
+    /// Two identical-shape sibling findings per function, in two
+    /// different functions: ignoring one function's checker must
+    /// suppress exactly that function's findings and leave the other
+    /// function's (already-computed) fingerprints unchanged — a
+    /// regression guard against a zip-misalignment bug in the filter.
+    #[test]
+    fn apply_pragma_ignores_keeps_and_splits_identical_siblings() {
+        let findings = vec![
+            finding("example.com/m.F1"),
+            finding("example.com/m.F1"),
+            finding("example.com/m.F2"),
+            finding("example.com/m.F2"),
+        ];
+        let fps = goverify_cli::fingerprint::fingerprints(&findings);
+        assert_ne!(
+            fps[0], fps[1],
+            "identical siblings get distinct ordinal fingerprints"
+        );
+        let ignores = vec![("example.com/m.F1".to_string(), "nil".to_string())];
+        let (kept, kept_fps, suppressed) = apply_pragma_ignores(&ignores, findings, fps.clone());
+        let kept_funcs: Vec<&str> = kept.iter().map(|f| f.func.as_str()).collect();
+        assert_eq!(kept_funcs, vec!["example.com/m.F2", "example.com/m.F2"]);
+        assert_eq!(
+            kept_fps,
+            vec![fps[2].clone(), fps[3].clone()],
+            "surviving fingerprints are unchanged by the filter"
+        );
+        assert_eq!(suppressed.len(), 2, "both F1 siblings are suppressed");
+        assert_eq!(suppressed[0].1, fps[0]);
+        assert_eq!(suppressed[1].1, fps[1]);
+    }
+
+    #[test]
+    fn apply_pragma_ignores_is_a_no_op_with_no_ignores() {
+        let findings = vec![finding("example.com/m.F")];
+        let fps = goverify_cli::fingerprint::fingerprints(&findings);
+        let (kept, kept_fps, suppressed) = apply_pragma_ignores(&[], findings.clone(), fps.clone());
+        assert_eq!(kept, findings);
+        assert_eq!(kept_fps, fps);
+        assert!(suppressed.is_empty());
+    }
+
+    fn check_args_with_baseline(path: PathBuf) -> CheckArgs {
+        CheckArgs {
+            gvir_dir: None,
+            patterns: vec!["./...".to_string()],
+            emit_smt: None,
+            solver_cmd: None,
+            solver_timeout_ms: 100,
+            obligation_timeout_ms: 250,
+            cache_dir: None,
+            no_cache: false,
+            scope: None,
+            format: OutputFormat::Human,
+            baseline: Some(path),
+            no_baseline: false,
+            diff_base: None,
+            deny: Vec::new(),
+        }
+    }
+
+    /// A finding matching BOTH a `//goverify:ignore` and a baseline
+    /// entry must count once, under ignore (phase-6 spec §5): the
+    /// pragma-ignore filter runs before the baseline filter, so the
+    /// finding never reaches `apply_baseline` and cannot inflate its
+    /// suppressed count.
+    #[test]
+    fn pragma_ignore_runs_before_baseline_so_a_double_match_counts_once() {
+        let ignored = finding("example.com/m.Ignored");
+        let kept_input = finding("example.com/m.Kept");
+        let findings = vec![ignored.clone(), kept_input.clone()];
+        let fps = goverify_cli::fingerprint::fingerprints(&findings);
+
+        // The baseline names the ignored finding's own fingerprint (the
+        // "both match" setup): if the filter order were wrong, this
+        // finding would be suppressed-and-counted twice.
+        let baseline_text = goverify_cli::baseline::render(
+            std::slice::from_ref(&ignored),
+            std::slice::from_ref(&fps[0]),
+        );
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let baseline_path = tmp_dir.path().join("baseline.json");
+        std::fs::write(&baseline_path, baseline_text).unwrap();
+
+        let ignores = vec![("example.com/m.Ignored".to_string(), "nil".to_string())];
+        let (scoped, fps, sup_pragma) = apply_pragma_ignores(&ignores, findings, fps);
+        assert_eq!(
+            sup_pragma.len(),
+            1,
+            "the ignored finding is pragma-suppressed"
+        );
+        assert_eq!(scoped.len(), 1);
+
+        let ca = check_args_with_baseline(baseline_path);
+        let (kept, _kept_fps, sup_baseline) = apply_baseline(&ca, scoped, fps).unwrap();
+        assert_eq!(
+            kept.len(),
+            1,
+            "the surviving finding is not itself baselined"
+        );
+        assert!(
+            sup_baseline.is_empty(),
+            "the ignored finding never reaches apply_baseline, so it isn't double-counted: {sup_baseline:?}"
+        );
     }
 }

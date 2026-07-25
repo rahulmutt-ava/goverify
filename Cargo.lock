@@ -350,6 +350,7 @@ dependencies = [
  "goverify-extract",
  "goverify-ir",
  "goverify-solver",
+ "goverify-spec",
  "serde",
  "serde_json",
  "tempfile",

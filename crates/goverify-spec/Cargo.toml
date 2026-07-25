@@ -11,6 +11,8 @@ goverify-analysis.workspace = true
 
 # `declared_name_wins_over_synthetic_ret_alias` builds a hand-written temp
 # module (a name-collision shape no existing corpus fixture has) via
-# `goverify_ir::testutil::load_module`.
+# `goverify_ir::testutil::load_module`. `annot_corpus.rs` (Task 11) needs
+# the real checker set + a Z3 backend to run `analyze_full` end-to-end.
 [dev-dependencies]
 tempfile.workspace = true
+goverify-checkers.workspace = true

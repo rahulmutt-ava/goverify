@@ -394,6 +394,7 @@ name = "goverify-spec"
 version = "0.1.0"
 dependencies = [
  "goverify-analysis",
+ "goverify-checkers",
  "goverify-ir",
  "goverify-solver",
  "tempfile",

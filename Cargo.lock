@@ -391,6 +391,11 @@ dependencies = [
 [[package]]
 name = "goverify-spec"
 version = "0.1.0"
+dependencies = [
+ "goverify-analysis",
+ "goverify-ir",
+ "goverify-solver",
+]
 
 [[package]]
 name = "hashbrown"

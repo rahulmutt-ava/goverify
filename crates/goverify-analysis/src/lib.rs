@@ -1,6 +1,7 @@
 //! Analysis engine: SCC scheduler, pre-pass, summary instantiation,
 //! bounded fixpoint (phase 2; parent spec §2).
 
+pub mod annotations;
 mod checker;
 mod dom;
 mod effects;
@@ -12,6 +13,9 @@ mod summary;
 #[cfg(test)]
 mod testpkg;
 
+pub use annotations::{
+    AnnClause, Annotations, BAD_ANNOTATION, CONTRACT, FuncAnnotations, UNVERIFIED_ANNOTATION,
+};
 pub use checker::{Checker, Finding, Obligation, Severity, TraceStep};
 pub use dom::{dominators, strictly_dominates};
 pub use effects::{ChanOp, Effects, Loc, LockOp, Root, Spawns, collect};

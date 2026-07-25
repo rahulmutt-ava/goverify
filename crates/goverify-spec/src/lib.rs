@@ -4,7 +4,10 @@
 //! parse/resolve/lower.
 
 pub mod ast;
+pub mod compile;
 pub mod parse;
+
+pub use compile::compile_program;
 
 /// Cache-key version of annotation-compilation semantics.
 pub const ANNOTATION_VERSION: u32 = 1;

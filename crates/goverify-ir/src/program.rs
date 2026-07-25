@@ -7,7 +7,8 @@ use std::path::Path;
 use goverify_extract::{gvir, load_package};
 use prost::Message;
 
-use crate::func::Function;
+use crate::func::{Function, Pos};
+use crate::lower::lower_pos;
 use crate::types::TypeTable;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -18,6 +19,13 @@ pub struct MethodInfo {
     pub name: String,
     pub sig: crate::types::TypeId,
     pub func: Option<FuncId>, // None = abstract (interface) method
+}
+
+/// A `//goverify:` pragma attached to a function declaration (spec §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PragmaInfo {
+    pub text: String,
+    pub pos: Option<Pos>,
 }
 
 #[derive(Debug, Default)]
@@ -32,6 +40,18 @@ pub struct Program {
     /// sorted entries. Used by Task 9's invoke resolution.
     pub method_sets: std::collections::BTreeMap<crate::types::TypeId, Vec<MethodInfo>>,
     diagnostics: Vec<String>,
+    /// FuncId -> its //goverify: pragmas, in .gvir order (sorted by
+    /// (decl_id, text) at extraction). Generic origins fan out to every
+    /// instantiation (id starts_with(decl_id + "[")).
+    ///
+    /// Determinism note: this HashMap is membership-only — every consumer
+    /// iterates via `FuncId` order (`func_ids()`) or a single func's Vec
+    /// (which preserves `.gvir` sort order); it is never itself iterated
+    /// into output.
+    pragmas: HashMap<FuncId, Vec<PragmaInfo>>,
+    /// Pragmas whose decl_id matched no function (type/var decls,
+    /// typos, dead code). Surfaced as bad-annotation findings (spec §4).
+    unmatched_pragmas: Vec<PragmaInfo>,
 }
 
 /// blake3 hash over a package's non-function sections: `schema_version`,
@@ -232,6 +252,37 @@ impl Program {
                     }
                 }
             }
+            for pr in &pkg.pragmas {
+                if !pr.text.starts_with("//goverify:") {
+                    continue;
+                }
+                let info = PragmaInfo {
+                    text: pr.text.clone(),
+                    pos: lower_pos(pkg, &pr.pos),
+                };
+                let exact = p.by_name.get(pr.decl_id.as_str()).copied();
+                if let Some(f) = exact {
+                    p.pragmas.entry(f).or_default().push(info);
+                    continue;
+                }
+                // Generic origin: apply to every instantiation.
+                let prefix = format!("{}[", pr.decl_id);
+                let mut matched = false;
+                let ids: Vec<FuncId> = p
+                    .func_names
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| n.starts_with(&prefix))
+                    .map(|(i, _)| FuncId(i as u32))
+                    .collect();
+                for f in ids {
+                    p.pragmas.entry(f).or_default().push(info.clone());
+                    matched = true;
+                }
+                if !matched {
+                    p.unmatched_pragmas.push(info);
+                }
+            }
         }
         p
     }
@@ -337,6 +388,19 @@ impl Program {
             .get(id.0 as usize)
             .copied()
             .unwrap_or([0u8; 32])
+    }
+
+    /// `f`'s `//goverify:` pragmas, in `.gvir` order (sorted by
+    /// `(decl_id, text)` at extraction). Empty slice if `f` has none.
+    pub fn pragmas(&self, f: FuncId) -> &[PragmaInfo] {
+        self.pragmas.get(&f).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Pragmas whose `decl_id` matched no function (type/var decls,
+    /// typos, dead code). Task 6 turns these into `bad-annotation`
+    /// findings.
+    pub fn unmatched_pragmas(&self) -> &[PragmaInfo] {
+        &self.unmatched_pragmas
     }
 
     pub fn types(&self) -> &TypeTable {

@@ -43,3 +43,17 @@ fn preds_survive_lowering_and_are_in_range() {
     }
     assert!(saw_preds, "ops corpus branches must yield preds");
 }
+
+#[test]
+fn hello_pragma_attached_and_names_plumbed() {
+    let p = goverify_ir::testutil::load_corpus("hello");
+    let f = p.lookup_func("example.com/hello.Deref").expect("Deref");
+    let prs = p.pragmas(f);
+    assert_eq!(prs.len(), 1, "Deref pragma count");
+    assert_eq!(prs[0].text, "//goverify:requires p != nil");
+    assert!(prs[0].pos.is_some(), "pragma carries a position");
+    let func = p.func(f).expect("body");
+    assert_eq!(func.param_names, vec!["p".to_string()]);
+    assert_eq!(func.result_names, vec![String::new()]);
+    assert!(p.unmatched_pragmas().is_empty());
+}

@@ -51,6 +51,7 @@ impl Program {
         ];
 
         let mut params = Vec::with_capacity(gf.params.len());
+        let mut param_names = Vec::with_capacity(gf.params.len());
         for p in &gf.params {
             if p.id != 0
                 && let Some(slot) = values.get_mut(p.id as usize)
@@ -60,8 +61,10 @@ impl Program {
                     kind: ValueKind::Param,
                 };
                 params.push(ValueId(p.id));
+                param_names.push(p.name.clone());
             }
         }
+        let result_names = gf.result_names.clone();
 
         for a in &gf.aux {
             let kind = match a.kind.as_str() {
@@ -123,6 +126,8 @@ impl Program {
             id,
             sig: resolve_ty(tmap, unknown, gf.r#type),
             params,
+            param_names,
+            result_names,
             values,
             blocks,
             pos: lower_pos(pkg, &gf.pos),
@@ -579,7 +584,7 @@ fn lower_const(a: &gvir::AuxValue) -> ConstVal {
 /// whole field unset) yields `None`; a present position with an
 /// unresolvable file index (0, or out of range on fuzzed input) still
 /// yields `Some` — line/col remain useful even when the file is unknown.
-fn lower_pos(pkg: &gvir::Package, pos: &Option<gvir::Position>) -> Option<Pos> {
+pub(crate) fn lower_pos(pkg: &gvir::Package, pos: &Option<gvir::Position>) -> Option<Pos> {
     let p = pos.as_ref()?;
     let file = if p.file != 0 {
         pkg.files

@@ -76,6 +76,12 @@ pub struct Function {
     pub id: FuncId,
     pub sig: TypeId,
     pub params: Vec<ValueId>,
+    /// Declared parameter names, parallel to `params` (receiver is
+    /// index 0 for methods). Display/resolution only — never hashed
+    /// (hashes are computed over raw .gvir bytes in program.rs).
+    pub param_names: Vec<String>,
+    /// Signature result names in declaration order ("" for unnamed).
+    pub result_names: Vec<String>,
     pub values: Vec<ValueInfo>,
     pub blocks: Vec<Block>,
     pub pos: Option<Pos>,

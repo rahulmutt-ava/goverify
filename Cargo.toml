@@ -25,3 +25,4 @@ goverify-analysis = { path = "crates/goverify-analysis" }
 goverify-solver = { path = "crates/goverify-solver" }
 goverify-cache = { path = "crates/goverify-cache" }
 goverify-checkers = { path = "crates/goverify-checkers" }
+goverify-spec = { path = "crates/goverify-spec" }

@@ -2830,6 +2830,7 @@ mod tests {
                 formula: crate::summary::Formula {
                     term: Term::not(ptr_is_nil(r0).unwrap()).unwrap(),
                 },
+                provenance: crate::summary::Provenance::Inferred,
             }],
             ..crate::summary::Summary::default()
         };
@@ -2959,6 +2960,7 @@ mod tests {
             ensures: vec![crate::summary::Clause {
                 tag: "nil-deref".into(),
                 formula: crate::summary::Formula { term: clause_term },
+                provenance: crate::summary::Provenance::Inferred,
             }],
             ..crate::summary::Summary::default()
         };
@@ -3076,6 +3078,7 @@ mod tests {
                 formula: crate::summary::Formula {
                     term: Term::not(ptr_is_nil(r0).unwrap()).unwrap(),
                 },
+                provenance: crate::summary::Provenance::Inferred,
             }],
             provenance: crate::summary::Provenance::Havoc,
             ..crate::summary::Summary::default()
@@ -3203,6 +3206,7 @@ mod tests {
                 formula: crate::summary::Formula {
                     term: Term::not(ptr_is_nil(r0).unwrap()).unwrap(),
                 },
+                provenance: crate::summary::Provenance::Inferred,
             }],
             ..crate::summary::Summary::default()
         };

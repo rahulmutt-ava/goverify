@@ -203,6 +203,7 @@ fn encode_provenance(p: &Provenance, out: &mut Vec<u8>) {
     out.push(match p {
         Provenance::Inferred => 0,
         Provenance::Havoc => 1,
+        Provenance::Annotated => 2,
     });
 }
 
@@ -210,6 +211,7 @@ fn decode_provenance(input: &mut &[u8]) -> Option<Provenance> {
     match take_u8(input)? {
         0 => Some(Provenance::Inferred),
         1 => Some(Provenance::Havoc),
+        2 => Some(Provenance::Annotated),
         _ => None,
     }
 }
@@ -219,14 +221,17 @@ fn decode_provenance(input: &mut &[u8]) -> Option<Provenance> {
 fn encode_clause(c: &Clause, out: &mut Vec<u8>) {
     put_str(out, &c.tag);
     encode_term(&c.formula.term, out);
+    encode_provenance(&c.provenance, out);
 }
 
 fn decode_clause(input: &mut &[u8], decls: &[DatatypeDecl]) -> Option<Clause> {
     let tag = take_str(input)?;
     let term = decode_term(input, decls)?;
+    let provenance = decode_provenance(input)?;
     Some(Clause {
         tag,
         formula: Formula { term },
+        provenance,
     })
 }
 
@@ -638,8 +643,17 @@ mod tests {
                     requires: vec![Clause {
                         tag: "nil-deref".to_string(),
                         formula: Formula { term: term.clone() },
+                        provenance: Provenance::Inferred,
                     }],
-                    ensures: vec![],
+                    // Annotated clause (human-stated pragma): exercises the
+                    // provenance byte's third encoding on a Clause even
+                    // though the enclosing Summary stays Inferred/Havoc —
+                    // Summary.provenance never takes the Annotated value.
+                    ensures: vec![Clause {
+                        tag: "nil-deref".to_string(),
+                        formula: Formula { term },
+                        provenance: Provenance::Annotated,
+                    }],
                     effects: crate::Effects::top(),
                     provenance: Provenance::Inferred,
                 },
@@ -689,6 +703,16 @@ mod tests {
         assert_eq!(
             a.summary, b.summary,
             "Summary round-trip incl. Effects/Terms"
+        );
+        assert_eq!(
+            a.summary.requires[0].provenance,
+            Provenance::Inferred,
+            "Inferred clause provenance survives encode/decode"
+        );
+        assert_eq!(
+            a.summary.ensures[0].provenance,
+            Provenance::Annotated,
+            "Annotated clause provenance survives encode/decode"
         );
         assert_eq!(a.analysis_diag, b.analysis_diag);
         assert_eq!(a.findings, b.findings);

@@ -314,6 +314,7 @@ fn inferred_ensures_summary() -> Summary {
             formula: Formula {
                 term: Term::not(ptr_is_nil(r0).unwrap()).unwrap(),
             },
+            provenance: Provenance::Inferred,
         }],
         provenance: Provenance::Inferred,
         ..Summary::default()

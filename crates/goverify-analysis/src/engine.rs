@@ -661,6 +661,11 @@ pub fn dump_summaries(p: &Program, a: &Analysis, filter: Option<&str>) -> String
             let provenance = match s.provenance {
                 Provenance::Inferred => "Inferred",
                 Provenance::Havoc => "Havoc",
+                // Summary.provenance is never Annotated in practice (that
+                // value is per-Clause only), but a corrupted/crafted SCC
+                // cache entry could decode one — degrade to a label
+                // rather than panic.
+                Provenance::Annotated => "Annotated",
             };
             format!(
                 "{name} effects={} requires={} ensures={} provenance={provenance}",
@@ -924,6 +929,7 @@ mod tests {
                 formula: crate::summary::Formula {
                     term: Term::not(ptr_is_nil(r0).unwrap()).unwrap(),
                 },
+                provenance: crate::summary::Provenance::Inferred,
             }]
         }
         fn obligations(

@@ -6,8 +6,8 @@
 //! are raised in `obligations` under the function's own preconditions.
 
 use goverify_analysis::{
-    Checker, Clause, Formula, IfaceVar, Obligation, Summary, encode_func_with, iface_var_name,
-    sort_of,
+    Checker, Clause, Formula, IfaceVar, Obligation, Provenance, Summary, encode_func_with,
+    iface_var_name, sort_of,
 };
 use goverify_ir::{
     ConstVal, FuncId, Function, Op, Pos, Program, TypeId, TypeKind, TypeTable, ValueId, ValueKind,
@@ -56,6 +56,7 @@ fn nonnil_result_clause(i: u32) -> Option<Clause> {
         formula: Formula {
             term: Term::not(ptr_is_nil(r).ok()?).ok()?,
         },
+        provenance: Provenance::Inferred,
     })
 }
 
@@ -72,6 +73,7 @@ fn correlation_clause(e: u32, i: u32) -> Option<Clause> {
             ])
             .ok()?,
         },
+        provenance: Provenance::Inferred,
     })
 }
 
@@ -142,6 +144,7 @@ impl Checker for NilChecker {
                 Clause {
                     tag: "nil-deref".into(),
                     formula: Formula { term: nonnil },
+                    provenance: Provenance::Inferred,
                 },
             );
         }

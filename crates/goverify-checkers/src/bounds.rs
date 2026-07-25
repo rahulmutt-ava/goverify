@@ -8,8 +8,8 @@
 //! narrowing/sign-changing `Op::Convert` sites (tag `"overflow"`).
 
 use goverify_analysis::{
-    Checker, Clause, EncodedFunc, Formula, Obligation, Summary, array_len, encode_func_with,
-    int_repr, seq_datatype,
+    Checker, Clause, EncodedFunc, Formula, Obligation, Provenance, Summary, array_len,
+    encode_func_with, int_repr, seq_datatype,
 };
 use goverify_ir::{BinOpKind, FuncId, Function, MakeKind, Op, Pos, Program, ValueId, ValueKind};
 use goverify_solver::{BvCmpOp, Query, SatResult, Term};
@@ -489,6 +489,7 @@ impl Checker for BoundsChecker {
                 Clause {
                     tag: site.tag.into(),
                     formula: Formula { term: bound },
+                    provenance: Provenance::Inferred,
                 },
             );
         }

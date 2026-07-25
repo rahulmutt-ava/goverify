@@ -37,12 +37,18 @@ pub struct Clause {
     /// Which checker/fact this clause states, e.g. "nil-deref".
     pub tag: String,
     pub formula: Formula,
+    pub provenance: Provenance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provenance {
     Inferred,
     Havoc,
+    /// Human-stated (//goverify: pragma). Per-CLAUSE only; a Summary's
+    /// own provenance is never Annotated. Annotated clauses are
+    /// constants, not fixpoint state: widening preserves them, and
+    /// encode_call_ensures trusts them even inside Havoc summaries.
+    Annotated,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +184,7 @@ mod tests {
             formula: Formula {
                 term: Term::not(ptr_is_nil(p).unwrap()).unwrap(),
             },
+            provenance: Provenance::Inferred,
         }
     }
 
@@ -224,6 +231,7 @@ mod tests {
             formula: Formula {
                 term: ptr_is_nil(r).unwrap(),
             },
+            provenance: Provenance::Inferred,
         }]);
         assert_eq!(
             instantiate_requires(&callee, &[Some(ptr_nil())])[0].violation,
@@ -258,6 +266,7 @@ mod tests {
             formula: Formula {
                 term: Term::not(ptr_is_nil(r).unwrap()).unwrap(),
             },
+            provenance: Provenance::Inferred,
         }
     }
 
@@ -306,6 +315,7 @@ mod tests {
         let r0 = Term::var("r0", ptr_sort());
         let both = Clause {
             tag: "nil-deref".into(),
+            provenance: Provenance::Inferred,
             formula: Formula {
                 term: Term::or(vec![
                     Term::not(ptr_is_nil(p0).unwrap()).unwrap(),

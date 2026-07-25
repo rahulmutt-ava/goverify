@@ -7,7 +7,8 @@
 //! logic verbatim).
 
 use goverify_analysis::{
-    Clause, EncodedFunc, Formula, Obligation, Summary, instantiate_requires, strictly_dominates,
+    Clause, EncodedFunc, Formula, Obligation, Provenance, Summary, instantiate_requires,
+    strictly_dominates,
 };
 use goverify_ir::{Callee, FuncId, Function, Op, Pos, Program, ValueId};
 use goverify_solver::{Query, SatResult, Term, ptr_is_nil};
@@ -133,6 +134,7 @@ pub(crate) fn propagate_requires(
                 Clause {
                     tag: tag.into(),
                     formula: Formula { term: bound },
+                    provenance: Provenance::Inferred,
                 },
             );
         }

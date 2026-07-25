@@ -134,6 +134,7 @@ mod tests {
             message: "nil passed to t.F (violates its nil-deref requirement)".to_string(),
             trace: Vec::new(),
             model: Vec::new(),
+            severity: goverify_analysis::Severity::Error,
         }
     }
 

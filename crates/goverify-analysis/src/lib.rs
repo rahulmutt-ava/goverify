@@ -12,7 +12,7 @@ mod summary;
 #[cfg(test)]
 mod testpkg;
 
-pub use checker::{Checker, Finding, Obligation, TraceStep};
+pub use checker::{Checker, Finding, Obligation, Severity, TraceStep};
 pub use dom::{dominators, strictly_dominates};
 pub use effects::{ChanOp, Effects, Loc, LockOp, Root, Spawns, collect};
 pub use encode::{

@@ -250,6 +250,7 @@ mod tests {
                 }),
             }],
             model: vec![("p0".to_string(), "(ptr-nil)".to_string())],
+            severity: goverify_analysis::Severity::Error,
         };
         let fps = vec!["v1:00112233445566778899aabbccddeeff".to_string()];
         let got = render_sarif(&[f], &fps, 3);
@@ -314,6 +315,7 @@ mod tests {
             message: "m".to_string(),
             trace: Vec::new(),
             model: Vec::new(),
+            severity: goverify_analysis::Severity::Error,
         };
         let got = render_sarif(&[f], &["v1:0".to_string()], 0);
         let v: serde_json::Value = serde_json::from_str(&got).unwrap();

@@ -13,7 +13,7 @@ use goverify_cache::Store;
 use goverify_ir::{Pos, Program, Sccs};
 use goverify_solver::{DatatypeDecl, SolverLimits, decode_term, encode_term, ptr_datatype};
 
-use crate::checker::{Finding, TraceStep};
+use crate::checker::{Finding, Severity, TraceStep};
 use crate::effects::{ChanOp, Effects, Loc, LockOp, Root, Spawns};
 use crate::encode::seq_datatype;
 use crate::summary::{Clause, Formula, Provenance, Summary};
@@ -21,9 +21,9 @@ use crate::summary::{Clause, Formula, Provenance, Summary};
 /// Bump on: entry-format change, any engine/encoding semantic change,
 /// prost major bump, CLI RETRY_FACTOR change (escalated limits are
 /// derived from base limits and deliberately not keyed separately).
-const SCC_CACHE_VERSION: u32 = 1;
+const SCC_CACHE_VERSION: u32 = 2;
 const LAYER: &str = "scc";
-const SCC_ENTRY_FORMAT: u8 = 1;
+const SCC_ENTRY_FORMAT: u8 = 2;
 
 /// Length-prefixes `b` into the salt hash. A free function (not a
 /// closure over `h`) so it can be called interleaved with direct
@@ -490,6 +490,10 @@ fn encode_finding(f: &Finding, out: &mut Vec<u8>) {
     put_str(out, &f.func);
     encode_opt_pos(&f.pos, out);
     put_str(out, &f.message);
+    out.push(match f.severity {
+        Severity::Error => 0,
+        Severity::Warning => 1,
+    });
     put_u32(out, f.trace.len() as u32);
     for t in &f.trace {
         encode_trace_step(t, out);
@@ -507,6 +511,11 @@ fn decode_finding(input: &mut &[u8]) -> Option<Finding> {
     let func = take_str(input)?;
     let pos = decode_opt_pos(input)?;
     let message = take_str(input)?;
+    let severity = match take_u8(input)? {
+        0 => Severity::Error,
+        1 => Severity::Warning,
+        _ => return None,
+    };
     let n_trace = take_count(input)?;
     let mut trace = Vec::with_capacity(n_trace);
     for _ in 0..n_trace {
@@ -527,6 +536,7 @@ fn decode_finding(input: &mut &[u8]) -> Option<Finding> {
         message,
         trace,
         model,
+        severity,
     })
 }
 
@@ -634,22 +644,35 @@ mod tests {
                     provenance: Provenance::Inferred,
                 },
                 analysis_diag: Some("widened".to_string()),
-                findings: vec![crate::Finding {
-                    checker: "nil".to_string(),
-                    tag: "nil-deref".to_string(),
-                    func: "example.com/m.F".to_string(),
-                    pos: Some(goverify_ir::Pos {
-                        file: "m.go".to_string(),
-                        line: 3,
-                        col: 9,
-                    }),
-                    message: "possible nil dereference".to_string(),
-                    trace: vec![crate::TraceStep {
-                        block: 0,
+                findings: vec![
+                    crate::Finding {
+                        checker: "nil".to_string(),
+                        tag: "nil-deref".to_string(),
+                        func: "example.com/m.F".to_string(),
+                        pos: Some(goverify_ir::Pos {
+                            file: "m.go".to_string(),
+                            line: 3,
+                            col: 9,
+                        }),
+                        message: "possible nil dereference".to_string(),
+                        trace: vec![crate::TraceStep {
+                            block: 0,
+                            pos: None,
+                        }],
+                        model: vec![("p0".to_string(), "(ptr-nil)".to_string())],
+                        severity: Severity::Error,
+                    },
+                    crate::Finding {
+                        checker: "nil".to_string(),
+                        tag: "nil-deref-warn".to_string(),
+                        func: "example.com/m.F".to_string(),
                         pos: None,
-                    }],
-                    model: vec![("p0".to_string(), "(ptr-nil)".to_string())],
-                }],
+                        message: "possible nil dereference (warning)".to_string(),
+                        trace: vec![],
+                        model: vec![],
+                        severity: Severity::Warning,
+                    },
+                ],
                 findings_diags: vec!["skipped encode".to_string()],
             }],
         }
@@ -670,6 +693,16 @@ mod tests {
         assert_eq!(a.analysis_diag, b.analysis_diag);
         assert_eq!(a.findings, b.findings);
         assert_eq!(a.findings_diags, b.findings_diags);
+        assert_eq!(
+            a.findings[0].severity,
+            Severity::Error,
+            "Error severity survives encode/decode"
+        );
+        assert_eq!(
+            a.findings[1].severity,
+            Severity::Warning,
+            "Warning severity survives encode/decode"
+        );
     }
 
     #[test]

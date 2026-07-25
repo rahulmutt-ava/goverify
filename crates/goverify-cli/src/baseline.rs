@@ -98,6 +98,7 @@ mod tests {
             message: msg.to_string(),
             trace: Vec::new(),
             model: Vec::new(),
+            severity: goverify_analysis::Severity::Error,
         }
     }
 

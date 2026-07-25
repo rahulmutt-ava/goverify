@@ -28,6 +28,15 @@ pub struct Obligation {
     pub query: Query,
 }
 
+/// Finding severity (phase-6 spec §5). Exit code and --deny promotion
+/// key on this; it is EXCLUDED from fingerprints (promotion must not
+/// churn baselines) — fingerprint.rs enumerates its fields explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
 /// A reported violation (parent spec §10 rendering arrives in phase 4;
 /// debug output in Task 12).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,6 +60,9 @@ pub struct Finding {
     /// for verdicts — the renderer treats it as untrusted display input
     /// (sanitized at render time).
     pub model: Vec<(String, String)>,
+    /// Error findings gate exit codes; warnings render but never fail
+    /// the run unless promoted (--deny warnings).
+    pub severity: Severity,
 }
 
 /// One step of a `Finding`'s trace: which block the path passes through

@@ -395,6 +395,7 @@ pub fn analyze_full(
                                 message: ob.message,
                                 trace,
                                 model,
+                                severity: crate::Severity::Error,
                             });
                         }
                     }

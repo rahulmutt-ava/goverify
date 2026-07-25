@@ -119,6 +119,7 @@ mod tests {
                 }, // position-less: dropped
             ],
             model: vec![("p0".to_string(), "(ptr-nil)".to_string())],
+            severity: goverify_analysis::Severity::Error,
         };
         let fps = vec!["v1:00112233445566778899aabbccddeeff".to_string()];
         let summary = Summary {

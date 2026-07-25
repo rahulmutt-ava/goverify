@@ -844,4 +844,98 @@ mod tests {
              identically-built Programs"
         );
     }
+
+    #[test]
+    fn pragma_generic_fanout_unmatched_and_non_goverify_text() {
+        // Exercises the two pragma-attachment branches the hello corpus
+        // fixture can't reach (it only has a single exact-match pragma):
+        // (1) a generic origin (`pkg.F`, no function of that exact name)
+        // fans out to every instantiation (`pkg.F[int]`, `pkg.F[string]`);
+        // (2) a decl_id matching no function and no instantiation prefix
+        // lands in `unmatched_pragmas()`; (3) pragma text that doesn't
+        // start with `//goverify:` is dropped entirely — neither attached
+        // nor unmatched.
+        use goverify_extract::gvir;
+        fn bodied_fn(id: &str) -> gvir::Function {
+            gvir::Function {
+                id: id.into(),
+                blocks: vec![gvir::BasicBlock {
+                    index: 0,
+                    instrs: vec![gvir::Instruction {
+                        kind: "Return".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+        let pkg = gvir::Package {
+            import_path: "pkg".into(),
+            functions: vec![
+                bodied_fn("pkg.F[int]"),
+                bodied_fn("pkg.F[string]"),
+                bodied_fn("pkg.G"),
+            ],
+            pragmas: vec![
+                gvir::Pragma {
+                    decl_id: "pkg.F".into(),
+                    text: "//goverify:requires x != nil".into(),
+                    pos: None,
+                },
+                gvir::Pragma {
+                    decl_id: "pkg.NoSuchDecl".into(),
+                    text: "//goverify:requires y != nil".into(),
+                    pos: None,
+                },
+                gvir::Pragma {
+                    decl_id: "pkg.G".into(),
+                    text: "not a goverify pragma".into(),
+                    pos: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let p = Program::from_packages(vec![pkg]);
+
+        let f_int = p.lookup_func("pkg.F[int]").expect("F[int] interned");
+        let f_string = p.lookup_func("pkg.F[string]").expect("F[string] interned");
+        let g = p.lookup_func("pkg.G").expect("G interned");
+
+        // (2) Generic origin fan-out: both instantiations get the pragma,
+        // even though no function is literally named "pkg.F".
+        assert_eq!(p.pragmas(f_int).len(), 1, "F[int] pragma count");
+        assert_eq!(
+            p.pragmas(f_int)[0].text,
+            "//goverify:requires x != nil",
+            "F[int] pragma text"
+        );
+        assert_eq!(p.pragmas(f_string).len(), 1, "F[string] pragma count");
+        assert_eq!(
+            p.pragmas(f_string)[0].text,
+            "//goverify:requires x != nil",
+            "F[string] pragma text"
+        );
+
+        // (3) Non-"//goverify:" text is dropped before any matching is
+        // attempted: not attached to pkg.G, and not unmatched either.
+        assert!(
+            p.pragmas(g).is_empty(),
+            "non-goverify pragma text must not attach to its decl_id's function"
+        );
+
+        // (1) decl_id matching no function and no instantiation prefix
+        // lands in unmatched_pragmas() — exactly the NoSuchDecl pragma,
+        // not the dropped non-goverify one.
+        let unmatched = p.unmatched_pragmas();
+        assert_eq!(
+            unmatched.len(),
+            1,
+            "exactly the NoSuchDecl pragma is unmatched: {unmatched:?}"
+        );
+        assert_eq!(
+            unmatched[0].text, "//goverify:requires y != nil",
+            "unmatched pragma text"
+        );
+    }
 }

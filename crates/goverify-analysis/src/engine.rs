@@ -21,7 +21,7 @@ use rayon::prelude::*;
 
 use goverify_cache::QueryCache;
 use goverify_ir::{CallGraph, FuncId, Program, Sccs};
-use goverify_solver::{Query, SatResult, StubSolver, TextSolver, discharge_query};
+use goverify_solver::{Query, SatResult, StubSolver, Term, TextSolver, discharge_query};
 
 use crate::annotations::{Annotations, FuncAnnotations};
 use crate::checker::{Checker, Finding};
@@ -453,8 +453,15 @@ pub fn analyze_full(
                 let enc_opt = p
                     .func(f)
                     .and_then(|_| crate::encode::encode_func_with(p, f, &summary_of).ok());
+                // `f`'s own merged summary (annotated requires included):
+                // needed by the contract pass (as `pre`, precision parity
+                // with the checkers) AND by `verify_ensures` (assumed
+                // alongside the body — requires holds at entry, design
+                // spec §1(a) — so an ensures clause that only holds under
+                // `f`'s own stated precondition is still provable, not
+                // flagged unverified).
+                let own = summary_of(f);
                 if let (Some(func), Some(enc)) = (p.func(f), enc_opt.as_ref()) {
-                    let own = summary_of(f);
                     for ob in crate::annotations::contract_obligations(p, func, enc, &own, &ann_of)
                     {
                         // Same bug-finder semantics as the checker loop
@@ -496,6 +503,11 @@ pub fn analyze_full(
                     }
                 }
                 if let Some(fa) = annotations.funcs.get(&f) {
+                    let own_requires: Vec<Term> = own
+                        .requires
+                        .iter()
+                        .map(|c| c.formula.term.clone())
+                        .collect();
                     let mut discharge = |q: &Query| {
                         discharge_query(q, &mut *backend, cache.as_ref(), emit_dir.as_deref())
                             .result
@@ -505,6 +517,7 @@ pub fn analyze_full(
                         f,
                         enc_opt.as_ref(),
                         fa,
+                        &own_requires,
                         &mut discharge,
                     ));
                 }
@@ -1977,6 +1990,102 @@ mod tests {
             !warnings[0].message.contains(".go:"),
             "INVARIANT: message must never embed a source position: {:?}",
             warnings[0]
+        );
+    }
+
+    /// `<var_name> > 0` (signed, BitVec-64), tag "contract"/Annotated:
+    /// shared by the own-requires-as-assumption regression test for both
+    /// the requires clause (over `p0`) and the ensures clause (over
+    /// `r0`) — same shape, different free var.
+    fn positive_ann_clause(var_name: &str, text: &str) -> AnnClause {
+        let v = Term::var(var_name, Sort::BitVec(64));
+        AnnClause {
+            clause: crate::summary::Clause {
+                tag: CONTRACT.into(),
+                formula: crate::summary::Formula {
+                    term: Term::bv_cmp(goverify_solver::BvCmpOp::Slt, Term::bv_lit(64, 0), v)
+                        .unwrap(),
+                },
+                provenance: Provenance::Annotated,
+            },
+            text: text.into(),
+            pos: None,
+        }
+    }
+
+    /// `t.G(x int) int { return x }`.
+    fn returns_param() -> goverify_extract::gvir::Function {
+        goverify_extract::gvir::Function {
+            id: "t.G".into(),
+            r#type: 2,
+            params: vec![goverify_extract::gvir::Param {
+                id: 1,
+                name: "x".into(),
+                r#type: 1,
+            }],
+            blocks: vec![block(
+                0,
+                vec![goverify_extract::gvir::Instruction {
+                    kind: "Return".into(),
+                    operands: vec![1],
+                    ..Default::default()
+                }],
+                vec![],
+            )],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn verify_ensures_uses_own_requires_as_an_assumption() {
+        // //goverify:requires x > 0
+        // //goverify:ensures ret > 0
+        // func F(x int) int { return x }
+        //
+        // `ret > 0` is NOT provable from the body alone (x can be <= 0
+        // in general) — it is only provable by ASSUMING the function's
+        // own annotated requires (`x > 0`) alongside the body, per the
+        // design spec's requires-assumed-at-entry rule (§1(a)), the same
+        // way the checkers' own in-body obligations assume
+        // `own_preconditions`. Regression test for the reviewer-flagged
+        // finding: `verify_ensures` must conjoin `own_requires` into the
+        // query, not just `body ∧ ¬clause` — without the fix this would
+        // spuriously warn (Sat via x = -1).
+        use goverify_extract::gvir;
+        let p = Program::from_packages(vec![gvir::Package {
+            import_path: "t".into(),
+            types: sig_and_int_types(),
+            functions: vec![returns_param()],
+            ..Default::default()
+        }]);
+        let f = p.lookup_func("t.G").unwrap();
+
+        let mut funcs = BTreeMap::new();
+        funcs.insert(
+            f,
+            FuncAnnotations {
+                requires: vec![positive_ann_clause("p0", "x > 0")],
+                ensures: vec![positive_ann_clause("r0", "ret > 0")],
+                ignores: Vec::new(),
+            },
+        );
+        let cfg = EngineConfig {
+            annotations: Annotations {
+                funcs,
+                findings: Vec::new(),
+            },
+            ..EngineConfig::default()
+        };
+        let checkers: Vec<&dyn Checker> = vec![&NoOpChecker];
+        let a = analyze_full(&p, &cfg, &checkers, &z3_backend);
+
+        assert!(
+            a.findings
+                .iter()
+                .all(|fnd| fnd.checker != UNVERIFIED_ANNOTATION),
+            "an ensures clause provable under the function's own annotated requires \
+             must never yield an unverified-annotation finding: {:?}",
+            a.findings
         );
     }
 

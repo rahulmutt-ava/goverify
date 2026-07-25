@@ -138,11 +138,20 @@ pub fn contract_obligations(
 }
 
 /// Best-effort verification of a function's ANNOTATED ensures (phase-6
-/// spec §4): for each clause, `body ∧ ¬clause` is discharged at every
-/// return site; `Unsat` everywhere means the clause is proven and stays
-/// silent (callers already trust it via `encode_call_ensures`'s
-/// Annotated-clause carve-out — nothing more to report). Anything short
-/// of that full proof — `Sat`, `Unknown`, an unbindable clause, a
+/// spec §4): for each clause, `own-requires ∧ body ∧ ¬clause` is
+/// discharged at every return site; `Unsat` everywhere means the clause
+/// is proven and stays silent (callers already trust it via
+/// `encode_call_ensures`'s Annotated-clause carve-out — nothing more to
+/// report). `own_requires` — this function's own (merged, annotated
+/// clauses included) requires terms — is assumed at every site: the
+/// design spec (§1(a)) treats requires as assumed at function entry, the
+/// same way the checkers' own in-body obligations assume
+/// `own_preconditions`, so proving an ensures clause without its
+/// function's own precondition would reject annotations that are
+/// perfectly valid under the stated contract (e.g. `requires x > 0` +
+/// `ensures ret > 0` on `return x` is unprovable without assuming
+/// `x > 0` first, even though it trivially holds under it). Anything
+/// short of that full proof — `Sat`, `Unknown`, an unbindable clause, a
 /// bodyless function, a function with no return sites, or a return
 /// whose arity doesn't match the signature — yields the
 /// `unverified-annotation` WARNING: the clause is still USED (trusted
@@ -153,6 +162,7 @@ pub fn verify_ensures(
     f: FuncId,
     enc: Option<&EncodedFunc>,
     ann: &FuncAnnotations,
+    own_requires: &[Term],
     discharge: &mut dyn FnMut(&Query) -> SatResult,
 ) -> Vec<Finding> {
     let mut out = Vec::new();
@@ -225,7 +235,14 @@ pub fn verify_ensures(
                 proven = false;
                 break;
             };
-            if discharge(&enc.reach_query(*bi, vec![v])) != SatResult::Unsat {
+            // Assume the function's own requires (annotated included)
+            // alongside the body before checking the clause's negation:
+            // requires is assumed at entry (design spec §1(a)), so a
+            // clause that only holds given the stated precondition must
+            // still count as proven, not unprovable.
+            let mut extra = own_requires.to_vec();
+            extra.push(v);
+            if discharge(&enc.reach_query(*bi, extra)) != SatResult::Unsat {
                 proven = false;
                 break;
             }

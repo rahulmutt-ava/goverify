@@ -864,17 +864,21 @@ impl Checker for LeakChecker {
         // once. Lookup-only (never iterated), so no map order can reach
         // the output.
         let mut enc_cache: HashMap<FuncId, Option<EncodedFunc>> = HashMap::new();
-        // Two blocking ops on the same channel in the same callee block
-        // (`go func() { ch <- 1; ch <- 2 }()` on an unbuffered channel)
-        // are distinct candidates that produce the SAME obligation: same
-        // tag, same message, same `go`-site position, and — since the
-        // instruction offset only enters the query through the buffered
-        // ordinal conjunct — a byte-identical query. Emitting both would
-        // render the same finding (same fingerprint) twice. Keyed on the
-        // canonical query text, so a buffered send whose ordinal count
-        // genuinely differs still gets its own obligation. Lookup-only
-        // (never iterated), so no map order reaches the output.
-        let mut seen: HashSet<String> = HashSet::new();
+        // One obligation per blocking op, siblings included: two blocking
+        // ops on the same channel in one goroutine (`go func() { ch <- 1;
+        // ch <- 2 }()`) are two candidates that can produce two findings
+        // with identical checker/func/tag/message/pos. That is a SUPPORTED
+        // case downstream, not a fingerprint collision — the fingerprint
+        // scheme assigns each finding an ordinal among identical siblings
+        // in position order (goverify-cli fingerprint.rs), so siblings key
+        // distinctly and baselines stay stable. Deduping here cannot be
+        // done correctly either: the only sound key would have to include
+        // the query (two candidates in different callee blocks differ only
+        // by which guard is asserted), which makes the dedup fire on
+        // incidental block structure, while any tighter key drops a
+        // Sat candidate in favour of an Unsat sibling and loses the
+        // finding outright. Report-level collapsing, if ever wanted,
+        // belongs post-discharge at the findings layer.
         let mut out = Vec::new();
         for cand in candidates(p, func) {
             // Select: every arm's channel must pass the escape check, and
@@ -928,21 +932,12 @@ impl Checker for LeakChecker {
                 continue;
             };
             let (tag, message) = tag_and_message(p, &cand);
-            let ob = Obligation {
+            out.push(Obligation {
                 tag: tag.into(),
                 message,
                 pos: cand.go_pos.clone(),
                 query: conjoin(enc_f.reach_query(cand.go_block, pre_f.clone()), cq),
-            };
-            if seen.insert(format!(
-                "{}|{}|{:?}|{}",
-                ob.tag,
-                ob.message,
-                ob.pos,
-                ob.query.canonical_text()
-            )) {
-                out.push(ob);
-            }
+            });
         }
         out
     }
@@ -2107,12 +2102,15 @@ mod tests {
         assert_eq!(findings[0].tag, "chan-send-leak");
     }
 
-    /// Two unbuffered sends on the same channel in the same callee block
-    /// are two candidates but ONE obligation (same tag/message/`go`-site
-    /// pos, byte-identical query) — the report must not carry the same
-    /// finding twice.
+    /// One finding per blocking op, siblings included: two unbuffered
+    /// sends on the same channel in one goroutine are two leak sites, and
+    /// the checker reports both even though they carry identical
+    /// tag/message/`go`-site pos. Deliberate — the fingerprint scheme
+    /// ordinals identical siblings (goverify-cli fingerprint.rs), so this
+    /// costs no baseline stability, and no dedup available at this layer
+    /// is both sound and complete (see `obligations`' comment).
     #[test]
-    fn identical_blocking_ops_report_once() {
+    fn identical_blocking_ops_each_report() {
         let p = Program::from_packages(vec![pkg(
             "t",
             vec![
@@ -2143,8 +2141,12 @@ mod tests {
         let findings = run_leak(&p);
         assert_eq!(
             findings.len(),
-            1,
-            "duplicate blocking ops collapse to one finding: {findings:?}"
+            2,
+            "each blocking op is its own leak site: {findings:?}"
+        );
+        assert!(
+            findings.iter().all(|f| f.tag == "chan-send-leak"),
+            "{findings:?}"
         );
     }
 

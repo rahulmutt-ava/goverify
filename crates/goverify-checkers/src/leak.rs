@@ -20,8 +20,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use goverify_analysis::{Loc, MAX_LOC_DEPTH, Root, closure_bindings, fv_loc, resolve_loc};
-use goverify_ir::{Callee, FuncId, Function, Op, Pos, Program, ValueId};
+use goverify_analysis::{
+    ChanOp, Effects, Loc, MAX_LOC_DEPTH, Root, closure_bindings, cyclic_blocks, fv_loc, resolve_loc,
+};
+use goverify_ir::{
+    Callee, ConstVal, FuncId, Function, MakeKind, Op, Pos, Program, ValueId, ValueKind,
+};
+
+use crate::shared::canonical_value;
 
 /// The blocking-op shape a [`Candidate`] was found at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,6 +444,190 @@ pub(crate) fn escapes(f: &Function, ch: ValueId) -> bool {
         }
     }
     false
+}
+
+/// The channel-op kinds able to unblock a candidate stuck at a blocked
+/// `Send`/`Recv`: a blocked send needs someone to receive (or a select
+/// that can serve as a receiver, or a close — a closed-channel send
+/// panics rather than blocking forever, so it still counts as "not
+/// blocked forever"); a blocked recv is the mirror image. `Select`
+/// itself is dispatched per-arm by `has_counterpart`'s caller (Task 7),
+/// never passed to this table.
+fn unblockers(kind: CandKind) -> &'static [ChanOp] {
+    match kind {
+        CandKind::Send => &[ChanOp::Recv, ChanOp::Select, ChanOp::Close],
+        CandKind::Recv => &[ChanOp::Send, ChanOp::Select, ChanOp::Close],
+        CandKind::Select => &[],
+    }
+}
+
+/// Does anything in the spawner's own converged effects (`env` —
+/// `summary_of(f).effects`, covering every callee's and every spawned
+/// goroutine's channel ops) ever unblock a candidate stuck at `loc`?
+/// `Send`/`Recv` only: the caller dispatches a `Select` candidate's own
+/// per-arm re-check (each arm behaves like a `Send` or `Recv` in its own
+/// right) rather than asking this function to judge a whole select at
+/// once — passed `CandKind::Select` directly, this defensively returns
+/// `true` (suppress), never risking a false positive for a shape it
+/// wasn't built to evaluate. Checked at `loc` AND `Loc::unknown()`
+/// (spec's may-alias rule): an op this pass could only resolve to
+/// "somewhere unknown" might still be the very counterpart this
+/// candidate needs — folding it in can only erase a finding, never
+/// invent one.
+pub(crate) fn has_counterpart(env: &Effects, loc: &Loc, kind: CandKind) -> bool {
+    if kind == CandKind::Select {
+        return true;
+    }
+    let set = unblockers(kind);
+    let unblocked_at = |l: &Loc| {
+        env.chan_ops
+            .get(l)
+            .is_some_and(|ops| set.iter().any(|u| ops.contains(u)))
+    };
+    unblocked_at(loc) || unblocked_at(&Loc::unknown())
+}
+
+/// Blocking-op capacity classification (Task 6 refinement over the raw
+/// syntactic candidate): distinguishes a genuinely reachability-only
+/// block (`Unbuffered` — no buffer can ever save it) from a buffered
+/// send a solver could still discharge via an ordinal fill-count
+/// argument (`BufferedConst`, Task 7's job to actually use), from a
+/// shape this syntactic pass can't safely reason about at all
+/// (`Silent` — a non-const capacity, or a buffered send sitting on a
+/// CFG cycle where "is the buffer ever full forever" isn't decidable
+/// here). `Silent` never promotes to a finding on its own; it just means
+/// this classifier has nothing further to add.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapClass {
+    /// Const capacity 0 (or a `Recv`, whose buffer never matters —
+    /// reachability-only regardless of capacity).
+    Unbuffered,
+    /// Const capacity `N > 0`, and (for a `Send`) the op's own block
+    /// isn't on a CFG cycle in its callee.
+    BufferedConst(u64),
+    /// Non-const capacity, an unresolvable def shape, or a buffered
+    /// `Send` sitting on a CFG cycle.
+    Silent,
+}
+
+/// `v`'s capacity in `f`: `v`'s def is `Op::Make{kind: Chan, args}` →
+/// `args[0]`'s const value (direct form); `v`'s def is `Op::Alloc` (cell
+/// form — a closure-captured channel's `alloc_value` is the capture
+/// cell, per Task 4/5's semantic pointer) → exactly one `Store{addr ==
+/// v}` in `f`, whose stored value resolves (through the same bridge,
+/// recursively) to a `Make{Chan}` → that one's capacity. Anything else —
+/// no def found, more than one store into the cell, a store whose value
+/// never bottoms out at a `Make{Chan}` — is `None` (non-const/
+/// unresolvable). Bounded to 64 hops through the cell bridge (mirrors
+/// `canonical_value`'s own cap): crafted `.gvir` could fabricate an
+/// `Alloc`/`Store` cycle that never resolves, and this must degrade
+/// rather than loop forever.
+fn cap_of(f: &Function, v: ValueId) -> Option<u64> {
+    let mut cur = v;
+    for _ in 0..64 {
+        let def = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instrs)
+            .find_map(|ins| match &ins.op {
+                Op::Make {
+                    dst,
+                    kind: MakeKind::Chan,
+                    args,
+                } if *dst == cur => Some(Ok(args)),
+                Op::Alloc { dst, .. } if *dst == cur => Some(Err(())),
+                _ => None,
+            });
+        match def {
+            Some(Ok(args)) => return const_cap(f, args.first().copied()),
+            Some(Err(())) => {
+                let mut stores =
+                    f.blocks
+                        .iter()
+                        .flat_map(|b| &b.instrs)
+                        .filter_map(|ins| match &ins.op {
+                            Op::Store { addr, val } if *addr == cur => Some(*val),
+                            _ => None,
+                        });
+                let first = stores.next()?;
+                if stores.next().is_some() {
+                    return None; // more than one store into the cell: unresolvable
+                }
+                let canon = canonical_value(f, first);
+                if canon == cur {
+                    return None; // degenerate self-store: avoid looping forever
+                }
+                cur = canon;
+            }
+            None => return None,
+        }
+    }
+    None
+}
+
+/// `v`'s constant int value, walking same-function `Assign` chains
+/// first (`crate::shared::canonical_value`) — `None` for a missing
+/// operand, a non-const value, or a negative literal (a real channel
+/// capacity is never negative; crafted negative `.gvir` degrades to
+/// "non-const" here rather than becoming a nonsensical capacity via a
+/// lossy cast).
+fn const_cap(f: &Function, v: Option<ValueId>) -> Option<u64> {
+    let canon = canonical_value(f, v?);
+    match &f.value(canon).kind {
+        ValueKind::Const(ConstVal::Int(n)) => u64::try_from(*n).ok(),
+        _ => None,
+    }
+}
+
+/// Capacity classification per Task 6's spec: a `Select` candidate is
+/// `Unbuffered` iff EVERY arm's channel (each `arm_locs` entry's
+/// `Root::Alloc`) has const capacity 0 — otherwise `Silent` (v1: no
+/// ordinal reasoning across a select's multiple channels yet). A
+/// `Send`/`Recv` candidate classifies `cand.alloc_value` itself: const 0
+/// is always `Unbuffered`; a `Recv`'s non-zero const capacity is still
+/// `Unbuffered`-equivalent (reachability-only: a recv with zero senders
+/// anywhere blocks forever regardless of how large the buffer is); a
+/// `Send`'s non-zero const capacity is `BufferedConst` only when its own
+/// block (`cand.op_block`) doesn't sit on a CFG cycle in the callee
+/// (`cyclic_blocks`) — a cyclic buffered send could refill the buffer
+/// indefinitely, defeating the ordinal fill-count argument, so that
+/// degrades to `Silent` too. A non-const capacity, or a callee id that
+/// no longer resolves to a body, also degrades to `Silent`. Total and
+/// panic-free: every id/index lookup above is bounds-checked by its own
+/// callee (`Function::value`, `cyclic_blocks`'s `Vec<bool>`, `Program::func`).
+pub(crate) fn cap_class(p: &Program, f: &Function, cand: &Candidate) -> CapClass {
+    if cand.kind == CandKind::Select {
+        let all_zero = !cand.arm_locs.is_empty()
+            && cand.arm_locs.iter().all(|(_, loc)| match &loc.root {
+                Root::Alloc(a) => cap_of(f, ValueId(*a)) == Some(0),
+                _ => false,
+            });
+        return if all_zero {
+            CapClass::Unbuffered
+        } else {
+            CapClass::Silent
+        };
+    }
+
+    match cap_of(f, cand.alloc_value) {
+        Some(0) => CapClass::Unbuffered,
+        Some(_) if cand.kind == CandKind::Recv => CapClass::Unbuffered,
+        Some(n) => {
+            // Only `Send` remains: `Select` returned above, `Recv`
+            // matched the prior arm regardless of its capacity value.
+            let Some(callee_fn) = p.func(cand.callee) else {
+                return CapClass::Silent;
+            };
+            let cyclic = cyclic_blocks(callee_fn);
+            let is_cyclic = cyclic.get(cand.op_block).copied().unwrap_or(true);
+            if is_cyclic {
+                CapClass::Silent
+            } else {
+                CapClass::BufferedConst(n)
+            }
+        }
+        None => CapClass::Silent,
+    }
 }
 
 /// Placeholder for Task 7's `Checker` impl: declared now (with no
@@ -1060,5 +1250,400 @@ mod tests {
                 path: vec![]
             }
         );
+    }
+
+    // -- has_counterpart -----------------------------------------------
+
+    fn env_with(loc: Loc, ops: &[ChanOp]) -> Effects {
+        let mut e = Effects::empty();
+        e.chan_ops
+            .entry(loc)
+            .or_default()
+            .extend(ops.iter().copied());
+        e
+    }
+
+    #[test]
+    fn send_candidate_suppressed_by_recv_at_same_loc() {
+        let l = Loc {
+            root: Root::Alloc(2),
+            path: vec![],
+        };
+        let env = env_with(l.clone(), &[ChanOp::Send, ChanOp::Recv]);
+        assert!(has_counterpart(&env, &l, CandKind::Send));
+    }
+
+    #[test]
+    fn send_candidate_not_suppressed_by_sibling_send() {
+        let l = Loc {
+            root: Root::Alloc(2),
+            path: vec![],
+        };
+        let env = env_with(l.clone(), &[ChanOp::Send, ChanOp::Make]);
+        assert!(
+            !has_counterpart(&env, &l, CandKind::Send),
+            "Send/Make are not unblockers for a blocked send"
+        );
+    }
+
+    #[test]
+    fn send_candidate_suppressed_by_any_unknown_loc_unblocker() {
+        let l = Loc {
+            root: Root::Alloc(2),
+            path: vec![],
+        };
+        let env = env_with(Loc::unknown(), &[ChanOp::Recv]);
+        assert!(
+            has_counterpart(&env, &l, CandKind::Send),
+            "an unresolvable-elsewhere Recv must still count (may-alias rule)"
+        );
+    }
+
+    #[test]
+    fn recv_candidate_suppressed_by_close() {
+        let l = Loc {
+            root: Root::Alloc(2),
+            path: vec![],
+        };
+        let env = env_with(l.clone(), &[ChanOp::Close]);
+        assert!(has_counterpart(&env, &l, CandKind::Recv));
+    }
+
+    #[test]
+    fn recv_candidate_unsuppressed_by_recv() {
+        let l = Loc {
+            root: Root::Alloc(2),
+            path: vec![],
+        };
+        let env = env_with(l.clone(), &[ChanOp::Recv]);
+        assert!(
+            !has_counterpart(&env, &l, CandKind::Recv),
+            "a sibling Recv can never unblock another blocked Recv"
+        );
+    }
+
+    /// The defensive default: `has_counterpart` isn't meant to judge a
+    /// whole `Select` candidate on its own (Task 7 dispatches per arm
+    /// instead), so passed `CandKind::Select` directly it always
+    /// suppresses, even against an empty env.
+    #[test]
+    fn has_counterpart_select_kind_defaults_to_true() {
+        let l = Loc {
+            root: Root::Alloc(2),
+            path: vec![],
+        };
+        assert!(has_counterpart(&Effects::empty(), &l, CandKind::Select));
+    }
+
+    /// Simulates Task 7's per-arm select dispatch (dir 1 = send arm →
+    /// `CandKind::Send`, dir 2 = recv arm → `CandKind::Recv`): "any arm
+    /// pairs" is true when at least one arm's own direction-appropriate
+    /// counterpart exists in the env, false for an empty env.
+    #[test]
+    fn select_arm_dispatch_suppressed_if_any_arm_matched() {
+        let la = Loc {
+            root: Root::Alloc(2),
+            path: vec![],
+        };
+        let lb = Loc {
+            root: Root::Alloc(3),
+            path: vec![],
+        };
+        let arm_locs: Vec<(u32, Loc)> = vec![(1, la.clone()), (2, lb.clone())];
+        let dispatch = |env: &Effects| {
+            arm_locs.iter().any(|(dir, loc)| {
+                let kind = if *dir == 1 {
+                    CandKind::Send
+                } else {
+                    CandKind::Recv
+                };
+                has_counterpart(env, loc, kind)
+            })
+        };
+        let env = env_with(la.clone(), &[ChanOp::Recv]);
+        assert!(dispatch(&env), "the send arm can pair via Recv on la");
+        assert!(
+            !dispatch(&Effects::empty()),
+            "an empty env leaves no arm able to pair"
+        );
+    }
+
+    // -- cap_class -------------------------------------------------------
+
+    /// F: const_int_aux(1, 0); make_chan(2, 1); go t.G(2). G sends on its
+    /// param. Cap 0 → Unbuffered.
+    #[test]
+    fn cap_class_unbuffered_from_const_zero() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![const_int_aux(1, 0)],
+                    vec![block(
+                        0,
+                        vec![
+                            gvir_make_chan(2, 1),
+                            go_call_args("t.G", vec![2]),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.G",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(0, vec![send(1, 1), ret(vec![])], vec![])],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let cands = candidates(&p, f);
+        assert_eq!(cands.len(), 1, "exactly one candidate: {cands:?}");
+        assert_eq!(cap_class(&p, f, &cands[0]), CapClass::Unbuffered);
+    }
+
+    /// Same shape, cap 3, callee's send sits in a straight-line (acyclic)
+    /// block → BufferedConst(3).
+    #[test]
+    fn cap_class_buffered_const_acyclic_send() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![const_int_aux(1, 3)],
+                    vec![block(
+                        0,
+                        vec![
+                            gvir_make_chan(2, 1),
+                            go_call_args("t.G", vec![2]),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.G",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(0, vec![send(1, 1), ret(vec![])], vec![])],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let cands = candidates(&p, f);
+        assert_eq!(cands.len(), 1, "exactly one candidate: {cands:?}");
+        assert_eq!(cap_class(&p, f, &cands[0]), CapClass::BufferedConst(3));
+    }
+
+    /// The cap operand is F's own param (not a const aux) → non-const →
+    /// Silent.
+    #[test]
+    fn cap_class_silent_for_nonconst_cap() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_params(
+                    "t.F",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "n".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(
+                        0,
+                        vec![
+                            gvir_make_chan(2, 1),
+                            go_call_args("t.G", vec![2]),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.G",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(0, vec![send(1, 1), ret(vec![])], vec![])],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let cands = candidates(&p, f);
+        assert_eq!(cands.len(), 1, "exactly one candidate: {cands:?}");
+        assert_eq!(cap_class(&p, f, &cands[0]), CapClass::Silent);
+    }
+
+    /// Cap 3, but the callee's send block loops to itself (`succs`
+    /// includes its own index) → Silent (a cyclic buffered send can
+    /// refill forever).
+    #[test]
+    fn cap_class_silent_for_cyclic_buffered_send() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![const_int_aux(1, 3)],
+                    vec![block(
+                        0,
+                        vec![
+                            gvir_make_chan(2, 1),
+                            go_call_args("t.G", vec![2]),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.G",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(0, vec![send(1, 1), ret(vec![])], vec![0])],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let cands = candidates(&p, f);
+        assert_eq!(cands.len(), 1, "exactly one candidate: {cands:?}");
+        assert_eq!(cap_class(&p, f, &cands[0]), CapClass::Silent);
+    }
+
+    /// Cell form: Alloc cell reg 4; make_chan(2, 1) cap const 3;
+    /// store(4, 2). The candidate's alloc_value is the cell (4), not the
+    /// MakeChan register (2) — the cell→Make bridge must resolve through
+    /// the single store to find the cap.
+    #[test]
+    fn cap_class_cell_form_single_store_resolves() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![const_int_aux(1, 3)],
+                    vec![block(
+                        0,
+                        vec![
+                            alloc_instr(4),
+                            gvir_make_chan(2, 1),
+                            store(4, 2),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_params("t.G", vec![], vec![block(0, vec![ret(vec![])], vec![])]),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let g = p.lookup_func("t.G").unwrap();
+        let cand = Candidate {
+            go_block: 0,
+            go_pos: None,
+            callee: g,
+            op_block: 0,
+            kind: CandKind::Send,
+            alloc_value: ValueId(4),
+            spawner_loc: Loc {
+                root: Root::Alloc(4),
+                path: vec![],
+            },
+            arm_locs: vec![],
+        };
+        assert_eq!(cap_class(&p, f, &cand), CapClass::BufferedConst(3));
+    }
+
+    /// Same as above, plus a second `store(4, 5)` into the same cell:
+    /// the exactly-one-store bridge no longer holds → Silent.
+    #[test]
+    fn cap_class_cell_form_two_stores_is_silent() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![const_int_aux(1, 3)],
+                    vec![block(
+                        0,
+                        vec![
+                            alloc_instr(4),
+                            gvir_make_chan(2, 1),
+                            store(4, 2),
+                            store(4, 5),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_params("t.G", vec![], vec![block(0, vec![ret(vec![])], vec![])]),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let g = p.lookup_func("t.G").unwrap();
+        let cand = Candidate {
+            go_block: 0,
+            go_pos: None,
+            callee: g,
+            op_block: 0,
+            kind: CandKind::Send,
+            alloc_value: ValueId(4),
+            spawner_loc: Loc {
+                root: Root::Alloc(4),
+                path: vec![],
+            },
+            arm_locs: vec![],
+        };
+        assert_eq!(cap_class(&p, f, &cand), CapClass::Silent);
+    }
+
+    /// Cap 3, but the candidate is a Recv: buffering never matters for a
+    /// recv — reachability only, so Unbuffered-equivalent.
+    #[test]
+    fn buffered_recv_is_reachability_only() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![const_int_aux(1, 3)],
+                    vec![block(
+                        0,
+                        vec![
+                            gvir_make_chan(2, 1),
+                            go_call_args("t.G", vec![2]),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.G",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(0, vec![recv(2, 1), ret(vec![])], vec![])],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let cands = candidates(&p, f);
+        assert_eq!(cands.len(), 1, "exactly one candidate: {cands:?}");
+        assert_eq!(cap_class(&p, f, &cands[0]), CapClass::Unbuffered);
     }
 }

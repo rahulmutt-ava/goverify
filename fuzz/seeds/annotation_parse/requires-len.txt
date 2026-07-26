@@ -1,0 +1,1 @@
+//goverify:requires len(p) > 0

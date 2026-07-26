@@ -1,0 +1,1 @@
+//goverify:requires p != nil && n >= 0

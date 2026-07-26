@@ -313,6 +313,7 @@ dependencies = [
  "goverify-extract",
  "goverify-ir",
  "goverify-solver",
+ "goverify-spec",
  "serde",
  "serde_json",
  "tempfile",
@@ -338,6 +339,7 @@ dependencies = [
  "goverify-extract",
  "goverify-ir",
  "goverify-solver",
+ "goverify-spec",
  "libfuzzer-sys",
  "prost",
 ]
@@ -360,6 +362,15 @@ dependencies = [
  "goverify-cache",
  "tempfile",
  "z3-sys",
+]
+
+[[package]]
+name = "goverify-spec"
+version = "0.1.0"
+dependencies = [
+ "goverify-analysis",
+ "goverify-ir",
+ "goverify-solver",
 ]
 
 [[package]]

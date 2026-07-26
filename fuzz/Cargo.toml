@@ -15,6 +15,7 @@ goverify-ir = { path = "../crates/goverify-ir" }
 goverify-solver = { path = "../crates/goverify-solver" }
 goverify-analysis = { path = "../crates/goverify-analysis" }
 goverify-cli = { path = "../crates/goverify-cli" }
+goverify-spec = { path = "../crates/goverify-spec" }
 
 [[bin]]
 name = "gvir_decode"
@@ -54,6 +55,13 @@ bench = false
 [[bin]]
 name = "baseline_parse"
 path = "fuzz_targets/baseline_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "annotation_parse"
+path = "fuzz_targets/annotation_parse.rs"
 test = false
 doc = false
 bench = false

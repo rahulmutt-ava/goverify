@@ -1,0 +1,1 @@
+//goverify:ensures err == nil ==> ret != nil

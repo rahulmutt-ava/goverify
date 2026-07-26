@@ -81,6 +81,8 @@ run = [
   "cargo +nightly fuzz run ir_encode fuzz/corpus/ir_encode fuzz/seeds/ir_encode -- -max_total_time=60",
   "cargo +nightly fuzz run scc_entry -- -max_total_time=60",
   "cargo +nightly fuzz run baseline_parse -- -max_total_time=60",
+  "mkdir -p fuzz/corpus/annotation_parse",
+  "cargo +nightly fuzz run annotation_parse fuzz/corpus/annotation_parse fuzz/seeds/annotation_parse -- -max_total_time=60",
 ]
 dir = "{{cwd}}"
 

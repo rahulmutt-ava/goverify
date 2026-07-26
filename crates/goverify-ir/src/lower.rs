@@ -66,6 +66,7 @@ impl Program {
         }
         let result_names = gf.result_names.clone();
 
+        let mut free_vars = Vec::new();
         for a in &gf.aux {
             let kind = match a.kind.as_str() {
                 "Const" => ValueKind::Const(lower_const(a)),
@@ -85,6 +86,9 @@ impl Program {
             if a.id != 0
                 && let Some(slot) = values.get_mut(a.id as usize)
             {
+                if matches!(kind, ValueKind::FreeVar) {
+                    free_vars.push(ValueId(a.id));
+                }
                 *slot = ValueInfo {
                     ty: resolve_ty(tmap, unknown, a.r#type),
                     kind,
@@ -128,6 +132,7 @@ impl Program {
             params,
             param_names,
             result_names,
+            free_vars,
             values,
             blocks,
             pos: lower_pos(pkg, &gf.pos),
@@ -915,5 +920,80 @@ mod tests {
             f.params.is_empty(),
             "id-0 param must not be registered as a real param"
         );
+    }
+
+    #[test]
+    fn free_var_aux_values_populate_free_vars_in_order() {
+        let p = Program::from_packages(vec![gvir::Package {
+            import_path: "t".into(),
+            functions: vec![gvir::Function {
+                id: "t.F$1".into(),
+                aux: vec![
+                    gvir::AuxValue {
+                        id: 1,
+                        kind: "FreeVar".into(),
+                        repr: "ch".into(),
+                        ..Default::default()
+                    },
+                    gvir::AuxValue {
+                        id: 2,
+                        kind: "Const".into(),
+                        ..Default::default()
+                    },
+                    gvir::AuxValue {
+                        id: 3,
+                        kind: "FreeVar".into(),
+                        repr: "n".into(),
+                        ..Default::default()
+                    },
+                ],
+                blocks: vec![gvir::BasicBlock {
+                    index: 0,
+                    instrs: vec![gvir::Instruction {
+                        kind: "Return".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }]);
+        let f = p.func(p.lookup_func("t.F$1").unwrap()).unwrap();
+        assert_eq!(
+            f.free_vars,
+            vec![ValueId(1), ValueId(3)],
+            "free_vars must list FreeVar aux ids in emission order, skipping non-FreeVar aux"
+        );
+        assert_eq!(f.value(ValueId(1)).kind, ValueKind::FreeVar);
+    }
+
+    #[test]
+    fn free_var_aux_id_zero_is_skipped() {
+        // id 0 is the reserved opaque slot — a fuzzed FreeVar aux with id 0
+        // must not enter free_vars (mirrors the params id!=0 guard).
+        let p = Program::from_packages(vec![gvir::Package {
+            import_path: "t".into(),
+            functions: vec![gvir::Function {
+                id: "t.F$1".into(),
+                aux: vec![gvir::AuxValue {
+                    id: 0,
+                    kind: "FreeVar".into(),
+                    ..Default::default()
+                }],
+                blocks: vec![gvir::BasicBlock {
+                    index: 0,
+                    instrs: vec![gvir::Instruction {
+                        kind: "Return".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }]);
+        let f = p.func(p.lookup_func("t.F$1").unwrap()).unwrap();
+        assert!(f.free_vars.is_empty(), "id-0 FreeVar aux must be skipped");
     }
 }

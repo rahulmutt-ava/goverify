@@ -82,6 +82,12 @@ pub struct Function {
     pub param_names: Vec<String>,
     /// Signature result names in declaration order ("" for unnamed).
     pub result_names: Vec<String>,
+    /// Free-variable value ids in wire (aux-emission) order — parallel to
+    /// go/ssa `fn.FreeVars`, so index i here corresponds to
+    /// `Op::MakeClosure::bindings[i]` at every closure-creation site.
+    /// Display/effects-resolution only — never hashed (hashes are computed
+    /// over raw .gvir bytes in program.rs).
+    pub free_vars: Vec<ValueId>,
     pub values: Vec<ValueInfo>,
     pub blocks: Vec<Block>,
     pub pos: Option<Pos>,

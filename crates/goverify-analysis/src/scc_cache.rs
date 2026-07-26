@@ -21,6 +21,10 @@ use crate::summary::{Clause, Formula, Provenance, Summary};
 /// Bump on: entry-format change, any engine/encoding semantic change,
 /// prost major bump, CLI RETRY_FACTOR change (escalated limits are
 /// derived from base limits and deliberately not keyed separately).
+/// Versions:
+/// 1: initial
+/// 2: ?
+/// 3: phase-7 Root::FreeVar + Make/Load rooting in resolve_loc
 const SCC_CACHE_VERSION: u32 = 3;
 const LAYER: &str = "scc";
 const SCC_ENTRY_FORMAT: u8 = 2;
@@ -805,6 +809,26 @@ mod tests {
             c.salt_for_test(),
             c3.salt_for_test(),
             "findings identity is in the salt"
+        );
+    }
+
+    #[test]
+    fn root_free_var_roundtrips() {
+        let mut e = Effects::empty();
+        e.chan_ops
+            .entry(Loc {
+                root: Root::FreeVar(5),
+                path: vec![1],
+            })
+            .or_default()
+            .insert(ChanOp::Send);
+        let mut out = Vec::new();
+        encode_effects(&e, &mut out);
+        let mut input = out.as_slice();
+        assert_eq!(
+            decode_effects(&mut input),
+            Some(e),
+            "FreeVar root must roundtrip"
         );
     }
 }

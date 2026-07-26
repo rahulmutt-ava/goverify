@@ -104,3 +104,106 @@ fn pragma_text_edit_invalidates_whole_package_sccs() {
     );
     assert_eq!(hits3, 0, "no SCC survives a pragma edit in its package");
 }
+
+// Phase-7 Task 9: two invalidation pins for the goroutine-leak checker's
+// findings, colocated here with the other SCC-cache pins rather than in
+// `leak_corpus.rs` (whose `cold_and_warm_cache_runs_are_byte_identical`
+// already pins byte-identical cold/warm replay for the leak corpus; this
+// pin additionally asserts `scc_cache_hits > 0` on the warm run and lives
+// alongside the config-rotation pin below).
+fn leak_corpus_limits() -> SolverLimits {
+    // Corpus queries are trivial; a generous timeout keeps a slow CI
+    // runner from turning a Sat into Unknown and flaking the pin (see
+    // leak_corpus.rs's `limits()`).
+    SolverLimits {
+        timeout_ms: 5_000,
+        mem_mb: 1024,
+    }
+}
+
+fn run_leak_corpus(cache_dir: std::path::PathBuf) -> (String, u64, u64) {
+    let p = goverify_ir::testutil::load_corpus("leak");
+    let cfg = EngineConfig {
+        opts: Options::default(),
+        cache_dir: Some(cache_dir),
+        emit_smt: None,
+        annotations: Default::default(),
+        annotation_version: 0,
+    };
+    let checkers: Vec<&dyn Checker> = vec![&goverify_checkers::LeakChecker];
+    let a = analyze_full(&p, &cfg, &checkers, &|_role| {
+        Box::new(Z3Native::new(leak_corpus_limits()))
+    });
+    (
+        goverify_analysis::dump_findings(&a, Some("example.com/leak")),
+        a.scc_cache_hits,
+        a.scc_cache_misses,
+    )
+}
+
+#[test]
+fn leak_findings_replay_byte_identical_on_warm_cache() {
+    let cache = tempfile::tempdir().unwrap();
+    let (cold, cold_hits, cold_misses) = run_leak_corpus(cache.path().to_path_buf());
+    assert_eq!(cold_hits, 0, "cold run");
+    assert!(cold_misses > 0, "cold run must populate the cache");
+
+    let (warm, warm_hits, warm_misses) = run_leak_corpus(cache.path().to_path_buf());
+    assert_eq!(
+        warm, cold,
+        "warm replay of the leak corpus must be byte-identical to the cold run"
+    );
+    assert_eq!(warm_misses, 0, "warm run must be a full hit");
+    assert!(
+        warm_hits > 0,
+        "warm run must actually replay leak findings from the SCC cache"
+    );
+}
+
+#[test]
+fn checker_set_rotation_does_not_replay_leak_findings() {
+    // vec![&NilChecker] then default_checkers() over the SAME cache dir:
+    // the checker-set change must rotate `CacheConfigKey` (checker
+    // name+version list, see engine.rs), so the second run must NOT
+    // replay the one-checker entries as stale hits.
+    let cache = tempfile::tempdir().unwrap();
+    let build_cfg = || EngineConfig {
+        opts: Options::default(),
+        cache_dir: Some(cache.path().to_path_buf()),
+        emit_smt: None,
+        annotations: Default::default(),
+        annotation_version: 0,
+    };
+
+    let one_checker: Vec<&dyn Checker> = vec![&NilChecker];
+    let _a1 = analyze_full(
+        &goverify_ir::testutil::load_corpus("leak"),
+        &build_cfg(),
+        &one_checker,
+        &|_role| Box::new(Z3Native::new(leak_corpus_limits())),
+    );
+
+    let all_checkers = goverify_checkers::default_checkers();
+    let a2 = analyze_full(
+        &goverify_ir::testutil::load_corpus("leak"),
+        &build_cfg(),
+        &all_checkers,
+        &|_role| Box::new(Z3Native::new(leak_corpus_limits())),
+    );
+
+    assert_eq!(
+        a2.scc_cache_hits, 0,
+        "checker-set rotation must not replay the one-checker run's cache entries"
+    );
+    assert!(
+        a2.scc_cache_misses > 0,
+        "the second config must actually (re)populate the cache"
+    );
+
+    let findings2 = goverify_analysis::dump_findings(&a2, Some("example.com/leak"));
+    assert!(
+        findings2.contains("goroutine-leak"),
+        "default_checkers() run must include goroutine-leak findings, which a stale \
+         one-checker replay would omit: {findings2}"
+    );
+}

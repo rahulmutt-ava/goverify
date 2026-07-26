@@ -359,9 +359,46 @@ fn rebase_loc(
     }
 }
 
+/// One `MakeClosure` site per target function ⇒ its bindings; two or
+/// more ⇒ `None` (ambiguous — a well-formed lowering emits exactly one
+/// MakeClosure per anon fn per enclosing function, so ambiguity is a
+/// fuzz/malformed shape and degrades). Lowering drops the go/call
+/// instruction's callee-slot value id, so bindings can only be found by
+/// this scan, never by operand inspection.
+pub fn closure_bindings(f: &Function) -> HashMap<FuncId, Option<Vec<ValueId>>> {
+    let mut m: HashMap<FuncId, Option<Vec<ValueId>>> = HashMap::new();
+    for b in &f.blocks {
+        for ins in &b.instrs {
+            if let Op::MakeClosure { func, bindings, .. } = &ins.op {
+                m.entry(*func)
+                    .and_modify(|e| *e = None)
+                    .or_insert_with(|| Some(bindings.clone()));
+            }
+        }
+    }
+    m
+}
+
+/// A callee's `FreeVar(i)`-rooted `Loc` re-roots through its `i`th
+/// `MakeClosure` binding at this call site (phase 7): absent, ambiguous
+/// (≥2 `MakeClosure` sites for `c`), or out-of-range `i` all degrade to
+/// `Loc::unknown()` — never a panic on malformed/fuzzed input.
+fn fv_loc(f: &Function, cb: &HashMap<FuncId, Option<Vec<ValueId>>>, c: FuncId, i: u32) -> Loc {
+    match cb.get(&c) {
+        Some(Some(bindings)) => bindings
+            .get(i as usize)
+            .map_or(Loc::unknown(), |&bv| resolve_loc(f, bv)),
+        _ => Loc::unknown(),
+    }
+}
+
 /// Blocks that sit on a CFG cycle: reachable from themselves. O(B²) DFS —
 /// fine for phase 2 (functions are small; revisit if profiling says so).
-fn cyclic_blocks(f: &Function) -> Vec<bool> {
+///
+/// `pub` (not `pub(crate)`): phase 7's buffered-cyclic-goroutine checker
+/// (Task 6) reuses this same cycle test standalone, without re-running
+/// all of `collect`.
+pub fn cyclic_blocks(f: &Function) -> Vec<bool> {
     let n = f.blocks.len();
     let mut cyclic = vec![false; n];
     for (start, block) in f.blocks.iter().enumerate() {
@@ -436,11 +473,13 @@ fn arg_loc(f: &Function, args: &[ValueId], i: u32) -> Loc {
 /// branch fired, so `collect` can add it to the static-site set (the
 /// call-graph double-count guard: this callee must NOT also be joined a
 /// second time, all-Unknown, by the invoke/dynamic diff pass).
+#[allow(clippy::too_many_arguments)]
 fn record_go_defer_callee(
     p: &Program,
     f: &Function,
     e: &mut Effects,
     effects_of: &dyn Fn(FuncId) -> Effects,
+    cb: &HashMap<FuncId, Option<Vec<ValueId>>>,
     callee: &Callee,
     args: &[ValueId],
     is_defer: bool,
@@ -458,8 +497,8 @@ fn record_go_defer_callee(
                 let loc = arg_loc(f, args, 0);
                 e.lock_ops.entry(loc).or_default().insert(op);
             } else {
-                e.join(&rebase(&effects_of(*c), &|i| arg_loc(f, args, i), &|_| {
-                    Loc::unknown()
+                e.join(&rebase(&effects_of(*c), &|i| arg_loc(f, args, i), &|i| {
+                    fv_loc(f, cb, *c, i)
                 }));
             }
             Some(*c)
@@ -499,6 +538,7 @@ pub fn collect(
         return Effects::top();
     };
     let cyclic = cyclic_blocks(f);
+    let cb = closure_bindings(f);
     let mut e = Effects::empty();
     let mut static_sites: BTreeSet<FuncId> = BTreeSet::new();
 
@@ -553,8 +593,8 @@ pub fn collect(
                     ..
                 } => {
                     static_sites.insert(*c);
-                    e.join(&rebase(&effects_of(*c), &|i| arg_loc(f, args, i), &|_| {
-                        Loc::unknown()
+                    e.join(&rebase(&effects_of(*c), &|i| arg_loc(f, args, i), &|i| {
+                        fv_loc(f, &cb, *c, i)
                     }));
                 }
                 Op::Go { callee, args } => {
@@ -565,14 +605,14 @@ pub fn collect(
                     };
                     e.spawns = e.spawns.max(s);
                     if let Some(c) =
-                        record_go_defer_callee(p, f, &mut e, effects_of, callee, args, false)
+                        record_go_defer_callee(p, f, &mut e, effects_of, &cb, callee, args, false)
                     {
                         static_sites.insert(c);
                     }
                 }
                 Op::Defer { callee, args } => {
                     if let Some(c) =
-                        record_go_defer_callee(p, f, &mut e, effects_of, callee, args, true)
+                        record_go_defer_callee(p, f, &mut e, effects_of, &cb, callee, args, true)
                     {
                         static_sites.insert(c);
                     }
@@ -988,6 +1028,166 @@ mod tests {
             rebased.chan_ops.keys().collect::<Vec<_>>(),
             vec![&Loc::unknown()]
         );
+    }
+
+    #[test]
+    fn go_closure_send_rebases_free_var_through_bindings() {
+        // t.F: v2 = make(chan); v3 = MakeClosure t.F$1 [v2]; go t.F$1()
+        // t.F$1: FreeVar fv1; Send fv1
+        // F's effects must contain Send at Alloc(2) — the closure's
+        // FreeVar(0) rebased through binding v2.
+        use goverify_extract::gvir;
+        use goverify_extract::gvir::instruction::Sem;
+
+        use crate::testpkg::{fn_aux, func_with_aux, make_closure};
+
+        let mut go = instr("Go");
+        go.operands = vec![3]; // callee slot = closure register (dropped by lower)
+        go.sem = Some(Sem::Call(gvir::CallSem {
+            static_callee: "t.F$1".into(),
+            ..Default::default()
+        }));
+        let mut send = instr("Send");
+        send.operands = vec![1, 1];
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![fn_aux(1, "t.F$1")],
+                    vec![block(
+                        0,
+                        vec![
+                            crate::testpkg::gvir_make_chan(2, 1),
+                            make_closure(3, 1, vec![2]),
+                            go,
+                            instr("Return"),
+                        ],
+                        vec![],
+                    )],
+                ),
+                crate::testpkg::func_with_free_vars(
+                    "t.F$1",
+                    vec![1],
+                    vec![block(0, vec![send, instr("Return")], vec![])],
+                ),
+            ],
+        )]);
+        let g = CallGraph::build(&p);
+        let f1 = p.lookup_func("t.F$1").unwrap();
+        // Drive with the real callee effects, as the fixpoint would:
+        let f1_effects = collect(&p, f1, &g, &|_| Effects::empty());
+        let e = collect(&p, p.lookup_func("t.F").unwrap(), &g, &|c| {
+            if c == f1 {
+                f1_effects.clone()
+            } else {
+                Effects::empty()
+            }
+        });
+        let want = Loc {
+            root: Root::Alloc(2),
+            path: vec![],
+        };
+        assert!(
+            e.chan_ops
+                .get(&want)
+                .is_some_and(|ops| ops.contains(&ChanOp::Send)),
+            "closure-captured send must rebase to the spawner's alloc site: {e:?}"
+        );
+        assert_eq!(e.spawns, Spawns::Bounded);
+    }
+
+    /// Two MakeClosure sites for the same target fn (fuzz shape) —
+    /// bindings are ambiguous, FreeVar-rooted effects degrade to Unknown.
+    #[test]
+    fn ambiguous_make_closure_degrades_free_var_to_unknown() {
+        use goverify_extract::gvir;
+        use goverify_extract::gvir::instruction::Sem;
+
+        use crate::testpkg::{fn_aux, func_with_aux, make_closure};
+
+        let mut go = instr("Go");
+        go.operands = vec![4];
+        go.sem = Some(Sem::Call(gvir::CallSem {
+            static_callee: "t.F$1".into(),
+            ..Default::default()
+        }));
+        let mut send = instr("Send");
+        send.operands = vec![1, 1];
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![fn_aux(1, "t.F$1")],
+                    vec![block(
+                        0,
+                        vec![
+                            crate::testpkg::gvir_make_chan(2, 1),
+                            crate::testpkg::gvir_make_chan(5, 1),
+                            make_closure(3, 1, vec![2]),
+                            make_closure(4, 1, vec![5]),
+                            go,
+                            instr("Return"),
+                        ],
+                        vec![],
+                    )],
+                ),
+                crate::testpkg::func_with_free_vars(
+                    "t.F$1",
+                    vec![1],
+                    vec![block(0, vec![send, instr("Return")], vec![])],
+                ),
+            ],
+        )]);
+        let g = CallGraph::build(&p);
+        let f1 = p.lookup_func("t.F$1").unwrap();
+        let f1_effects = collect(&p, f1, &g, &|_| Effects::empty());
+        let e = collect(&p, p.lookup_func("t.F").unwrap(), &g, &|c| {
+            if c == f1 {
+                f1_effects.clone()
+            } else {
+                Effects::empty()
+            }
+        });
+        let send_at = |loc: &Loc| {
+            e.chan_ops
+                .get(loc)
+                .is_some_and(|o| o.contains(&ChanOp::Send))
+        };
+        assert!(
+            send_at(&Loc::unknown()),
+            "ambiguous bindings must degrade: {e:?}"
+        );
+        assert!(!send_at(&Loc {
+            root: Root::Alloc(2),
+            path: vec![]
+        }));
+        assert!(!send_at(&Loc {
+            root: Root::Alloc(5),
+            path: vec![]
+        }));
+    }
+
+    /// `testpkg::const_int_aux` isn't exercised by the two closure-rebase
+    /// tests above (their `MakeChan` cap operand doesn't need a defined
+    /// aux value) but is part of the testpkg interface this task adds —
+    /// pin its wire shape directly so it isn't dead code.
+    #[test]
+    fn const_int_aux_builds_expected_wire_shape() {
+        use goverify_extract::gvir;
+
+        use crate::testpkg::const_int_aux;
+
+        let a = const_int_aux(9, 42);
+        assert_eq!(a.id, 9);
+        assert_eq!(a.kind, "Const");
+        assert!(matches!(
+            a.r#const,
+            Some(gvir::ConstValue {
+                value: Some(gvir::const_value::Value::Int(42)),
+            })
+        ));
     }
 
     #[test]

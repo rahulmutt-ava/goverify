@@ -147,3 +147,50 @@ pub fn func_with_free_vars(
         ..Default::default()
     }
 }
+
+/// `register = MakeClosure <fn_aux> [bindings…]` — wire shape per
+/// lower.rs ~line 441: operands [fn, bindings…], fn is a Function aux.
+pub fn make_closure(register: u32, fn_aux_operand: u32, bindings: Vec<u32>) -> gvir::Instruction {
+    let mut operands = vec![fn_aux_operand];
+    operands.extend(bindings);
+    gvir::Instruction {
+        kind: "MakeClosure".into(),
+        register,
+        operands,
+        ..Default::default()
+    }
+}
+
+/// Function with arbitrary aux values (Function refs, consts, …).
+pub fn func_with_aux(
+    id: &str,
+    aux: Vec<gvir::AuxValue>,
+    blocks: Vec<gvir::BasicBlock>,
+) -> gvir::Function {
+    gvir::Function {
+        id: id.into(),
+        aux,
+        blocks,
+        ..Default::default()
+    }
+}
+
+pub fn fn_aux(id: u32, target: &str) -> gvir::AuxValue {
+    gvir::AuxValue {
+        id,
+        kind: "Function".into(),
+        repr: target.into(),
+        ..Default::default()
+    }
+}
+
+pub fn const_int_aux(id: u32, v: i64) -> gvir::AuxValue {
+    gvir::AuxValue {
+        id,
+        kind: "Const".into(),
+        r#const: Some(gvir::ConstValue {
+            value: Some(gvir::const_value::Value::Int(v)),
+        }),
+        ..Default::default()
+    }
+}

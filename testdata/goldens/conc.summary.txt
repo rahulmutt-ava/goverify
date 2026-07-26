@@ -3,7 +3,7 @@
 (example.com/conc.Thing).Rename effects={spawns:None chan:{} locks:{}} requires=0 ensures=0 provenance=Inferred
 example.com/conc.CloseAll effects={spawns:None chan:{} locks:{?:[Lock,DeferredUnlock]}} requires=0 ensures=0 provenance=Inferred
 example.com/conc.DeferClose effects={spawns:None chan:{p0:[Close]} locks:{}} requires=0 ensures=0 provenance=Inferred
-example.com/conc.Fan effects={spawns:Bounded chan:{p0:[Select] p1:[Select] alloc:3:[Select] alloc:4:[Make] ?:[Close]} locks:{}} requires=0 ensures=0 provenance=Inferred
+example.com/conc.Fan effects={spawns:Bounded chan:{p0:[Select] p1:[Select] alloc:3:[Close,Select] alloc:4:[Make]} locks:{}} requires=0 ensures=0 provenance=Inferred
 example.com/conc.Fan$1 effects={spawns:None chan:{fv:0:[Close]} locks:{}} requires=0 ensures=0 provenance=Inferred
 example.com/conc.GoClose effects={spawns:Bounded chan:{p0:[Close]} locks:{}} requires=0 ensures=0 provenance=Inferred
 example.com/conc.InvokeCB effects={spawns:None chan:{} locks:{}} requires=0 ensures=0 provenance=Inferred

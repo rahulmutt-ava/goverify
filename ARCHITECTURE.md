@@ -29,7 +29,7 @@ Rust core: IR load ─▶ call-graph SCC order ─▶ per-function analysis
 | `goverify-analysis` | the SCC-ordered engine: concurrency effects, the syntactic pre-pass (no SMT), summary instantiation over placeholder clauses, the SCC summary cache (context-hash keying + entry framing over the shared Store) | what to check (checkers plug in) |
 | `goverify-checkers` | `Checker` trait consumers: `NilChecker` (tag `nil-deref`) and `BoundsChecker` (tags `bounds`, `div-zero`, `overflow`) | engine machinery, solver details |
 | `goverify-solver` | typed QF term language (Bool, BV, Array, Ptr-ADT); canonical SMT-LIB2 printer is the single lowering — cache keys and artifacts are byte-identical to solved queries; `Z3Native` (statically-linked bundled Z3 4.16.0) and `SmtLib2Process` (external binary) backends both consume printer bytes; differential harness guards agreement | summary semantics |
-| `goverify-spec` | summary/annotation format: parse, serialize, validate | inference |
+| `goverify-spec` | the `//goverify:` annotation compiler: parse → resolve → lower `requires`/`ensures`/`ignore` pragmas into `Clause`s (phase-6 spec §3); depends on `goverify-ir` + `goverify-solver` + `goverify-analysis` (resolves against `.gvir` signatures, lowers to `Term`, and shares `FuncAnnotations`/`AnnClause` with the engine) | inference; wiring itself into the engine — the CLI compiles (`compile_program`) and passes the result into the engine via `EngineConfig`, so there is no analysis→spec edge |
 | `goverify-cache` | content-addressed store (blake3, atomic rename, advisory lock, corrupt=miss) — bytes only, layer-agnostic. Three live layers write to it: `extract` (keyed in goverify-extract), `scc` (keyed + framed in goverify-analysis), and `query` (keyed here on canonical SMT text ⊕ solver identity ⊕ limits) | what the bytes mean; how any layer keys or frames them |
 
 Checkers depend on `goverify-analysis` + `goverify-ir` + `goverify-solver`
@@ -38,6 +38,21 @@ and nothing else — notably not `goverify-extract`, `goverify-cache`, or
 they read the IR, plug into the engine's `Checker` surface, and discharge
 queries through the solver, so a checker change can't ripple into
 extraction or the caching/spec layers.
+
+`goverify-spec` sits *above* `goverify-analysis` in the dependency
+graph, not below it: `goverify-analysis` cannot depend on
+`goverify-spec` (that would cycle back through `goverify-spec`'s own
+dependency on `goverify-analysis`'s summary/clause types), so the
+annotation compiler cannot be called from inside the engine the way the
+checkers are. `goverify-cli` is the crate that sits above both — it
+calls `goverify_spec::compile_program` once per run and feeds the
+result into `goverify_analysis::EngineConfig`, which the engine
+consumes at summary-construction time. The types both sides need
+(`FuncAnnotations`, `AnnClause`, and the `contract`/`bad-annotation`/
+`unverified-annotation` tag constants) live in
+`goverify-analysis/src/annotations.rs` rather than in `goverify-spec`,
+precisely so the engine can consume compiled annotations without ever
+importing the compiler.
 
 ## The Go sidecar (`extractor/`)
 

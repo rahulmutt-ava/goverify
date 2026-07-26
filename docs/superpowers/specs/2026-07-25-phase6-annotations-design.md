@@ -115,6 +115,33 @@ Crate dependencies: `goverify-spec` → `goverify-solver` (Term) and the
 gvir/type-table types it resolves against. Exact import shape settled at
 plan time against `ARCHITECTURE.md`'s edges.
 
+**Deviation recorded at implementation time: dependency direction.**
+This section's "resolve against the annotated function's `.gvir`
+signature" and §4's "the engine compiles each function's pragmas once,
+at summary construction" together read as if `goverify-analysis` calls
+into `goverify-spec` from inside the engine. That edge cannot exist:
+`goverify-spec`'s resolve/lower stages bind against `FuncAnnotations`/
+`AnnClause`/`Clause` — types that live with the engine's own summary
+machinery so the engine can consume them without importing the
+compiler — so `goverify-spec` depends on `goverify-analysis` (and
+`goverify-checkers`, to validate `ignore` names against the real
+checker set), not the other way around. `goverify-analysis` depending
+back on `goverify-spec` would be a cycle. The implementation instead
+puts compilation at the CLI: `goverify-cli` calls
+`goverify_spec::compile_program(&program, &known_checkers)` once per
+run and passes the resulting `Annotations` into
+`goverify_analysis::EngineConfig`, which `analyze_full` consumes at
+summary construction — the same point in the pipeline §4 describes,
+just invoked one layer up. The shared data shapes
+(`FuncAnnotations`, `AnnClause`, the `CONTRACT`/`BAD_ANNOTATION`/
+`UNVERIFIED_ANNOTATION` tag constants) live in
+`goverify-analysis/src/annotations.rs` for exactly this reason: both
+the compiler (downstream) and the engine/CLI (upstream and downstream)
+need one shared definition, and the crate that can't take the
+dependency edge is where the types have to live. See
+`ARCHITECTURE.md`'s `goverify-spec` row for the resulting crate-graph
+description.
+
 ## 4. Engine integration
 
 **Per-clause provenance.** `Clause` gains
@@ -154,6 +181,19 @@ Verification is best-effort and controls only the warning:
   warning** finding at the pragma position.
 - Queries ride the existing solver stack: query cache, per-tier limits,
   retry-on-Unknown escalation.
+
+  **Deviation recorded at implementation time:** the query above is the
+  planning-time sketch; the shipped query is `own-requires ∧ body ∧
+  ¬clause` — the function's own (merged, annotated-included) requires
+  terms are conjoined in as an assumption alongside the body, per §1(a)'s
+  "requires assumed at function entry" rule and the same
+  `own_preconditions`-assumed convention the checkers already use for
+  their in-body obligations. Without it, a perfectly valid contract like
+  `requires x > 0` + `ensures ret > 0` on `return x` is unprovable (`x`
+  ranges over all integers absent its own precondition) and would
+  spuriously warn; see `verify_ensures`'s doc comment and the
+  `verify_ensures_uses_own_requires_as_an_assumption` regression test in
+  `goverify-analysis/src/engine.rs`.
 
 An unproven ensures is therefore *used and flagged* — never silently
 trusted, never silently dropped. `--deny warnings` is the CI ratchet.

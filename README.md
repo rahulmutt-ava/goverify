@@ -6,15 +6,16 @@ summaries, constraints discharged with Z3, aggressive content-addressed
 caching. Bug-finder first — high-confidence reports, false positives
 are the enemy.
 
-**Status:** early development. Phases 1-7 of the
+**Status:** early development. Phases 1-6 of the
 [design](docs/superpowers/specs/2026-07-16-goverify-design.md) are
 implemented: extraction pipeline, IR/call-graph/analysis engine, the Z3
 solver layer, the nil + bounds checkers behind `goverify check`, the
 summary/extraction caches, the CI-facing surface — SARIF/JSON output,
 findings baselines (`goverify baseline write`), `--diff-base` PR-scoped
-reporting — the core `//goverify:` annotation language (see
-[Annotations](#annotations) below) — and the channels-only
-`goroutine-leak` checker (see [Checkers](#checkers) below). See
+reporting — and the core `//goverify:` annotation language (see
+[Annotations](#annotations) below) — plus phase 7's channels-only
+`goroutine-leak` checker (see [Checkers](#checkers) below); phase 7's
+own WaitGroup/data-race scope is not yet done (below). See
 [docs/shakeout-phase5b-ci-surface.md](docs/shakeout-phase5b-ci-surface.md)
 and
 [docs/shakeout-phase6-annotations.md](docs/shakeout-phase6-annotations.md)
@@ -129,9 +130,10 @@ above the pragma, is truly invisible to `--diff-base`).
   the spawning function can ever unblock. A channel that escapes the
   spawner (stored to the heap, returned, passed as an argument to any
   plain call, or captured by an untracked closure), is rooted at a
-  parameter or a package-level `var`, or has a non-constant/cyclically-
-  filled buffered capacity is deliberately silent in v1 — see the
-  [design
+  parameter or a package-level `var`, is spawned through a dynamic
+  (function-value) `go` callee rather than a named function, or has a
+  non-constant/cyclically-filled buffered capacity is deliberately
+  silent in v1 — see the [design
   spec](docs/superpowers/specs/2026-07-26-phase7-goroutine-leaks-design.md)
   for the full scope boundary.
 
@@ -141,14 +143,19 @@ func leaks() {
 	go func() { ch <- 1 }() // reported: chan-send-leak (nothing ever receives)
 }
 
+//goverify:ignore goroutine-leak
 func acknowledged() {
 	ch := make(chan int)
-	go func() { ch <- 1 }() //goverify:ignore goroutine-leak
+	go func() { ch <- 1 }() // silenced — the pragma is function-scoped
 }
 ```
 
-See [Annotations](#annotations) below for how `//goverify:ignore
-<checker>` suppression works in general.
+Like every `ignore`, the pragma is a doc comment on the enclosing
+function declaration, not a trailing statement comment (the extractor
+only harvests `//goverify:` lines from a `FuncDecl`/`GenDecl`'s own doc
+comment — see [Annotations](#annotations) below) — and it suppresses
+`goroutine-leak` findings for `acknowledged`'s whole body, not just the
+one `go` statement.
 
 ## Annotations
 

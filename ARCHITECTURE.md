@@ -102,9 +102,10 @@ channels-only goroutine-leak detection over the Effects lattice; see
 its [design
 spec](docs/superpowers/specs/2026-07-26-phase7-goroutine-leaks-design.md)).
 All three implement the `Checker` trait (`goverify-analysis::checker`),
-but `LeakChecker` only implements `obligations` — leaks aren't
-contracts, so its `infer_requires`/`infer_ensures` return nothing, and
-the requires-inference/lifting bullets below don't apply to it:
+but `LeakChecker`'s `infer_requires`/`infer_ensures` are deliberately
+empty no-ops — leaks aren't contracts — so only its `obligations` does
+any work, and the requires-inference/lifting bullets below don't apply
+to it:
 
 - `infer_requires` derives a function's own preconditions from its
   body during the engine's existing SCC fixpoint. A clause is only

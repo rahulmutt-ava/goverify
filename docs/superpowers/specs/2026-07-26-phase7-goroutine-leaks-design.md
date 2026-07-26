@@ -66,10 +66,19 @@ A finding is raised at an `Op::Go` in function `f` when ALL hold:
    on across a call boundary, so a nested-helper op is never itself the
    subject of a finding (§10: "nested-helper blocking ops (cross-function
    obligation anchoring)").
-2. **No escape.** The channel's `Make` dst never: appears as the
-   stored value of any `Store` (v1 makes no attempt to attribute
-   stores back to locals — any store is an escape), is returned, is
-   passed as an argument to any plain `Call` — **even a summarized
+2. **No escape.** The tracked channel value never: appears as the
+   stored value of a `Store{addr, val}` whose `addr` is itself
+   untracked (`val` tracked, `addr` not — a tracked value spilled into
+   some *other*, non-channel cell). A `Store` INTO the channel's own
+   already-tracked cell is whitelisted bookkeeping, not an escape, and
+   instead grows the tracked-alias set to cover the stored content —
+   this exemption is load-bearing: `ch := make(chan T)` (and every
+   address-taken channel a closure later captures) lowers to exactly an
+   `Alloc` cell plus a `Store` of the `Make` dst into it plus a `Load`
+   back out per use, so without it every such candidate's own
+   initializing store would silence it. Beyond that, the channel is
+   returned, is passed as an argument to any plain `Call` — **even a
+   summarized
    static callee** — with only a narrow builtin whitelist exempted
    (`close`/`len`/`cap`; a `Go`/`Defer` argument is separately
    whitelisted for a static callee or the `close` builtin, since those
@@ -86,10 +95,13 @@ A finding is raised at an `Op::Go` in function `f` when ALL hold:
 3. **No counterpart.** The spawning environment — `f`'s own chan ops,
    its summarized callees' ops (already rebased into `f`'s summary by
    `effects::collect`), and sibling spawned goroutines — contains no op
-   at the same `Loc` that could unblock it: `Recv`/recv-`Select` for a
-   blocked send; `Send`/`Close`/send-`Select` for a blocked recv. Any
-   op keyed at `Loc::Unknown` anywhere in the environment counts as a
-   counterpart (may-alias) and suppresses.
+   at the same `Loc` that could unblock it: `Recv`/`Select`/`Close` for
+   a blocked send; `Send`/`Select`/`Close` for a blocked recv (`Close`
+   counts on both sides — a send on a closed channel panics rather than
+   blocking forever, so it still counts as "not blocked forever", and a
+   recv on a closed channel returns the zero value rather than
+   blocking). Any op keyed at `Loc::Unknown` anywhere in the environment
+   counts as a counterpart (may-alias) and suppresses.
 
    **Select-arm dispatch is a deliberate exception to the table above.**
    A Select candidate's *own* `ChanOp::Select` lands in `f`'s converged

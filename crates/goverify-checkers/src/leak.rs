@@ -503,6 +503,50 @@ pub(crate) fn has_counterpart(env: &Effects, loc: &Loc, kind: CandKind) -> bool 
     unblocked_at(loc) || unblocked_at(&Loc::unknown())
 }
 
+/// A blocking `Select` candidate's PER-ARM counterpart check (`dir` 1 =
+/// send arm, anything else = recv arm). Deliberately NOT
+/// `has_counterpart(env, loc, Send/Recv)`: that table lists `ChanOp::Select`
+/// as an unblocker, and the candidate's OWN select is folded into `env`
+/// (`summary_of(f).effects` covers every spawned goroutine's ops, and the
+/// spawned closure's select rebases through its bindings to precisely
+/// these arm locs). Asking the generic table therefore made every
+/// blocking-select candidate find *itself* at every arm and
+/// self-suppress — `chan-select-leak` was structurally unfireable for any
+/// input (found by the phase-7 corpus fixture `LeakSelectAllBlocked`).
+///
+/// So at the ARM's own loc the unblocker set drops `Select`: a send arm
+/// needs a `Recv`/`Close`, a recv arm a `Send`/`Close`. At
+/// `Loc::unknown()` `Select` is KEPT as a suppressor — the candidate's own
+/// select always rebases to the known `Root::Alloc` arm locs, never to
+/// unknown, so unknown-loc select evidence is necessarily foreign, and the
+/// may-alias rule still applies to it.
+///
+/// The cost, stated plainly: same-loc `Select` evidence is ambiguous
+/// between this candidate's own select and a genuine second select that
+/// could pair with it, and this resolves the ambiguity toward reporting,
+/// because the alternative makes the tag vacuous. A real
+/// select-pairing-with-another-select shape can therefore false-positive
+/// in v1; accepted, and gated by shakeout G2.
+fn arm_has_counterpart(env: &Effects, loc: &Loc, dir: u32) -> bool {
+    let (at_arm, at_unknown): (&[ChanOp], &[ChanOp]) = if dir == 1 {
+        (
+            &[ChanOp::Recv, ChanOp::Close],
+            &[ChanOp::Recv, ChanOp::Select, ChanOp::Close],
+        )
+    } else {
+        (
+            &[ChanOp::Send, ChanOp::Close],
+            &[ChanOp::Send, ChanOp::Select, ChanOp::Close],
+        )
+    };
+    let any_of = |l: &Loc, set: &[ChanOp]| {
+        env.chan_ops
+            .get(l)
+            .is_some_and(|ops| set.iter().any(|u| ops.contains(u)))
+    };
+    any_of(loc, at_arm) || any_of(&Loc::unknown(), at_unknown)
+}
+
 /// Blocking-op capacity classification (Task 6 refinement over the raw
 /// syntactic candidate): distinguishes a genuinely reachability-only
 /// block (`Unbuffered` — no buffer can ever save it) from a buffered
@@ -882,23 +926,21 @@ impl Checker for LeakChecker {
         let mut out = Vec::new();
         for cand in candidates(p, func) {
             // Select: every arm's channel must pass the escape check, and
-            // no arm may have a counterpart (each arm behaves like a Send
-            // or a Recv in its own right — dir 1 = send, 2 = recv).
-            // Send/Recv use the candidate's single loc.
+            // no arm may have a counterpart — per arm, via
+            // `arm_has_counterpart` (dir 1 = send arm, 2 = recv arm),
+            // whose same-loc set excludes `Select` so the candidate's own
+            // select can't suppress it. Send/Recv use the candidate's
+            // single loc and the generic table (an op is never in its own
+            // unblocker set there, so no self-match is possible).
             let (escaped, suppressed) = match cand.kind {
                 CandKind::Select => (
                     cand.arm_locs.iter().any(|(_, l)| match &l.root {
                         Root::Alloc(a) => escapes(func, ValueId(*a)),
                         _ => true,
                     }),
-                    cand.arm_locs.iter().any(|(dir, l)| {
-                        let k = if *dir == 1 {
-                            CandKind::Send
-                        } else {
-                            CandKind::Recv
-                        };
-                        has_counterpart(env, l, k)
-                    }),
+                    cand.arm_locs
+                        .iter()
+                        .any(|(dir, l)| arm_has_counterpart(env, l, *dir)),
                 ),
                 k => (
                     escapes(func, cand.alloc_value),
@@ -1643,10 +1685,12 @@ mod tests {
         assert!(has_counterpart(&Effects::empty(), &l, CandKind::Select));
     }
 
-    /// Simulates Task 7's per-arm select dispatch (dir 1 = send arm →
-    /// `CandKind::Send`, dir 2 = recv arm → `CandKind::Recv`): "any arm
-    /// pairs" is true when at least one arm's own direction-appropriate
-    /// counterpart exists in the env, false for an empty env.
+    /// The per-arm select dispatch (`arm_has_counterpart`, dir 1 = send
+    /// arm, 2 = recv arm): "any arm pairs" is true when at least one arm's
+    /// own direction-appropriate counterpart exists in the env, false for
+    /// an empty env. Updated in the select-self-suppression fix — the
+    /// dispatch used to call `has_counterpart(.., Send/Recv)`, whose
+    /// unblocker sets include `Select`.
     #[test]
     fn select_arm_dispatch_suppressed_if_any_arm_matched() {
         let la = Loc {
@@ -1659,14 +1703,9 @@ mod tests {
         };
         let arm_locs: Vec<(u32, Loc)> = vec![(1, la.clone()), (2, lb.clone())];
         let dispatch = |env: &Effects| {
-            arm_locs.iter().any(|(dir, loc)| {
-                let kind = if *dir == 1 {
-                    CandKind::Send
-                } else {
-                    CandKind::Recv
-                };
-                has_counterpart(env, loc, kind)
-            })
+            arm_locs
+                .iter()
+                .any(|(dir, loc)| arm_has_counterpart(env, loc, *dir))
         };
         let env = env_with(la.clone(), &[ChanOp::Recv]);
         assert!(dispatch(&env), "the send arm can pair via Recv on la");
@@ -1674,6 +1713,52 @@ mod tests {
             !dispatch(&Effects::empty()),
             "an empty env leaves no arm able to pair"
         );
+    }
+
+    /// The self-suppression regression: the candidate's OWN select is in
+    /// `env` at every arm loc (the spawned closure's ops rebase there), so
+    /// a same-loc `Select` must NOT count as an unblocker — otherwise
+    /// `chan-select-leak` is unfireable for every input.
+    #[test]
+    fn select_arm_not_suppressed_by_its_own_select_at_arm_locs() {
+        let la = Loc {
+            root: Root::Alloc(2),
+            path: vec![],
+        };
+        let lb = Loc {
+            root: Root::Alloc(3),
+            path: vec![],
+        };
+        let mut env = env_with(la.clone(), &[ChanOp::Select, ChanOp::Make]);
+        env.chan_ops
+            .entry(lb.clone())
+            .or_default()
+            .extend([ChanOp::Select, ChanOp::Make]);
+        assert!(
+            !arm_has_counterpart(&env, &la, 1),
+            "a send arm must not be unblocked by the candidate's own select"
+        );
+        assert!(
+            !arm_has_counterpart(&env, &lb, 2),
+            "a recv arm must not be unblocked by the candidate's own select"
+        );
+    }
+
+    /// A `Select` at `Loc::unknown()` is necessarily FOREIGN (the
+    /// candidate's own select rebases to its known `Alloc` arm locs), so
+    /// the may-alias rule still lets it suppress.
+    #[test]
+    fn select_arm_suppressed_by_unknown_loc_select() {
+        let la = Loc {
+            root: Root::Alloc(2),
+            path: vec![],
+        };
+        let env = env_with(Loc::unknown(), &[ChanOp::Select]);
+        assert!(
+            arm_has_counterpart(&env, &la, 1),
+            "an unresolvable-elsewhere Select must still count (may-alias rule)"
+        );
+        assert!(arm_has_counterpart(&env, &la, 2), "same for a recv arm");
     }
 
     // -- cap_class -------------------------------------------------------
@@ -2148,6 +2233,50 @@ mod tests {
             findings.iter().all(|f| f.tag == "chan-send-leak"),
             "{findings:?}"
         );
+    }
+
+    /// The `LeakSelectAllBlocked` shape, end to end: two unbuffered makes
+    /// bound into a closure, the closure blocking-selects (recv arms) over
+    /// both, and the spawner does nothing else with either channel. Pins
+    /// the self-suppression fix at the engine layer — before it, the
+    /// candidate's own select (folded into `f`'s converged effects at both
+    /// arm locs) suppressed every arm and this reported nothing.
+    #[test]
+    fn select_all_blocked_reports_via_z3() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![const_int_aux(1, 0), fn_aux(2, "t.F$1")],
+                    vec![block(
+                        0,
+                        vec![
+                            gvir_make_chan(3, 1),
+                            gvir_make_chan(4, 1),
+                            make_closure(5, 2, vec![3, 4]),
+                            go_call_via_closure("t.F$1", 5),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_free_vars(
+                    "t.F$1",
+                    vec![1, 2],
+                    vec![block(
+                        0,
+                        vec![select(3, vec![(2, 1, 0), (2, 2, 0)], true), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+            ],
+        )]);
+        let findings = run_leak(&p);
+        assert_eq!(findings.len(), 1, "exactly one finding: {findings:?}");
+        assert_eq!(findings[0].checker, "goroutine-leak");
+        assert_eq!(findings[0].tag, "chan-select-leak");
+        assert_eq!(findings[0].severity, Severity::Error);
     }
 
     #[test]

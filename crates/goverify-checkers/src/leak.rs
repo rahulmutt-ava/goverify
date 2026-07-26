@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use goverify_analysis::{Loc, Root, closure_bindings, fv_loc, resolve_loc};
+use goverify_analysis::{Loc, MAX_LOC_DEPTH, Root, closure_bindings, fv_loc, resolve_loc};
 use goverify_ir::{Callee, FuncId, Function, Op, Pos, Program, ValueId};
 
 /// The blocking-op shape a [`Candidate`] was found at.
@@ -76,7 +76,14 @@ fn arg_loc(f: &Function, args: &[ValueId], i: u32) -> Loc {
 /// mirrors `goverify_analysis::effects`'s private per-call-site
 /// `rebase_loc`, specialized to a single `Loc` (that helper works over a
 /// whole `Effects` map and is private to goverify-analysis; duplicating
-/// just this much of its logic here is cheaper than exposing it).
+/// just this much of its logic here is cheaper than exposing it). The
+/// caller-side and callee-side paths are each individually capped at
+/// `MAX_LOC_DEPTH` by their own `resolve_loc` call, but concatenating two
+/// depth-2 paths can still produce a depth-3/4 result — degrade to
+/// `Loc::unknown()` in that case too (matching `rebase_loc`'s own
+/// `.capped()` call), since every `Loc` key an `Effects` map can ever
+/// hold is itself capped: an uncapped deep `Loc` here would be a key that
+/// can never match anything, silently dropping a real counterpart.
 fn map_through_site(
     callee_loc: &Loc,
     f: &Function,
@@ -94,6 +101,9 @@ fn map_through_site(
     }
     let mut path = base.path;
     path.extend(callee_loc.path.iter().copied());
+    if path.len() > MAX_LOC_DEPTH {
+        return Loc::unknown();
+    }
     Loc {
         root: base.root,
         path,
@@ -361,24 +371,52 @@ pub(crate) fn escapes(f: &Function, ch: ValueId) -> bool {
         for b in &f.blocks {
             for ins in &b.instrs {
                 match &ins.op {
-                    Op::Load { dst, addr } if chans.contains(addr) && chans.insert(*dst) => {
-                        changed = true;
+                    // Alias-extender ops grow *both* sets independently:
+                    // an op whose source is a tracked channel extends
+                    // `chans`; one whose source is a tracked closure
+                    // extends `closures`. Growing only `chans` here would
+                    // let a closure value get laundered through a bare
+                    // `Assign`/`Convert`/`Phi`/`Load` (e.g. Go's
+                    // `type H func(); return H(f)` lowers to
+                    // `Op::Assign`) and escape undetected, since
+                    // `instr_escapes` wholesale-whitelists these ops on
+                    // the assumption that aliasing already tracked the
+                    // def through them.
+                    Op::Load { dst, addr } => {
+                        if chans.contains(addr) && chans.insert(*dst) {
+                            changed = true;
+                        }
+                        if closures.contains(addr) && closures.insert(*dst) {
+                            changed = true;
+                        }
                     }
-                    Op::Assign { dst, src } | Op::Convert { dst, src }
-                        if chans.contains(src) && chans.insert(*dst) =>
-                    {
-                        changed = true;
+                    Op::Assign { dst, src } | Op::Convert { dst, src } => {
+                        if chans.contains(src) && chans.insert(*dst) {
+                            changed = true;
+                        }
+                        if closures.contains(src) && closures.insert(*dst) {
+                            changed = true;
+                        }
                     }
-                    Op::Phi { dst, edges }
-                        if edges.iter().any(|e| chans.contains(e)) && chans.insert(*dst) =>
-                    {
-                        changed = true;
+                    Op::Phi { dst, edges } => {
+                        if edges.iter().any(|e| chans.contains(e)) && chans.insert(*dst) {
+                            changed = true;
+                        }
+                        if edges.iter().any(|e| closures.contains(e)) && closures.insert(*dst) {
+                            changed = true;
+                        }
                     }
                     Op::Store { addr, val } if chans.contains(addr) && chans.insert(*val) => {
                         changed = true;
                     }
+                    // A binding may itself be a tracked closure (nested
+                    // capture), not just a tracked channel directly —
+                    // check both sets, not `chans` alone.
                     Op::MakeClosure { dst, bindings, .. }
-                        if bindings.iter().any(|b| chans.contains(b)) && closures.insert(*dst) =>
+                        if bindings
+                            .iter()
+                            .any(|b| chans.contains(b) || closures.contains(b))
+                            && closures.insert(*dst) =>
                     {
                         changed = true;
                     }
@@ -416,9 +454,10 @@ mod tests {
 
     use super::*;
     use crate::testfix::{
-        alloc_instr, block, call_builtin, call_static, const_int_aux, fn_aux, func_with_aux,
-        func_with_free_vars, func_with_params, go_call_args, go_call_dynamic, go_call_via_closure,
-        gvir_make_chan, make_closure, make_interface_instr, pkg, recv, ret, select, send, store,
+        alloc_instr, block, call_builtin, call_static, change_type_instr, const_int_aux,
+        field_addr_on, fn_aux, func_with_aux, func_with_free_vars, func_with_params, go_call_args,
+        go_call_dynamic, go_call_via_closure, gvir_make_chan, load_instr, make_closure,
+        make_interface_instr, pkg, recv, ret, select, send, store,
     };
 
     /// F: v2 = make(chan); go t.G(v2). G(p1): p1 <- x.
@@ -878,5 +917,148 @@ mod tests {
         )]);
         let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
         assert!(escapes(f, ValueId(2)), "MakeInterface.src must escape");
+    }
+
+    /// Review finding 1 (false-positive path): a closure captured over
+    /// the channel, laundered through a bare `Op::Assign` (Go's
+    /// `type H func(); return H(f)` lowers `ChangeType` to exactly this),
+    /// then returned. The `closures` alias set must grow through
+    /// alias-extender ops the same way `chans` does, or this escape goes
+    /// undetected (the laundered value is untracked, so `Return`'s
+    /// fallback check sees nothing).
+    #[test]
+    fn closure_alias_laundered_through_assign_and_returned_escapes() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![func_with_aux(
+                "t.F",
+                vec![fn_aux(1, "t.F$1")],
+                vec![block(
+                    0,
+                    vec![
+                        gvir_make_chan(2, 1),
+                        make_closure(3, 1, vec![2]),
+                        change_type_instr(4, 3),
+                        ret(vec![4]),
+                    ],
+                    vec![],
+                )],
+            )],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        assert!(
+            escapes(f, ValueId(2)),
+            "a closure alias laundered through Assign must still escape"
+        );
+    }
+
+    /// Review finding 2 (false-positive path): a caller-side path already
+    /// at depth 2 (two `FieldAddr` hops off an `Alloc`) composed with a
+    /// callee-side path of depth 1 exceeds `MAX_LOC_DEPTH` — the combined
+    /// `Loc` must degrade to `Unknown` (never surface an uncapped depth-3
+    /// `Loc` that no `Effects` key could ever equal), so `candidates`
+    /// finds nothing here.
+    #[test]
+    fn deep_composed_path_degrades_to_unknown_and_yields_no_candidate() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![const_int_aux(1, 0)],
+                    vec![block(
+                        0,
+                        vec![
+                            alloc_instr(2),
+                            field_addr_on(3, 2),
+                            field_addr_on(4, 3),
+                            go_call_args("t.W", vec![4]),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.W",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "s".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(
+                        0,
+                        vec![field_addr_on(2, 1), recv(3, 2), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        assert!(
+            candidates(&p, f).is_empty(),
+            "a depth-3 composed path must degrade to Unknown, not yield a candidate"
+        );
+    }
+
+    /// Review finding 3 (coverage gap): the real closure-capture shape,
+    /// where `MakeClosure`'s binding is an `Alloc` CELL rather than the
+    /// `MakeChan` register itself (`ch := make(chan int); go func(){
+    /// <-ch }()` lowers to: alloc the cell, make the channel, store it
+    /// into the cell, capture the cell). The callee reaches the channel
+    /// through a `Load` of its `FreeVar` (the captured cell pointer);
+    /// `resolve_loc` collapses that `Load` hop (deref-collapsing, per
+    /// `resolve_loc`'s own doc comment), so the callee-side `Loc` stays
+    /// `FreeVar(0)` with an empty path — the candidate must land on the
+    /// CELL's `Alloc` site (register 2), not the `MakeChan` register
+    /// (register 3). This is the shape Task 6's cell→Make bridge is
+    /// built against.
+    #[test]
+    fn closure_capture_via_cell_yields_recv_candidate_at_cell_alloc() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![fn_aux(1, "t.F$1")],
+                    vec![block(
+                        0,
+                        vec![
+                            alloc_instr(2),
+                            gvir_make_chan(3, 1),
+                            store(2, 3),
+                            make_closure(4, 1, vec![2]),
+                            go_call_via_closure("t.F$1", 4),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_free_vars(
+                    "t.F$1",
+                    vec![1],
+                    vec![block(
+                        0,
+                        vec![load_instr(2, 1), recv(3, 2), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let cands = candidates(&p, f);
+        assert_eq!(cands.len(), 1, "exactly one candidate: {cands:?}");
+        assert_eq!(cands[0].kind, CandKind::Recv);
+        assert_eq!(
+            cands[0].alloc_value,
+            ValueId(2),
+            "must land on the CELL's alloc site, not the MakeChan register"
+        );
+        assert_eq!(
+            cands[0].spawner_loc,
+            Loc {
+                root: Root::Alloc(2),
+                path: vec![]
+            }
+        );
     }
 }

@@ -577,6 +577,37 @@ pub(crate) fn make_interface_instr(register: u32, src_operand: u32) -> gvir::Ins
     }
 }
 
+/// `v<dst_reg> = <named-type-conversion>(src)` — a representation-
+/// preserving SSA rename (e.g. `type H func(); H(f)`): mirrors lower.rs's
+/// `"ChangeType" => Op::Assign{dst, src}` arm, distinct from
+/// `convert_instr`'s `Op::Convert` (a real representation change). Needed
+/// for leak.rs's escape-walk fixtures pinning that a closure alias
+/// laundered through `Op::Assign` is still tracked.
+pub(crate) fn change_type_instr(dst_reg: u32, src: u32) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "ChangeType".into(),
+        register: dst_reg,
+        operands: vec![src],
+        ..Default::default()
+    }
+}
+
+/// `*addr` — a pointer dereference load. gvir has no standalone "Load"
+/// wire kind: this lowers from kind "UnOp" with `Sem::Unop{op: "*"}`
+/// (lower.rs ~line 201), mirroring `recv`'s "UnOp"/`"<-"` shape.
+pub(crate) fn load_instr(register: u32, addr_operand: u32) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "UnOp".into(),
+        register,
+        operands: vec![addr_operand],
+        sem: Some(Sem::Unop(gvir::UnOpSem {
+            op: "*".into(),
+            comma_ok: false,
+        })),
+        ..Default::default()
+    }
+}
+
 pub(crate) fn z3_discharge() -> impl FnMut(&Query) -> SatResult {
     let mut solver = Z3Native::new(SolverLimits {
         timeout_ms: 5_000,

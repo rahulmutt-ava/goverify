@@ -23,5 +23,5 @@ pub use nil::NilChecker;
 /// list, so it lives here rather than being duplicated at each call
 /// site.
 pub fn default_checkers() -> Vec<&'static dyn goverify_analysis::Checker> {
-    vec![&NilChecker, &BoundsChecker]
+    vec![&NilChecker, &BoundsChecker, &LeakChecker]
 }

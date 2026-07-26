@@ -26,6 +26,7 @@ use goverify_spec::{ANNOTATION_VERSION, compile_program};
 const KNOWN: &[&str] = &[
     "nil",
     "bounds",
+    "goroutine-leak",
     "contract",
     "bad-annotation",
     "unverified-annotation",

@@ -6,28 +6,26 @@
 //! `f` stops referencing the channel. This module owns the two pure,
 //! syntactic passes: `candidates` (v1: a syntactically-direct scan of a
 //! spawned callee's own body for blocking ops) and `escapes` (a
-//! whitelist-based alias/use walk, spec §2 rule 2's strict form). Task 6
-//! adds counterpart/capacity reasoning (does anything else ever unblock
-//! this op?); Task 7 wires both into the `Checker` impl.
-//!
-//! `#![allow(dead_code)]`: every item below `candidates`/`escapes`
-//! themselves is exercised only by this module's own `#[cfg(test)]`
-//! block until Task 7 wires them into a `Checker` impl — the same
-//! "prefer `#[allow(dead_code)]` + a note over a tautological test"
-//! call the phase-7 plan's Task 4 carry-forward already made for this
-//! exact staged-wiring situation. Drop this once Task 7 lands.
-#![allow(dead_code)]
+//! whitelist-based alias/use walk, spec §2 rule 2's strict form), plus
+//! counterpart/capacity reasoning (does anything else ever unblock this
+//! op?) and the `Checker` impl that turns a surviving candidate into a
+//! conjoined SMT query: the spawn site is reachable in `f` AND the
+//! blocking op is reachable in the spawned callee (whose consts are
+//! prefix-renamed so the two encodings share no names), AND — for a
+//! buffered send — the buffer is already full when it fires.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use goverify_analysis::{
-    ChanOp, Effects, Loc, MAX_LOC_DEPTH, Root, closure_bindings, cyclic_blocks, fv_loc, resolve_loc,
+    ChanOp, Checker, Clause, Effects, EncodedFunc, Loc, MAX_LOC_DEPTH, Obligation, Root, Summary,
+    closure_bindings, cyclic_blocks, encode_func_with, fv_loc, resolve_loc,
 };
 use goverify_ir::{
     Callee, ConstVal, FuncId, Function, MakeKind, Op, Pos, Program, ValueId, ValueKind,
 };
+use goverify_solver::{BvBinOp, BvCmpOp, Query, SatResult, Term};
 
-use crate::shared::canonical_value;
+use crate::shared::{canonical_value, own_preconditions};
 
 /// The blocking-op shape a [`Candidate`] was found at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +50,19 @@ pub(crate) struct Candidate {
     pub callee: FuncId,
     /// Block index of the blocking op in `callee`.
     pub op_block: usize,
+    /// Instruction index of the blocking op within `op_block` — the
+    /// buffered-send ordinal conjunct counts the sends that precede the
+    /// candidate inside its own block, so it needs the offset, not just
+    /// the block.
+    pub op_instr: usize,
     pub kind: CandKind,
+    /// The blocking op's channel resolved in the CALLEE's own frame
+    /// (before `map_through_site` re-roots it into `f`) — the key the
+    /// ordinal conjunct counts callee-side sends against. `Loc::unknown()`
+    /// for a `Select` candidate (whose arms each have their own, and which
+    /// never gets an ordinal conjunct: `cap_class` classifies a select as
+    /// `Unbuffered` or `Silent`, never `BufferedConst`).
+    pub callee_loc: Loc,
     /// `Root::Alloc` id in `f` — the escape/capacity subject.
     pub alloc_value: ValueId,
     /// Alloc-rooted `Loc` in `f` — the counterpart key.
@@ -149,7 +159,7 @@ pub(crate) fn candidates(p: &Program, f: &Function) -> Vec<Candidate> {
                 continue;
             }
             for (op_block, cblk) in callee_f.blocks.iter().enumerate() {
-                for cins in &cblk.instrs {
+                for (op_instr, cins) in cblk.instrs.iter().enumerate() {
                     match &cins.op {
                         Op::Send { chan, .. } => {
                             let callee_loc = resolve_loc(callee_f, *chan);
@@ -160,7 +170,9 @@ pub(crate) fn candidates(p: &Program, f: &Function) -> Vec<Candidate> {
                                     go_pos: ins.pos.clone(),
                                     callee: c,
                                     op_block,
+                                    op_instr,
                                     kind: CandKind::Send,
+                                    callee_loc,
                                     alloc_value: ValueId(a),
                                     spawner_loc: mapped,
                                     arm_locs: Vec::new(),
@@ -176,7 +188,9 @@ pub(crate) fn candidates(p: &Program, f: &Function) -> Vec<Candidate> {
                                     go_pos: ins.pos.clone(),
                                     callee: c,
                                     op_block,
+                                    op_instr,
                                     kind: CandKind::Recv,
+                                    callee_loc,
                                     alloc_value: ValueId(a),
                                     spawner_loc: mapped,
                                     arm_locs: Vec::new(),
@@ -215,7 +229,9 @@ pub(crate) fn candidates(p: &Program, f: &Function) -> Vec<Candidate> {
                                 go_pos: ins.pos.clone(),
                                 callee: c,
                                 op_block,
+                                op_instr,
                                 kind: CandKind::Select,
+                                callee_loc: Loc::unknown(),
                                 alloc_value: ValueId(a),
                                 spawner_loc: mapped_arms[0].1.clone(),
                                 arm_locs: mapped_arms,
@@ -630,17 +646,314 @@ pub(crate) fn cap_class(p: &Program, f: &Function, cand: &Candidate) -> CapClass
     }
 }
 
-/// Placeholder for Task 7's `Checker` impl: declared now (with no
-/// `Checker` impl yet) purely so `pub use leak::LeakChecker;` in lib.rs
-/// has something to re-export. `default_checkers()` deliberately does
-/// NOT include it yet — that wiring, plus the trait impl itself, is
-/// Task 7's job.
+/// Renames every const in `q` with `prefix`, substituting in all asserts.
+/// Returns `None` if substitution fails (a sort mismatch can't happen for
+/// a pure rename, but degrade rather than unwrap on adversarial input).
+/// The point: the spawner's and the spawned callee's encodings are two
+/// independent frames that both name their blocks `g0`, `g1`, … and their
+/// params `p0`, `p1`, … — conjoining them unrenamed would silently
+/// identify the two functions' guards and values.
+fn prefixed(q: &Query, prefix: &str) -> Option<Query> {
+    let map: std::collections::BTreeMap<String, Term> = q
+        .consts
+        .iter()
+        .map(|(n, s)| (n.clone(), Term::var(&format!("{prefix}{n}"), s.clone())))
+        .collect();
+    let mut asserts = Vec::with_capacity(q.asserts.len());
+    for t in &q.asserts {
+        asserts.push(t.substitute(&map).ok()?);
+    }
+    Some(Query {
+        logic: q.logic,
+        datatypes: q.datatypes.clone(),
+        consts: q
+            .consts
+            .iter()
+            .map(|(n, s)| (format!("{prefix}{n}"), s.clone()))
+            .collect(),
+        asserts,
+    })
+}
+
+/// f-side query ∧ prefix-renamed callee-side query. Both encodings share
+/// the same two datatype decls (Ptr, GoSeq), so `fq`'s set is kept as-is
+/// (`cq`'s would be a duplicate declaration). Consts are sorted and
+/// deduped for canonical determinism.
+fn conjoin(mut fq: Query, cq: Query) -> Query {
+    fq.consts.extend(cq.consts);
+    fq.consts.sort();
+    fq.consts.dedup();
+    fq.asserts.extend(cq.asserts);
+    fq
+}
+
+/// Every block that can precede `block` on a DAG path — reverse
+/// reachability over `dag_succs` (back edges already cut by the encoder),
+/// STRICT: `block` itself is never included. Ascending order, so the
+/// ordinal sum below is built in a deterministic sequence. Total: an
+/// out-of-range successor id (crafted `.gvir`) is ignored, and `block >=
+/// dag_succs.len()` yields an empty ancestor set.
+fn strict_ancestors(dag_succs: &[Vec<u32>], block: usize) -> Vec<usize> {
+    let n = dag_succs.len();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, succs) in dag_succs.iter().enumerate() {
+        for &s in succs {
+            if (s as usize) < n {
+                preds[s as usize].push(b);
+            }
+        }
+    }
+    let mut seen = vec![false; n];
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    if block < n {
+        seen[block] = true;
+        queue.push_back(block);
+    }
+    while let Some(b) = queue.pop_front() {
+        for &pb in &preds[b] {
+            if !seen[pb] {
+                seen[pb] = true;
+                queue.push_back(pb);
+            }
+        }
+    }
+    (0..n).filter(|&b| seen[b] && b != block).collect()
+}
+
+/// How many `Op::Send` instrs in callee block `b` send on `loc` (resolved
+/// in the callee's own frame). `upto` bounds the scan to instrs strictly
+/// before that index — used for the candidate's own block, where only the
+/// sends that precede it have already filled the buffer; `None` counts the
+/// whole block.
+fn sends_on_loc_in(callee_f: &Function, b: usize, loc: &Loc, upto: Option<usize>) -> u64 {
+    let Some(blk) = callee_f.blocks.get(b) else {
+        return 0;
+    };
+    blk.instrs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| upto.is_none_or(|u| *i < u))
+        .filter(|(_, ins)| {
+            matches!(&ins.op, Op::Send { chan, .. } if resolve_loc(callee_f, *chan) == *loc)
+        })
+        .count() as u64
+}
+
+/// The buffered-send ordinal conjunct (spec §2): a send on a channel with
+/// const capacity `cap` blocks forever only if the buffer is ALREADY full
+/// when it fires and nothing ever drains it (the counterpart check has
+/// already established there is no receive/close/select anywhere). The
+/// fill count at the candidate is
+///
+/// ```text
+/// pending = <sends on this loc before the candidate in its own block>
+///         + Σ over strict ancestors b: ite(g_b, <sends on this loc in b>, 0)
+/// ```
+///
+/// and the candidate is blocked iff `pending >= cap`. `BvCmpOp` has no
+/// unsigned-≥ variant, so that is encoded as `¬(pending <u cap)`. All
+/// arithmetic is 32-bit: a capacity or a send count that doesn't fit
+/// (crafted `.gvir`), a sum that would wrap the counter, a missing guard
+/// term, or any term-construction error yields `None` — the caller skips
+/// the candidate rather than emitting a query built on a wrapped count.
+fn ordinal_conjunct(
+    callee_f: &Function,
+    enc_c: &EncodedFunc,
+    cand: &Candidate,
+    cap: u64,
+) -> Option<Term> {
+    let cap = u32::try_from(cap).ok()?;
+    let mut total = sends_on_loc_in(
+        callee_f,
+        cand.op_block,
+        &cand.callee_loc,
+        Some(cand.op_instr),
+    );
+    let mut pending = Term::bv_lit(32, u128::from(u32::try_from(total).ok()?));
+    for b in strict_ancestors(&enc_c.dag_succs, cand.op_block) {
+        let n = sends_on_loc_in(callee_f, b, &cand.callee_loc, None);
+        if n == 0 {
+            continue;
+        }
+        total = total.checked_add(n)?;
+        let n = u32::try_from(n).ok()?;
+        u32::try_from(total).ok()?; // the running sum must not wrap
+        let inc = Term::ite(
+            enc_c.guards.get(b)?.clone(),
+            Term::bv_lit(32, u128::from(n)),
+            Term::bv_lit(32, 0),
+        )
+        .ok()?;
+        pending = Term::bv_bin(BvBinOp::Add, pending, inc).ok()?;
+    }
+    let below = Term::bv_cmp(BvCmpOp::Ult, pending, Term::bv_lit(32, u128::from(cap))).ok()?;
+    Term::not(below).ok()
+}
+
+/// The obligation tag/message pair for a candidate's shape. Position-free
+/// by construction (`Obligation::message`'s invariant): the callee's name
+/// is deterministic and independent of where it sits in the file.
+fn tag_and_message(p: &Program, cand: &Candidate) -> (&'static str, String) {
+    let callee = p.func_name(cand.callee);
+    match cand.kind {
+        CandKind::Send => (
+            "chan-send-leak",
+            format!(
+                "goroutine {callee} may block forever: send on a spawner-created channel with no receive, close, or select in the spawning environment"
+            ),
+        ),
+        CandKind::Recv => (
+            "chan-recv-leak",
+            format!(
+                "goroutine {callee} may block forever: receive on a spawner-created channel with no send, close, or select"
+            ),
+        ),
+        CandKind::Select => (
+            "chan-select-leak",
+            format!(
+                "goroutine {callee} may block forever: blocking select whose channels have no counterpart operations"
+            ),
+        ),
+    }
+}
+
+/// The goroutine-leak checker (phase-7 spec §2). Obligations only: a leak
+/// is a property of a spawn site, not a contract, so nothing lifts to a
+/// requires/ensures clause.
 pub struct LeakChecker;
+
+impl Checker for LeakChecker {
+    fn name(&self) -> &'static str {
+        "goroutine-leak"
+    }
+
+    // bump on any semantic change to this checker's obligations.
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn infer_requires(
+        &self,
+        _p: &Program,
+        _f: FuncId,
+        _summary_of: &dyn Fn(FuncId) -> Summary,
+        _discharge: &mut dyn FnMut(&Query) -> SatResult,
+    ) -> Vec<Clause> {
+        Vec::new() // leaks are not contracts; nothing lifts (spec §4)
+    }
+
+    fn obligations(
+        &self,
+        p: &Program,
+        f: FuncId,
+        summary_of: &dyn Fn(FuncId) -> Summary,
+    ) -> Vec<Obligation> {
+        let Some(func) = p.func(f) else {
+            return Vec::new();
+        };
+        // Encode `f` once, before the candidate loop: an encoding failure
+        // (e.g. past the assertion cap) means no obligations at all — the
+        // engine's own probe already emitted the diagnostic.
+        let Ok(enc_f) = encode_func_with(p, f, summary_of) else {
+            return Vec::new();
+        };
+        let own = summary_of(f);
+        let env = &own.effects;
+        let pre_f = own_preconditions(&own);
+        // Several `go` sites often share a callee; encode each at most
+        // once. Lookup-only (never iterated), so no map order can reach
+        // the output.
+        let mut enc_cache: HashMap<FuncId, Option<EncodedFunc>> = HashMap::new();
+        // Two blocking ops on the same channel in the same callee block
+        // (`go func() { ch <- 1; ch <- 2 }()` on an unbuffered channel)
+        // are distinct candidates that produce the SAME obligation: same
+        // tag, same message, same `go`-site position, and — since the
+        // instruction offset only enters the query through the buffered
+        // ordinal conjunct — a byte-identical query. Emitting both would
+        // render the same finding (same fingerprint) twice. Keyed on the
+        // canonical query text, so a buffered send whose ordinal count
+        // genuinely differs still gets its own obligation. Lookup-only
+        // (never iterated), so no map order reaches the output.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::new();
+        for cand in candidates(p, func) {
+            // Select: every arm's channel must pass the escape check, and
+            // no arm may have a counterpart (each arm behaves like a Send
+            // or a Recv in its own right — dir 1 = send, 2 = recv).
+            // Send/Recv use the candidate's single loc.
+            let (escaped, suppressed) = match cand.kind {
+                CandKind::Select => (
+                    cand.arm_locs.iter().any(|(_, l)| match &l.root {
+                        Root::Alloc(a) => escapes(func, ValueId(*a)),
+                        _ => true,
+                    }),
+                    cand.arm_locs.iter().any(|(dir, l)| {
+                        let k = if *dir == 1 {
+                            CandKind::Send
+                        } else {
+                            CandKind::Recv
+                        };
+                        has_counterpart(env, l, k)
+                    }),
+                ),
+                k => (
+                    escapes(func, cand.alloc_value),
+                    has_counterpart(env, &cand.spawner_loc, k),
+                ),
+            };
+            if escaped || suppressed {
+                continue;
+            }
+            let class = cap_class(p, func, &cand);
+            if class == CapClass::Silent {
+                continue;
+            }
+            let Some(callee_f) = p.func(cand.callee) else {
+                continue;
+            };
+            let enc_c = enc_cache
+                .entry(cand.callee)
+                .or_insert_with(|| encode_func_with(p, cand.callee, summary_of).ok());
+            let Some(enc_c) = enc_c.as_ref() else {
+                continue; // callee encoding failed: skip, never report
+            };
+            let mut extra = own_preconditions(&summary_of(cand.callee));
+            if let CapClass::BufferedConst(cap) = class {
+                let Some(full) = ordinal_conjunct(callee_f, enc_c, &cand, cap) else {
+                    continue;
+                };
+                extra.push(full);
+            }
+            let Some(cq) = prefixed(&enc_c.reach_query(cand.op_block, extra), "s_") else {
+                continue;
+            };
+            let (tag, message) = tag_and_message(p, &cand);
+            let ob = Obligation {
+                tag: tag.into(),
+                message,
+                pos: cand.go_pos.clone(),
+                query: conjoin(enc_f.reach_query(cand.go_block, pre_f.clone()), cq),
+            };
+            if seen.insert(format!(
+                "{}|{}|{:?}|{}",
+                ob.tag,
+                ob.message,
+                ob.pos,
+                ob.query.canonical_text()
+            )) {
+                out.push(ob);
+            }
+        }
+        out
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use goverify_analysis::{EngineConfig, Finding, Severity, analyze_full};
     use goverify_extract::gvir;
     use goverify_ir::Program;
+    use goverify_solver::{Logic, SolverLimits, Sort, Z3Native};
 
     use super::*;
     use crate::testfix::{
@@ -1556,7 +1869,9 @@ mod tests {
             go_pos: None,
             callee: g,
             op_block: 0,
+            op_instr: 0,
             kind: CandKind::Send,
+            callee_loc: Loc::unknown(),
             alloc_value: ValueId(4),
             spawner_loc: Loc {
                 root: Root::Alloc(4),
@@ -1599,7 +1914,9 @@ mod tests {
             go_pos: None,
             callee: g,
             op_block: 0,
+            op_instr: 0,
             kind: CandKind::Send,
+            callee_loc: Loc::unknown(),
             alloc_value: ValueId(4),
             spawner_loc: Loc {
                 root: Root::Alloc(4),
@@ -1645,5 +1962,199 @@ mod tests {
         let cands = candidates(&p, f);
         assert_eq!(cands.len(), 1, "exactly one candidate: {cands:?}");
         assert_eq!(cap_class(&p, f, &cands[0]), CapClass::Unbuffered);
+    }
+
+    // -- query construction ----------------------------------------------
+
+    #[test]
+    fn prefixed_renames_consts_and_free_vars() {
+        let q = Query {
+            logic: Logic::All,
+            datatypes: vec![],
+            consts: vec![("g0".into(), Sort::Bool)],
+            asserts: vec![Term::var("g0", Sort::Bool)],
+        };
+        let pq = prefixed(&q, "s_").expect("pure rename cannot fail");
+        assert_eq!(pq.consts, vec![("s_g0".into(), Sort::Bool)]);
+        let fv = pq.asserts[0].free_vars();
+        assert!(fv.contains_key("s_g0") && !fv.contains_key("g0"), "{fv:?}");
+    }
+
+    // -- end-to-end (engine + Z3) -----------------------------------------
+
+    /// The full engine path: the leak checker is the only registered
+    /// checker, backed by a real Z3, so a finding here means the conjoined
+    /// spawn/block query actually came back Sat.
+    fn run_leak(p: &Program) -> Vec<Finding> {
+        let cfg = EngineConfig::default();
+        let checkers: Vec<&dyn Checker> = vec![&LeakChecker];
+        analyze_full(p, &cfg, &checkers, &|_role| {
+            Box::new(Z3Native::new(SolverLimits {
+                timeout_ms: 5_000,
+                mem_mb: 1024,
+            }))
+        })
+        .findings
+    }
+
+    /// F: v2 = make(chan, 0); go t.G(v2); return. G(p1): p1 <- p1.
+    /// Nothing in F ever receives, closes or selects on v2, and v2 never
+    /// escapes F — the spawned send blocks forever.
+    fn spawn_and_send_pkg(f_blocks: Vec<gvir::BasicBlock>, cap: i64) -> Program {
+        Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux("t.F", vec![const_int_aux(1, cap)], f_blocks),
+                func_with_params(
+                    "t.G",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(0, vec![send(1, 1), ret(vec![])], vec![])],
+                ),
+            ],
+        )])
+    }
+
+    #[test]
+    fn leak_end_to_end_reports_via_z3() {
+        let p = spawn_and_send_pkg(
+            vec![block(
+                0,
+                vec![
+                    gvir_make_chan(2, 1),
+                    go_call_args("t.G", vec![2]),
+                    ret(vec![]),
+                ],
+                vec![],
+            )],
+            0,
+        );
+        let findings = run_leak(&p);
+        assert_eq!(findings.len(), 1, "exactly one finding: {findings:?}");
+        assert_eq!(findings[0].checker, "goroutine-leak");
+        assert_eq!(findings[0].tag, "chan-send-leak");
+        assert_eq!(findings[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn leak_suppressed_when_recv_follows_spawn() {
+        let p = spawn_and_send_pkg(
+            vec![block(
+                0,
+                vec![
+                    gvir_make_chan(2, 1),
+                    go_call_args("t.G", vec![2]),
+                    recv(3, 2),
+                    ret(vec![]),
+                ],
+                vec![],
+            )],
+            0,
+        );
+        let findings = run_leak(&p);
+        assert!(
+            findings.is_empty(),
+            "a receive in the spawning environment unblocks the send: {findings:?}"
+        );
+    }
+
+    /// The buffered-capacity ordinal conjunct: cap 3, four sends on the
+    /// channel in one acyclic callee block. The first three fit in the
+    /// buffer (pending < cap ⇒ the conjunct is false ⇒ Unsat ⇒ silent);
+    /// only the fourth is blocked, so exactly one finding survives.
+    #[test]
+    fn buffered_send_reports_only_past_capacity() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![const_int_aux(1, 3)],
+                    vec![block(
+                        0,
+                        vec![
+                            gvir_make_chan(2, 1),
+                            go_call_args("t.G", vec![2]),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.G",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(
+                        0,
+                        vec![send(1, 1), send(1, 1), send(1, 1), send(1, 1), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+            ],
+        )]);
+        let findings = run_leak(&p);
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the send past capacity blocks: {findings:?}"
+        );
+        assert_eq!(findings[0].tag, "chan-send-leak");
+    }
+
+    /// Two unbuffered sends on the same channel in the same callee block
+    /// are two candidates but ONE obligation (same tag/message/`go`-site
+    /// pos, byte-identical query) — the report must not carry the same
+    /// finding twice.
+    #[test]
+    fn identical_blocking_ops_report_once() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![const_int_aux(1, 0)],
+                    vec![block(
+                        0,
+                        vec![
+                            gvir_make_chan(2, 1),
+                            go_call_args("t.G", vec![2]),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.G",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(0, vec![send(1, 1), send(1, 1), ret(vec![])], vec![])],
+                ),
+            ],
+        )]);
+        let findings = run_leak(&p);
+        assert_eq!(
+            findings.len(),
+            1,
+            "duplicate blocking ops collapse to one finding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ignore_name_is_valid() {
+        assert!(
+            crate::default_checkers()
+                .iter()
+                .any(|c| c.name() == "goroutine-leak"),
+            "goroutine-leak must be a registered checker name"
+        );
     }
 }

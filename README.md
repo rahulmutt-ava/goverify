@@ -6,19 +6,22 @@ summaries, constraints discharged with Z3, aggressive content-addressed
 caching. Bug-finder first — high-confidence reports, false positives
 are the enemy.
 
-**Status:** early development. Phases 1-6 of the
+**Status:** early development. Phases 1-7 of the
 [design](docs/superpowers/specs/2026-07-16-goverify-design.md) are
 implemented: extraction pipeline, IR/call-graph/analysis engine, the Z3
 solver layer, the nil + bounds checkers behind `goverify check`, the
 summary/extraction caches, the CI-facing surface — SARIF/JSON output,
 findings baselines (`goverify baseline write`), `--diff-base` PR-scoped
-reporting — and the core `//goverify:` annotation language (see
-[Annotations](#annotations) below). See
+reporting — the core `//goverify:` annotation language (see
+[Annotations](#annotations) below) — and the channels-only
+`goroutine-leak` checker (see [Checkers](#checkers) below). See
 [docs/shakeout-phase5b-ci-surface.md](docs/shakeout-phase5b-ci-surface.md)
 and
 [docs/shakeout-phase6-annotations.md](docs/shakeout-phase6-annotations.md)
-for the acceptance-gate results at bbolt scale. The concurrency
-checkers land in later phases.
+for the acceptance-gate results at bbolt scale. WaitGroup modeling and
+phase-C data races (the rest of the concurrency work,
+[design](docs/superpowers/specs/2026-07-26-phase7-goroutine-leaks-design.md)
+§10) land in later phases.
 
 ## Quickstart
 
@@ -111,6 +114,42 @@ text *does* mark its function changed, since that changes the contract
 being checked; only a position shift, e.g. an unrelated comment moving
 above the pragma, is truly invisible to `--diff-base`).
 
+## Checkers
+
+`goverify check` runs three checkers today, all **Error** severity:
+
+- **`nil`** — nil-pointer dereferences (tag `nil-deref`).
+- **`bounds`** — index/slice bounds violations, div/rem-by-zero, and
+  narrowing/sign-changing conversions (tags `bounds`, `div-zero`,
+  `overflow`).
+- **`goroutine-leak`** — channels-only (tags `chan-send-leak`,
+  `chan-recv-leak`, `chan-select-leak`): flags a `go` statement that
+  spawns a goroutine which, on some satisfiable execution, blocks
+  forever on a channel send/receive/select that nothing reachable from
+  the spawning function can ever unblock. A channel that escapes the
+  spawner (stored to the heap, returned, passed as an argument to any
+  plain call, or captured by an untracked closure), is rooted at a
+  parameter or a package-level `var`, or has a non-constant/cyclically-
+  filled buffered capacity is deliberately silent in v1 — see the
+  [design
+  spec](docs/superpowers/specs/2026-07-26-phase7-goroutine-leaks-design.md)
+  for the full scope boundary.
+
+```go
+func leaks() {
+	ch := make(chan int)
+	go func() { ch <- 1 }() // reported: chan-send-leak (nothing ever receives)
+}
+
+func acknowledged() {
+	ch := make(chan int)
+	go func() { ch <- 1 }() //goverify:ignore goroutine-leak
+}
+```
+
+See [Annotations](#annotations) below for how `//goverify:ignore
+<checker>` suppression works in general.
+
 ## Annotations
 
 `//goverify:` doc-comment pragmas on a function/method declaration let
@@ -123,11 +162,11 @@ pragmas ship today (phase-6 spec §2):
 //goverify:ignore nil              // trailing // comment allowed
 ```
 
-`ignore`'s argument is a **checker name** (`nil`, `bounds`, `contract`,
-`bad-annotation`, `unverified-annotation`), not a finding **tag** — the
-`nil` checker reports the `nil-deref` tag, so `//goverify:ignore
-nil-deref` is rejected (unknown checker name); write `//goverify:ignore
-nil` instead.
+`ignore`'s argument is a **checker name** (`nil`, `bounds`,
+`goroutine-leak`, `contract`, `bad-annotation`, `unverified-annotation`),
+not a finding **tag** — the `nil` checker reports the `nil-deref` tag,
+so `//goverify:ignore nil-deref` is rejected (unknown checker name);
+write `//goverify:ignore nil` instead.
 
 - **`requires`** is assumed at the function's own entry (kills in-body
   false positives the contract covers) and checked at every DIRECT call
@@ -208,7 +247,8 @@ Named tasks (run `mise tasks` for the full list): `build`, `test`,
 Corpus expectations live as `// want: <tag>` comments on the annotated
 line (`testdata/corpus/*`), checked by the `corpus` task's checker
 suites — checker tags are `nil-deref`, `bounds`, `div-zero`,
-`overflow`, `contract`; the `bad-annotation`/`unverified-annotation`
+`overflow`, `contract`, `chan-send-leak`, `chan-recv-leak`,
+`chan-select-leak`; the `bad-annotation`/`unverified-annotation`
 annotation-only fixtures (`testdata/corpus/annot/`) use bespoke
 assertions instead of `// want:` pins, since those findings anchor at
 the pragma line.

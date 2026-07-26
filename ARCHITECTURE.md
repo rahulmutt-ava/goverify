@@ -27,7 +27,7 @@ Rust core: IR load ─▶ call-graph SCC order ─▶ per-function analysis
 | `goverify-extract` | sidecar driving, `.gvir` schema + loader, the extraction cache (go-list closure manifest + per-package gvir keying, degrades to uncached extraction on a manifest miss) | interpretation of the IR |
 | `goverify-ir` | analyzer-owned SSA-style IR lowered from `.gvir`, the whole-program call graph (static/interface/function-value edges), SCC condensation for scheduling | x/tools SSA quirks (isolated at the extractor boundary) |
 | `goverify-analysis` | the SCC-ordered engine: concurrency effects, the syntactic pre-pass (no SMT), summary instantiation over placeholder clauses, the SCC summary cache (context-hash keying + entry framing over the shared Store) | what to check (checkers plug in) |
-| `goverify-checkers` | `Checker` trait consumers: `NilChecker` (tag `nil-deref`) and `BoundsChecker` (tags `bounds`, `div-zero`, `overflow`) | engine machinery, solver details |
+| `goverify-checkers` | `Checker` trait consumers: `NilChecker` (tag `nil-deref`), `BoundsChecker` (tags `bounds`, `div-zero`, `overflow`), and `LeakChecker` (tags `chan-send-leak`, `chan-recv-leak`, `chan-select-leak` — channels-only goroutine-leak detection over the Effects lattice, phase 7) | engine machinery, solver details |
 | `goverify-solver` | typed QF term language (Bool, BV, Array, Ptr-ADT); canonical SMT-LIB2 printer is the single lowering — cache keys and artifacts are byte-identical to solved queries; `Z3Native` (statically-linked bundled Z3 4.16.0) and `SmtLib2Process` (external binary) backends both consume printer bytes; differential harness guards agreement | summary semantics |
 | `goverify-spec` | the `//goverify:` annotation compiler: parse → resolve → lower `requires`/`ensures`/`ignore` pragmas into `Clause`s (phase-6 spec §3); depends on `goverify-ir` + `goverify-solver` + `goverify-analysis` (resolves against `.gvir` signatures, lowers to `Term`, and shares `FuncAnnotations`/`AnnClause` with the engine) | inference; wiring itself into the engine — the CLI compiles (`compile_program`) and passes the result into the engine via `EngineConfig`, so there is no analysis→spec edge |
 | `goverify-cache` | content-addressed store (blake3, atomic rename, advisory lock, corrupt=miss) — bytes only, layer-agnostic. Three live layers write to it: `extract` (keyed in goverify-extract), `scc` (keyed + framed in goverify-analysis), and `query` (keyed here on canonical SMT text ⊕ solver identity ⊕ limits) | what the bytes mean; how any layer keys or frames them |
@@ -94,10 +94,17 @@ is the summary-free delegate.
 
 ## Checkers (`goverify-checkers`)
 
-Two checkers ship: `NilChecker` (`nil-deref`) and `BoundsChecker`
+Three checkers ship: `NilChecker` (`nil-deref`), `BoundsChecker`
 (`bounds`, `div-zero`, `overflow` — index/slice bounds, div/rem-by-zero,
-narrowing or sign-changing `Convert`s). Both implement the `Checker`
-trait (`goverify-analysis::checker`):
+narrowing or sign-changing `Convert`s), and `LeakChecker`
+(`chan-send-leak`, `chan-recv-leak`, `chan-select-leak` — phase 7's
+channels-only goroutine-leak detection over the Effects lattice; see
+its [design
+spec](docs/superpowers/specs/2026-07-26-phase7-goroutine-leaks-design.md)).
+All three implement the `Checker` trait (`goverify-analysis::checker`),
+but `LeakChecker` only implements `obligations` — leaks aren't
+contracts, so its `infer_requires`/`infer_ensures` return nothing, and
+the requires-inference/lifting bullets below don't apply to it:
 
 - `infer_requires` derives a function's own preconditions from its
   body during the engine's existing SCC fixpoint. A clause is only

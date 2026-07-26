@@ -33,10 +33,10 @@ spawning environment can ever unblock.
 
 - Param-rooted channels (the spawner's caller may hold counterparts)
   and `Global`-rooted channels (any package can touch them).
-- Channels that escape: stored to the heap, returned, passed to a
-  havoc callee, or captured by an untracked closure (parent spec §7:
-  "channels escaping into arbitrary heap structures degrade to
-  no-report").
+- Channels that escape: stored to the heap, returned, passed as an
+  argument to any plain call (a strict whitelist — see §2 rule 2), or
+  captured by an untracked closure (parent spec §7: "channels escaping
+  into arbitrary heap structures degrade to no-report").
 - Buffered channels with non-constant capacity; buffered channels
   whose sends sit in a CFG cycle (counting unsupported in v1 — a
   cyclic *unbuffered* send needs no counting and still reports).
@@ -52,16 +52,37 @@ rule is a documented precision boundary).
 
 A finding is raised at an `Op::Go` in function `f` when ALL hold:
 
-1. **Blocking op on an identified channel.** The spawned callee's
-   summarized `chan_ops`, rebased through the go site's arguments and
-   closure bindings, contain `Send`, `Recv`, or a blocking `Select` on
-   a `Loc` rooted at an **`Alloc` in `f`** (a `make(chan …)` in the
-   spawner reaching the goroutine via argument or capture).
+1. **Blocking op on an identified channel.** A `Send`, `Recv`, or
+   blocking `Select` **syntactically present in the spawned callee's
+   own body** — never a blocking op reached only through a helper the
+   goroutine calls — whose channel operand, rebased through the go
+   site's arguments and closure bindings, resolves to a `Loc` rooted at
+   an **`Alloc` in `f`** (a `make(chan …)` in the spawner reaching the
+   goroutine via argument or capture). A helper's own blocking ops still
+   flow into the goroutine's *summarized* `chan_ops` (rebased in by
+   `effects::collect`), and rule 3's counterpart match consults that
+   summary — so a nested-helper op can suppress a sibling candidate —
+   but v1 has no callee-side instruction to anchor a reachability query
+   on across a call boundary, so a nested-helper op is never itself the
+   subject of a finding (§10: "nested-helper blocking ops (cross-function
+   obligation anchoring)").
 2. **No escape.** The channel's `Make` dst never: appears as the
    stored value of any `Store` (v1 makes no attempt to attribute
    stores back to locals — any store is an escape), is returned, is
-   passed to a havoc callee, or is captured by a closure other than
-   ones whose spawn/call flow the checker tracks. Any escape ⇒ silent.
+   passed as an argument to any plain `Call` — **even a summarized
+   static callee** — with only a narrow builtin whitelist exempted
+   (`close`/`len`/`cap`; a `Go`/`Defer` argument is separately
+   whitelisted for a static callee or the `close` builtin, since those
+   flows the checker tracks through directly), or is captured by a
+   closure other than ones whose spawn/call flow the checker tracks.
+   The strict Call rule holds even for a callee the engine has fully
+   summarized, because effects don't model a callee storing its own
+   parameter to the heap — a summary carries chan-op/escape info the
+   checker consults, but not "does this callee stash its argument
+   somewhere effects doesn't model," so passing the channel to *any*
+   plain call is treated as an escape rather than trusting the summary.
+   Any escape ⇒ silent. (§10: "arg-passing to summarized callees could
+   stop escaping once effects model param stores.")
 3. **No counterpart.** The spawning environment — `f`'s own chan ops,
    its summarized callees' ops (already rebased into `f`'s summary by
    `effects::collect`), and sibling spawned goroutines — contains no op
@@ -69,6 +90,29 @@ A finding is raised at an `Op::Go` in function `f` when ALL hold:
    blocked send; `Send`/`Close`/send-`Select` for a blocked recv. Any
    op keyed at `Loc::Unknown` anywhere in the environment counts as a
    counterpart (may-alias) and suppresses.
+
+   **Select-arm dispatch is a deliberate exception to the table above.**
+   A Select candidate's *own* `ChanOp::Select` lands in `f`'s converged
+   effects at exactly its own arm `Loc`s (the spawned closure's select
+   rebases into the spawner's summary like any other op), so applying
+   the generic table — which lists `Select` as an unblocker for both
+   `Send` and `Recv` — to a Select candidate's own arms would make every
+   blocking select find *itself* as its counterpart: `chan-select-leak`
+   would be structurally unfireable for any input (corpus-discovered via
+   `LeakSelectAllBlocked`). The implemented fix dispatches per arm and
+   drops `Select` from the SAME-`Loc` unblocker set only for that
+   dispatch — a send arm needs `{Recv, Close}`, a recv arm needs `{Send,
+   Close}` — while keeping `Select` in the `Loc::unknown()` unblocker
+   set: the candidate's own select never rebases to `Unknown`, so
+   unknown-loc select evidence is necessarily a different, foreign
+   select, and the may-alias rule still applies to it. `Send`/`Recv`
+   candidates keep `Select` in their unblocker set unconditionally
+   (rule 3's table, unchanged) — a self-match is structurally impossible
+   there, since a Send/Recv candidate's own op is never itself a
+   `Select` entry. Accepted residual v1 false positive: a genuine
+   select-vs-select pairing over the same spawner-local channel is
+   indistinguishable from this candidate's own select-evidence and still
+   reports; gated by shakeout G2 triage.
 4. **Solver confirmation** (bug-finder discipline, Sat = report):
    (a) the go site is reachable in `f`'s encoding; (b) the blocking op
    is reachable in the spawned callee's encoding; (c) for buffered
@@ -94,6 +138,25 @@ most common leak shape — is invisible. The extension:
   `free_vars`), deriving the same traits; `resolve_loc` roots FreeVar
   values at their ordinal exactly as params root at theirs (missing or
   out-of-range ordinal ⇒ `Loc::unknown()`).
+- **`resolve_loc` also gained two root/hop rules the FreeVar work
+  exposed as gaps.** `Op::Make{dst}` now roots at `Alloc(dst.0)`,
+  exactly like `Op::Alloc` — pre-existing behavior rooted every
+  `make(chan)` register at `Unknown`, which would have made every leak
+  candidate invisible before counterpart matching ever ran. `Load{addr}`
+  and `Assign{src}` are now transparent, deref-collapsing hops (a cell
+  and its loaded/assigned content share one `Loc` — sound for effects
+  matching, since over-merging can only suppress a finding, never
+  manufacture one), bounded independently by `MAX_LOC_HOPS` (32) so a
+  malformed/cyclic def chain can't loop the walk forever (orthogonal to
+  `MAX_LOC_DEPTH`, which bounds path *growth*, not hop count).
+- **Closure bindings are recovered structurally, not from an
+  operand:** lowering drops the callee-slot operand from
+  `MakeClosure`, so the checker recovers a callee's binding list by
+  scanning `f`'s own body for that callee's `MakeClosure` site(s); a
+  *unique* site's `bindings` are used to re-root `FreeVar(i)` through
+  `resolve_loc(bindings[i])`, and ≥2 sites for the same callee
+  (ambiguous — which binding list applies?) degrade to `Loc::unknown()`,
+  same discipline as every other unresolvable shape.
 - **`rebase` at closure sites:** when a `Go`/`Defer`/`Call` callee
   value defs to `Op::MakeClosure{func, bindings}`, callee `FreeVar(i)`
   roots re-root through `resolve_loc(bindings[i])`, concatenating
@@ -130,14 +193,33 @@ Deliberately thin; no new theory, no solver-layer changes:
 - **Unbuffered (cap 0):** no counting. With no counterpart, the first
   send/recv blocks; the two queries are pure reachability through the
   existing per-function encodings.
-- **Buffered, constant cap, acyclic sends:** the kth send on the Loc
-  along a path blocks iff `k > cap`; encoded as per-path ordinals over
-  the existing integer term language.
+- **Buffered, constant cap, acyclic sends:** the buffered ordinal is a
+  `BV(32)` guard-indicator sum over the candidate block's DAG
+  ancestors — each strict-ancestor block's send count on the same
+  `Loc` gated by that block's own reachability guard (`ite(g_b, n,
+  0)`), added to the sends preceding the candidate within its own
+  block. The candidate is blocked iff this pending-before-candidate
+  count is `>= cap` (encoded as `¬(pending <u cap)`; `BvCmpOp` has no
+  unsigned-`≥` of its own).
 - **Buffered + cyclic sends, or non-constant cap:** Unknown ⇒ silent.
 
 Capacity is read from the spawner's `Op::Make{Chan, args[0]}` when
 const (v(0) is the capacity operand; unbuffered `make(chan T)` lowers
 with cap const 0).
+
+**The conjoined query links no variables across its two frames.** The
+go-site (f-side) query and the blocking-op (callee-side) query are
+built independently, then the callee-side query's SMT consts are
+prefix-renamed before conjunction purely to avoid name collisions — the
+two frames end up sharing NO variables, so a go-site's actual argument
+value is never linked to the callee's corresponding formal parameter.
+Both frames being individually `Sat` is enough to report even when the
+concrete argument passed at the go site would, in the real callee body,
+make the blocking-op branch dead. This is sound for a bug-finder (a
+real execution witnessing the callee-side op independently reachable
+still exists somewhere), but it is the checker's main structural
+false-positive source in v1 (§10: "link go-site actuals to callee
+formals in the conjoined query").
 
 ## 6. Degradation
 
@@ -179,8 +261,38 @@ Every failure mode degrades to silence, never crash or speculation:
   (report), closure-captured channel (report), cyclic unbuffered
   producer (report), buffered within cap (silent), counterpart exists
   (silent), param-rooted (silent), global-rooted (silent), heap-store
-  escape (silent), select-with-default (silent), havoc suppression
-  (silent). No `sync` import needed — keeps corpus runtime bounded.
+  escape (silent), select-with-default (silent), and a genuinely
+  unresolved dynamic call in the goroutine (report — `LeakDespiteOpaqueCall`).
+  "Havoc-callee suppression (silent)" moved out of the corpus and into
+  unit tests instead: a no-import corpus module has no way to reference
+  a bodyless static callee, so `effects.rs`'s and `has_counterpart`'s own
+  unit tests pin that a `Effects::top()`-summarized callee's
+  Unknown-keyed ops are a universal (suppressing) counterpart.
+  `LeakDespiteOpaqueCall` takes its place: an unresolved dynamic call
+  inside the goroutine must NOT suppress, because the escape walk
+  proves the channel can never reach it — but the fixture's dynamic
+  callee value (`hook`) is deliberately given a signature that is
+  **unique in the module** (no other address-taken function shares its
+  shape). That uniqueness is load-bearing, not incidental: the
+  call-graph's may-call resolution for a dynamic call is
+  structural-signature-keyed CHA-style over-approximation — every
+  address-taken function sharing the callee value's signature becomes a
+  possible target, and their effects join into the goroutine's converged
+  env. A signature with zero same-shape targets resolves to zero
+  call-graph edges (genuinely unresolved, contributes no effects at
+  all); a signature shared by even one other closure would instead pull
+  that closure's effects into the join, and if any such target were
+  itself havoc/unresolved, the join would put `{Send, Recv, Select}` at
+  `Loc::unknown()` — the may-alias rule (rule 3) then treats that as a
+  counterpart and suppresses every candidate in the spawner, including a
+  genuine leak. This same-signature shape is a documented, accepted v1
+  false-negative surface (conservative may-call resolution is correct
+  engine behavior; it costs recall, never precision) and is deliberately
+  not exercised by the corpus, precisely because it would assert away a
+  known gap rather than pin a bug (§10: "dynamic-call effect
+  contamination (signature-keyed may-call joins all-Unknown effects;
+  type-flow or assignment-based narrowing would recover the FN
+  surface)"). No `sync` import needed — keeps corpus runtime bounded.
 - **Regression:** zero extractor changes ⇒ every existing corpus
   `.gvir` byte-identical (free invariant check). bbolt: 457 existing
   findings unchanged; new leak findings (expect ~0–2) manually triaged
@@ -218,3 +330,13 @@ bbolt remains the regression gate per §8.
   is direction-blind today; v1 handles it conservatively — a Select
   counterpart matches either direction, and a blocking select
   candidate requires all arms unmatched).
+- Arg-passing to summarized callees could stop escaping once effects
+  model param stores (§2 rule 2).
+- Nested-helper blocking ops (cross-function obligation anchoring) —
+  §2 rule 1's helper-side ops suppress via summaries today but can
+  never anchor a finding of their own.
+- Dynamic-call effect contamination (signature-keyed may-call joins
+  all-Unknown effects; type-flow or assignment-based narrowing would
+  recover the FN surface) — §8.
+- Link go-site actuals to callee formals in the conjoined query — §5's
+  unlinked-conjunction false-positive source.

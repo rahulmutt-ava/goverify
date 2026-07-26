@@ -7,12 +7,14 @@
 //! §15).
 
 mod bounds;
+mod leak;
 mod nil;
 mod shared;
 #[cfg(test)]
 mod testfix;
 
 pub use bounds::BoundsChecker;
+pub use leak::LeakChecker;
 pub use nil::NilChecker;
 
 /// The production checker set — single source for the CLI's checker

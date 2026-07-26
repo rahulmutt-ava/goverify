@@ -316,6 +316,267 @@ pub(crate) fn convert_instr(dst_reg: u32, dst_ty: u32, src: u32) -> gvir::Instru
     }
 }
 
+/// Package with the given import path and functions — the generic
+/// wire-level package builder `leak.rs`'s fixtures need (goverify-analysis's
+/// `testpkg::pkg` equivalent; not otherwise needed by nil.rs/bounds.rs,
+/// whose fixtures go through the `pkg_with_*_types` helpers instead).
+pub(crate) fn pkg(path: &str, functions: Vec<gvir::Function>) -> gvir::Package {
+    gvir::Package {
+        import_path: path.into(),
+        functions,
+        ..Default::default()
+    }
+}
+
+/// Function with declared params and no other aux — ported from
+/// goverify-analysis's `testpkg::func_with_params` (needed here for
+/// `leak.rs`'s direct-param-passing goroutine fixtures).
+pub(crate) fn func_with_params(
+    id: &str,
+    params: Vec<gvir::Param>,
+    blocks: Vec<gvir::BasicBlock>,
+) -> gvir::Function {
+    gvir::Function {
+        id: id.into(),
+        params,
+        blocks,
+        ..Default::default()
+    }
+}
+
+/// `register = make(chan T, <cap value id>)` — MakeChan wire shape:
+/// operands [cap], per lower.rs's `"MakeChan" => Op::Make{args: vec![v(0)]}`.
+/// Ported from goverify-analysis's `testpkg::gvir_make_chan`.
+pub(crate) fn gvir_make_chan(register: u32, cap_operand: u32) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "MakeChan".into(),
+        register,
+        operands: vec![cap_operand],
+        ..Default::default()
+    }
+}
+
+/// Function with FreeVar aux values (ids in order) and no params.
+/// Ported from goverify-analysis's `testpkg::func_with_free_vars`.
+pub(crate) fn func_with_free_vars(
+    id: &str,
+    free_var_ids: Vec<u32>,
+    blocks: Vec<gvir::BasicBlock>,
+) -> gvir::Function {
+    gvir::Function {
+        id: id.into(),
+        aux: free_var_ids
+            .into_iter()
+            .map(|fv| gvir::AuxValue {
+                id: fv,
+                kind: "FreeVar".into(),
+                ..Default::default()
+            })
+            .collect(),
+        blocks,
+        ..Default::default()
+    }
+}
+
+/// Function with arbitrary aux values (Function refs, consts, …).
+/// Ported from goverify-analysis's `testpkg::func_with_aux`.
+pub(crate) fn func_with_aux(
+    id: &str,
+    aux: Vec<gvir::AuxValue>,
+    blocks: Vec<gvir::BasicBlock>,
+) -> gvir::Function {
+    gvir::Function {
+        id: id.into(),
+        aux,
+        blocks,
+        ..Default::default()
+    }
+}
+
+/// A `Function`-kind aux value naming `target`. Ported from
+/// goverify-analysis's `testpkg::fn_aux`.
+pub(crate) fn fn_aux(id: u32, target: &str) -> gvir::AuxValue {
+    gvir::AuxValue {
+        id,
+        kind: "Function".into(),
+        repr: target.into(),
+        ..Default::default()
+    }
+}
+
+/// A manifest int constant aux value at package-less type 0 (leak.rs's
+/// fixtures only need *some* defined value for a MakeChan's cap operand,
+/// never its actual int value). Ported from goverify-analysis's
+/// `testpkg::const_int_aux`.
+pub(crate) fn const_int_aux(id: u32, v: i64) -> gvir::AuxValue {
+    gvir::AuxValue {
+        id,
+        kind: "Const".into(),
+        r#const: Some(gvir::ConstValue {
+            value: Some(gvir::const_value::Value::Int(v)),
+        }),
+        ..Default::default()
+    }
+}
+
+/// `register = MakeClosure <fn_aux> [bindings…]` — wire shape per
+/// lower.rs ~line 441: operands [fn, bindings…], fn is a Function aux.
+/// Ported from goverify-analysis's `testpkg::make_closure`.
+pub(crate) fn make_closure(
+    register: u32,
+    fn_aux_operand: u32,
+    bindings: Vec<u32>,
+) -> gvir::Instruction {
+    let mut operands = vec![fn_aux_operand];
+    operands.extend(bindings);
+    gvir::Instruction {
+        kind: "MakeClosure".into(),
+        register,
+        operands,
+        ..Default::default()
+    }
+}
+
+/// `go <target>()` — zero-arg static go call (`Callee::Static`); operand
+/// layout `[callee slot, args…]` per lower.rs (the slot itself is
+/// dropped by lowering, so an empty-operands `Go` yields zero args, not
+/// a havoc). Ported from goverify-analysis's `testpkg::go_call`.
+pub(crate) fn go_call(target: &str) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "Go".into(),
+        sem: Some(Sem::Call(gvir::CallSem {
+            static_callee: target.into(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+}
+
+/// Same as `go_call`, with the given argument value ids appended after
+/// the (unused-for-static) callee slot — mirrors lower.rs's `skip(1)`
+/// convention: `go_call_args("t.G", vec![2])` yields operands `[0, 2]`.
+pub(crate) fn go_call_args(target: &str, args: Vec<u32>) -> gvir::Instruction {
+    let mut operands = vec![0];
+    operands.extend(args);
+    gvir::Instruction {
+        operands,
+        ..go_call(target)
+    }
+}
+
+/// `go <target>(<closure>)` where `<target>` is invoked through a
+/// `MakeClosure` register: operands are just `[closure_register]` —
+/// lower.rs drops slot 0's value unconditionally, and the closure's own
+/// free-var bindings carry the captured values (not `Go`'s `args`, which
+/// is empty here after `.skip(1)` on a single-element operand list).
+pub(crate) fn go_call_via_closure(target: &str, closure_register: u32) -> gvir::Instruction {
+    gvir::Instruction {
+        operands: vec![closure_register],
+        ..go_call(target)
+    }
+}
+
+/// `go` through a dynamic (function-value) callee: empty
+/// `static_callee`/`builtin`/`invoke` in `CallSem` is exactly the "none
+/// of the above" shape lower.rs's `Call`/`Defer`/`Go` arm falls through
+/// to `Callee::Dynamic { value: v(0) }` for.
+pub(crate) fn go_call_dynamic() -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "Go".into(),
+        sem: Some(Sem::Call(gvir::CallSem::default())),
+        ..Default::default()
+    }
+}
+
+/// `<-ch` — Recv lowers from kind "UnOp" with Sem::Unop{op: "<-"}
+/// (lower.rs ~line 197), register = dst, operands [chan].
+pub(crate) fn recv(register: u32, chan_operand: u32) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "UnOp".into(),
+        register,
+        operands: vec![chan_operand],
+        sem: Some(Sem::Unop(gvir::UnOpSem {
+            op: "<-".into(),
+            comma_ok: false,
+        })),
+        ..Default::default()
+    }
+}
+
+/// `ch <- val` — operands [chan, val] (lower.rs "Send").
+pub(crate) fn send(chan_operand: u32, val_operand: u32) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "Send".into(),
+        operands: vec![chan_operand, val_operand],
+        ..Default::default()
+    }
+}
+
+/// `*addr = val` — operands [addr, val] (lower.rs "Store").
+pub(crate) fn store(addr_operand: u32, val_operand: u32) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "Store".into(),
+        operands: vec![addr_operand, val_operand],
+        ..Default::default()
+    }
+}
+
+/// `return vals…` — operands are the returned value ids.
+pub(crate) fn ret(vals: Vec<u32>) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "Return".into(),
+        operands: vals,
+        ..Default::default()
+    }
+}
+
+/// Select over `states` (dir 1 = send, 2 = recv) — kind "Select" +
+/// SelectSem{states, blocking}; needs a register (lower bails without dst).
+pub(crate) fn select(
+    register: u32,
+    states: Vec<(u32, u32, u32)>, // (dir, chan_operand, send_operand-or-0)
+    blocking: bool,
+) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "Select".into(),
+        register,
+        sem: Some(Sem::Select(gvir::SelectSem {
+            blocking,
+            states: states
+                .into_iter()
+                .map(|(dir, chan_operand, send_operand)| gvir::SelectState {
+                    dir,
+                    chan_operand,
+                    send_operand,
+                })
+                .collect(),
+        })),
+        ..Default::default()
+    }
+}
+
+/// A heap `Alloc` at `register` — a "foreign cell" unrelated to any
+/// tracked channel, for `leak.rs`'s escape-walk fixtures.
+pub(crate) fn alloc_instr(register: u32) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "Alloc".into(),
+        register,
+        sem: Some(Sem::Alloc(gvir::AllocSem { heap: true })),
+        ..Default::default()
+    }
+}
+
+/// `v<register> = iface(src)` — MakeInterface wire shape: a single
+/// operand, no `Sem` needed (mirrors `convert_instr`'s shape).
+pub(crate) fn make_interface_instr(register: u32, src_operand: u32) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "MakeInterface".into(),
+        register,
+        operands: vec![src_operand],
+        ..Default::default()
+    }
+}
+
 pub(crate) fn z3_discharge() -> impl FnMut(&Query) -> SatResult {
     let mut solver = Z3Native::new(SolverLimits {
         timeout_ms: 5_000,

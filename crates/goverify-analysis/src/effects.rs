@@ -383,7 +383,13 @@ pub fn closure_bindings(f: &Function) -> HashMap<FuncId, Option<Vec<ValueId>>> {
 /// `MakeClosure` binding at this call site (phase 7): absent, ambiguous
 /// (≥2 `MakeClosure` sites for `c`), or out-of-range `i` all degrade to
 /// `Loc::unknown()` — never a panic on malformed/fuzzed input.
-fn fv_loc(f: &Function, cb: &HashMap<FuncId, Option<Vec<ValueId>>>, c: FuncId, i: u32) -> Loc {
+///
+/// `pub` (not `pub(crate)`): phase 7's goroutine-leak checker
+/// (`goverify-checkers`'s `leak.rs`) needs this exact re-rooting logic
+/// for its own call-site mapping (a `Go` site's free-var argument),
+/// rather than duplicating `closure_bindings`' bindings lookup a second
+/// time in a sibling crate.
+pub fn fv_loc(f: &Function, cb: &HashMap<FuncId, Option<Vec<ValueId>>>, c: FuncId, i: u32) -> Loc {
     match cb.get(&c) {
         Some(Some(bindings)) => bindings
             .get(i as usize)

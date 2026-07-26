@@ -41,8 +41,23 @@ pub struct Program {
     pub method_sets: std::collections::BTreeMap<crate::types::TypeId, Vec<MethodInfo>>,
     diagnostics: Vec<String>,
     /// FuncId -> its //goverify: pragmas, in .gvir order (sorted by
-    /// (decl_id, text) at extraction). Generic origins fan out to every
-    /// instantiation (id starts_with(decl_id + "[")).
+    /// (decl_id, text) at extraction). The fan-out branch below (id
+    /// starts_with(decl_id + "[")) exists for instantiations that are
+    /// emitted as functions in their own right with a decl_id distinct
+    /// from their origin's — currently that never happens for Go
+    /// generics: go/ssa gives every instantiation `Pkg == nil`, so the
+    /// extractor never emits them as `gvir::Function` entries at all,
+    /// and the origin's own exact decl_id match (the `if let Some(f) =
+    /// exact` branch above the fan-out) always wins first. In practice,
+    /// then, a pragma on a generic function attaches to the origin only
+    /// and never reaches call sites, which target the instantiation (an
+    /// annotation-free interned external) — see
+    /// `testdata/corpus/annot/generic.go` for the pinned fixture and the
+    /// plan's follow-up queue for the fan-out work needed to change this.
+    /// The branch is kept in place for forward-compat, in case a future
+    /// extractor change (or a different generic-instantiation shape)
+    /// ever does emit instantiations under a decl_id sharing the
+    /// origin's prefix.
     ///
     /// Determinism note: this HashMap is membership-only — every consumer
     /// iterates via `FuncId` order (`func_ids()`) or a single func's Vec

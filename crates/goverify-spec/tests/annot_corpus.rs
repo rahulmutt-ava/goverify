@@ -200,3 +200,76 @@ fn checked_compiles_one_ensures_and_any_warning_is_at_its_own_pragma() {
         );
     }
 }
+
+/// `generic.go` pins the CURRENT (documented-limitation, fix-wave
+/// item 1) behavior of a `//goverify:requires` pragma on a generic
+/// function: go/ssa gives every instantiation of `GenPositive` (e.g.
+/// `GenPositive[int]`, the interned name a static call site actually
+/// targets) `Pkg == nil`, so the extractor never emits instantiations
+/// as functions of their own — only the generic ORIGIN
+/// (`example.com/annot.GenPositive`, no `[...]` suffix) is emitted, and
+/// the pragma attaches to it via an exact decl_id match (`compile_program`
+/// never needed to fan out to any instantiation, because none exist to
+/// fan out to). This asserts three things: the pragma compiles cleanly
+/// onto the origin (one requires clause, no bad-annotation finding — it
+/// is a well-formed pragma on a real decl_id, just one the engine can't
+/// yet act on at call sites), and `CallsGenPositiveBad`'s outright
+/// violation (`GenPositive(0, 1)`, `n >= 1`) produces NO contract
+/// finding, because the call's static callee is `GenPositive[int]`, an
+/// annotation-free interned external. Flip this test's last assertion
+/// (and add a `// want: contract` pin instead) once generic-origin
+/// pragma fan-out lands (plan follow-up queue).
+#[test]
+fn generic_origin_pragma_attaches_but_call_site_is_unaffected() {
+    let p = goverify_ir::testutil::load_corpus("annot");
+    let ann = compile_program(&p, KNOWN);
+
+    // The pragma compiles onto the origin's own decl_id — no `[...]`
+    // suffix, since instantiations are never emitted as functions.
+    let origin = p
+        .lookup_func("example.com/annot.GenPositive")
+        .expect("the generic origin must be interned under its unparameterized decl_id");
+    assert_eq!(
+        ann.funcs[&origin].requires.len(),
+        1,
+        "the pragma must compile onto the origin with exactly one requires clause: {:?}",
+        ann.funcs.get(&origin)
+    );
+    assert!(
+        p.lookup_func("example.com/annot.GenPositive[int]")
+            .is_some(),
+        "the instantiation IS interned (as a call-site callee) — just never as a function \
+         with a body or its own pragma match"
+    );
+    assert!(
+        ann.findings
+            .iter()
+            .all(|f| f.checker != "bad-annotation" || !f.func.contains("GenPositive")),
+        "a well-formed pragma on a real decl_id must not raise bad-annotation: {:?}",
+        ann.findings
+    );
+
+    // No contract finding anywhere for the outright-violating call:
+    // the documented limitation, pinned so it flips loudly (this
+    // assertion starts failing) once fan-out lands.
+    let cfg = EngineConfig {
+        opts: Options::default(),
+        cache_dir: None,
+        emit_smt: None,
+        annotations: ann,
+        annotation_version: ANNOTATION_VERSION,
+    };
+    let checkers = default_checkers();
+    let a = analyze_full(&p, &cfg, &checkers, &|_role| {
+        Box::new(Z3Native::new(limits()))
+    });
+    assert!(
+        a.findings
+            .iter()
+            .all(|f| f.checker != CONTRACT || !f.func.ends_with("CallsGenPositiveBad")),
+        "CURRENT documented limitation: a generic function's annotated requires does not \
+         yet reach its call sites, so this outright violation produces no contract \
+         finding: {:?}",
+        a.findings
+    );
+}

@@ -665,8 +665,15 @@ func (e *emitter) emitPragmas() {
 				doc = d.Doc
 				if obj, ok := e.pkg.TypesInfo.Defs[d.Name].(*types.Func); ok {
 					// Prefer the SSA id so Rust-side pragma->function
-					// matching is exact; generic origins fall back to
-					// FullName() and match instantiations by prefix.
+					// matching is exact. The FullName() branch is dead
+					// for any package-level FuncDecl (including a
+					// generic origin): prog.FuncValue looks up a
+					// package-level member and a FuncDecl's *types.Func
+					// always is one, so it never returns nil here — it
+					// can only return nil for objects that aren't
+					// package-level members at all (not a shape this
+					// switch case produces). Kept as a defensive
+					// fallback rather than an assert.
 					if ssaFn := e.prog.FuncValue(obj); ssaFn != nil {
 						declID = canonFuncID(ssaFn)
 					} else {

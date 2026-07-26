@@ -462,8 +462,14 @@ pub fn analyze_full(
                 // flagged unverified).
                 let own = summary_of(f);
                 if let (Some(func), Some(enc)) = (p.func(f), enc_opt.as_ref()) {
-                    for ob in crate::annotations::contract_obligations(p, func, enc, &own, &ann_of)
-                    {
+                    for ob in crate::annotations::contract_obligations(
+                        p,
+                        func,
+                        enc,
+                        &own,
+                        &ann_of,
+                        &summary_of,
+                    ) {
                         // Same bug-finder semantics as the checker loop
                         // above: only a confirmed Sat verdict becomes a
                         // Finding.
@@ -1833,6 +1839,117 @@ mod tests {
             contract_findings.is_empty(),
             "a caller that already requires the callee's precondition must get no \
              contract finding: {:?}",
+            a.findings
+        );
+    }
+
+    /// Infers the SAME requires formula `nonzero_ann_clause` states
+    /// (standing in for a real checker, e.g. `nil`, inferring a body-
+    /// derived fact that happens to match an annotation verbatim), and
+    /// raises exactly one obligation for `t.Caller` unconditionally
+    /// (standing in for what that checker's own call-site-obligations
+    /// pass — `shared::call_site_obligations` — would produce for a
+    /// caller that violates the inferred clause). Both halves are
+    /// deliberately simplified (no real dominance/reachability logic):
+    /// this checker exists only to reproduce the fix-wave item 4 shape —
+    /// an annotated requires whose formula duplicates a checker-inferred
+    /// one — at the engine's findings-pass layer.
+    struct DupChecker;
+    impl Checker for DupChecker {
+        fn name(&self) -> &'static str {
+            "dupchecker"
+        }
+        fn infer_requires(
+            &self,
+            _p: &Program,
+            _f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
+            _discharge: &mut dyn FnMut(&Query) -> SatResult,
+        ) -> Vec<crate::summary::Clause> {
+            vec![crate::summary::Clause {
+                tag: "dupchecker-fact".into(),
+                formula: nonzero_ann_clause("unused").clause.formula,
+                provenance: Provenance::Inferred,
+            }]
+        }
+        fn obligations(
+            &self,
+            p: &Program,
+            f: FuncId,
+            _summary_of: &dyn Fn(FuncId) -> Summary,
+        ) -> Vec<crate::checker::Obligation> {
+            if p.func_name(f) != "t.Caller" {
+                return Vec::new();
+            }
+            vec![crate::checker::Obligation {
+                tag: "dupchecker-fact".into(),
+                message: "call to t.Callee violates its dupchecker-fact requirement".into(),
+                pos: None,
+                query: Query::for_asserts(goverify_solver::Logic::All, vec![Term::bool_lit(true)]),
+            }]
+        }
+    }
+
+    #[test]
+    fn contract_obligation_skips_when_checker_already_infers_the_same_formula() {
+        // `t.Callee` carries the same "requires p0 != 0" fact twice: as
+        // an annotated pragma (tag "contract") AND as DupChecker's
+        // inferred clause (tag "dupchecker-fact", the same formula) — the
+        // exact duplicate shape
+        // `merge_dedups_duplicate_annotated_requires_keeps_distinct_one`
+        // pins at the summary layer (the annotated one is deduped OUT of
+        // `t.Callee`'s merged summary). `t.Caller` passes the violating
+        // literal constant 0, and DupChecker's `obligations` raises its
+        // own finding for it (standing in for the real checker's
+        // call-site pass). Before the fix-wave item 4 fix,
+        // `contract_obligations` walked the callee's raw, unmerged
+        // `FuncAnnotations` and raised a SECOND (contract) finding for
+        // the identical violation; the fix must yield exactly the one
+        // checker finding, no contract finding.
+        let mut caller = caller_calling_callee(1);
+        caller.aux = vec![int_aux(1, 0)];
+        let p = program_with_int_type(vec![caller]);
+        let callee = p.lookup_func("t.Callee").unwrap();
+
+        let mut funcs = BTreeMap::new();
+        funcs.insert(
+            callee,
+            FuncAnnotations {
+                requires: vec![nonzero_ann_clause("p != 0")],
+                ensures: Vec::new(),
+                ignores: Vec::new(),
+            },
+        );
+        let cfg = EngineConfig {
+            annotations: Annotations {
+                funcs,
+                findings: Vec::new(),
+            },
+            ..EngineConfig::default()
+        };
+        let checkers: Vec<&dyn Checker> = vec![&DupChecker];
+        let a = analyze_full(&p, &cfg, &checkers, &z3_backend);
+
+        let contract_findings: Vec<&Finding> = a
+            .findings
+            .iter()
+            .filter(|f| f.checker == CONTRACT)
+            .collect();
+        assert!(
+            contract_findings.is_empty(),
+            "no contract finding when the annotation duplicates a checker-inferred \
+             requires: {:?}",
+            a.findings
+        );
+        let dup_findings: Vec<&Finding> = a
+            .findings
+            .iter()
+            .filter(|f| f.checker == "dupchecker")
+            .collect();
+        assert_eq!(
+            dup_findings.len(),
+            1,
+            "exactly one checker finding survives (no double reporting): {:?}",
             a.findings
         );
     }

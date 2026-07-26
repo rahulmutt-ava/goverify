@@ -105,7 +105,11 @@ cold/warm cache runs and emit no absolute paths. `baseline write`
 records the current finding set; a later `check` reports only findings
 absent from the baseline (exit 0 once fully suppressed). `--diff-base
 <rev>` restricts the report to functions changed since `<rev>`, or in
-their transitive callers (comment-only edits report nothing).
+their transitive callers (ordinary comment-only edits report nothing —
+but a `//goverify:` pragma is not an ordinary comment: editing one's
+text *does* mark its function changed, since that changes the contract
+being checked; only a position shift, e.g. an unrelated comment moving
+above the pragma, is truly invisible to `--diff-base`).
 
 ## Annotations
 
@@ -116,13 +120,26 @@ pragmas ship today (phase-6 spec §2):
 ```go
 //goverify:requires p != nil && n >= 0
 //goverify:ensures err == nil ==> ret != nil
-//goverify:ignore nil-deref        // trailing // comment allowed
+//goverify:ignore nil              // trailing // comment allowed
 ```
 
+`ignore`'s argument is a **checker name** (`nil`, `bounds`, `contract`,
+`bad-annotation`, `unverified-annotation`), not a finding **tag** — the
+`nil` checker reports the `nil-deref` tag, so `//goverify:ignore
+nil-deref` is rejected (unknown checker name); write `//goverify:ignore
+nil` instead.
+
 - **`requires`** is assumed at the function's own entry (kills in-body
-  false positives the contract covers) and checked at every call site —
-  a violating call reports a `contract` finding (error severity) at the
-  *caller*, quoting the clause text.
+  false positives the contract covers) and checked at every DIRECT call
+  site — a violating call reports a `contract` finding (error severity)
+  at the *caller*, quoting the clause text. Annotating a function
+  therefore obliges every direct caller to establish the precondition
+  itself; unlike a checker's own inferred requires (which lift into a
+  caller that merely forwards the same argument, becoming that caller's
+  precondition in turn), an annotated requires does **not** lift — a
+  forwarding wrapper that calls the annotated function with its own
+  unchecked parameter must be annotated too, chaining the contract
+  explicitly rather than inheriting it.
 - **`ensures`** always enters the function's summary (callers rely on
   it), and is verified best-effort against the body after the SCC
   fixpoint settles: proven → silent; unprovable or unknown →
@@ -139,8 +156,22 @@ pragmas ship today (phase-6 spec §2):
 Multiple pragmas per declaration are allowed; repeated `requires`/
 `ensures` lines become separate clauses. Expressions support
 comparisons, `&&`/`||`/`!`, `==>` (implication), `len()`/`cap()`,
-`old()`, and literals — no arithmetic and no field selection yet (both
-parsed-and-rejected, reserved for a later wave).
+`old()`, and literals — no arithmetic and no field selection yet,
+reserved for a later wave. They differ in where they're rejected:
+arithmetic operators (`+`, `-`, `*`, `/`, `%`) aren't in the grammar at
+all, so an expression using one fails to **lex** (`unexpected
+character`); field selection (`p.buf`) lexes and parses fine but is
+rejected at **resolution** (a `bad-annotation` finding, not a parse
+error).
+
+**Limitations.** Annotations on a generic function (`func Gen[T
+any](...)`) are accepted and attach to the generic origin, but do not
+yet take effect at call sites: Go's SSA builder gives every
+instantiation (`Gen[int]`, `Gen[string]`, …) `Pkg == nil`, so the
+extractor never emits them as functions the pragma can fan out to, and
+a call site's callee resolves to the (annotation-free) instantiation,
+not the origin. This is planned work, not a silent gap — see the
+follow-up queue.
 
 **Severity.** Every finding carries a `severity` (`error` or
 `warning`); only `unverified-annotation` is a warning today. Exit code

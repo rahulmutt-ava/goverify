@@ -38,9 +38,13 @@ declarations. The extractor already captures them verbatim into `.gvir`
 ```go
 //goverify:requires p != nil && n >= 0
 //goverify:ensures err == nil ==> ret != nil
-//goverify:ignore nil-deref        // trailing // comment allowed
+//goverify:ignore nil              // trailing // comment allowed
 ```
 
+- `ignore`'s argument is a checker name (`nil`, `bounds`, `contract`,
+  `bad-annotation`, `unverified-annotation`), not a finding tag — the
+  `nil` checker's findings carry the tag `nil-deref`, so
+  `//goverify:ignore nil-deref` names no known checker and is rejected.
 - Multiple pragmas per declaration are allowed. Repeated
   `requires`/`ensures` lines become separate clauses.
 - A trailing `//`-comment on the pragma line is stripped before parsing.
@@ -123,9 +127,14 @@ into `goverify-spec` from inside the engine. That edge cannot exist:
 `goverify-spec`'s resolve/lower stages bind against `FuncAnnotations`/
 `AnnClause`/`Clause` — types that live with the engine's own summary
 machinery so the engine can consume them without importing the
-compiler — so `goverify-spec` depends on `goverify-analysis` (and
-`goverify-checkers`, to validate `ignore` names against the real
-checker set), not the other way around. `goverify-analysis` depending
+compiler — so `goverify-spec` depends on `goverify-analysis`, not the
+other way around. Validating `ignore` names does NOT pull in
+`goverify-checkers` as a production dependency: `compile_program` takes
+the known-checker set as a plain `known_checkers: &[&str]` parameter,
+supplied by the CLI (which does depend on `goverify-checkers`);
+`goverify-checkers` appears in `goverify-spec`'s `Cargo.toml` only as a
+`[dev-dependencies]` entry, for `annot_corpus.rs`'s end-to-end test
+harness. `goverify-analysis` depending
 back on `goverify-spec` would be a cycle. The implementation instead
 puts compilation at the CLI: `goverify-cli` calls
 `goverify_spec::compile_program(&program, &known_checkers)` once per
@@ -150,22 +159,34 @@ keeps marking havoc summaries. The scc-cache clause codec grows the new
 field → scc cache version bump (natural rotation).
 
 **Compilation point.** The engine compiles each function's pragmas once,
-at summary construction. `bad-annotation` findings flow into the normal
-finding stream; a function whose annotation is bad is analyzed **as if
-unannotated** (plus the error finding) — degrade, never die.
+at summary construction. (As the §3 deviation paragraph records: in the
+implementation this compilation actually happens once per run in the
+CLI, one layer above the engine, which then consumes the resulting
+`Annotations` at this same point in the pipeline — see there for why.)
+`bad-annotation` findings flow into the normal finding stream; a
+function whose annotation is bad is analyzed **as if unannotated**
+(plus the error finding) — degrade, never die.
 
 **Annotated requires — the contract split:**
 
 1. **Assumed at entry** of the function's own encoding, so in-body
    obligations covered by the contract discharge. This is the
-   FP-killing payoff and mirrors what requires-lifting already does for
-   inferred clauses.
-2. **Checked at every call site** via the existing
+   FP-killing payoff for the annotated function itself.
+2. **Checked at every DIRECT call site** via the existing
    `instantiate_requires` — no new call-site machinery. A violated
    annotated requires reports as a **`contract`** finding (error
    severity) at the call site, attributed to the *caller*, with the
    annotation text quoted in the message (position-free, so
-   fingerprint-safe).
+   fingerprint-safe). Unlike an inferred requires clause — which
+   `propagate_requires` can lift into a forwarding caller, making it that
+   caller's own precondition in turn — an annotated requires does **not**
+   lift: it is checked at every direct call site and stops there. A
+   caller that merely forwards its own parameter to an annotated
+   function is itself unannotated and unchecked at ITS call sites; only
+   annotating that caller too (chaining the contract explicitly) extends
+   the obligation further up the call graph. See README's Annotations
+   section for the user-facing version of this and the follow-up queue
+   for whether contract-tagged requires should lift like inferred ones.
 
 Annotated clauses that duplicate inferred ones dedup by formula
 equality before entering the summary.
@@ -243,9 +264,18 @@ warnings are baselineable.
 
 ## 6. Caching and determinism
 
-- Pragmas are already in the scc-cache ctx-hash (position-cleared:
-  comment shifts don't invalidate; text changes do). Annotation edits
-  invalidate correctly with no new plumbing.
+- Pragmas are already in the scc-cache `ctx_hash` — with `Pragma.pos`
+  included, not cleared: the cache key stays position-sensitive so warm
+  replays render exact positions, so a comment shift that moves a
+  pragma's line (even with no text change) DOES invalidate the SCC cache
+  for that pragma's whole package (whole-package granularity: pragma
+  bytes are folded into every member's ctx hash). It's the separate
+  position-blind `semantic_ctx_hash`/`func_semantic_hash` pair — used
+  only for `--diff-base`, never as a cache key — that clears `pos`
+  before hashing, so a comment shift above a pragma does NOT mark that
+  function changed for `--diff-base` while a pragma text edit does.
+  Annotation edits invalidate correctly at both layers with no new
+  plumbing.
 - The annotation compiler gets an `ANNOTATION_VERSION` constant salted
   into the scc cache like checker versions; bump on any semantics
   change to parse/resolve/lower.

@@ -11,7 +11,7 @@ use goverify_solver::{Query, SatResult, Term};
 
 use crate::checker::{Finding, Obligation, Severity};
 use crate::encode::EncodedFunc;
-use crate::summary::{Clause, Summary, instantiate_ensures, instantiate_requires};
+use crate::summary::{Clause, Provenance, Summary, instantiate_ensures, instantiate_requires};
 
 /// Tag for every compiled annotation `Clause` (both `requires` and
 /// `ensures`): annotations are one contract source, not a per-checker
@@ -69,12 +69,30 @@ pub struct Annotations {
 /// itself requires (and therefore never violates) some precondition
 /// would still get a reachable-looking obligation from an unconstrained
 /// encoding.
+///
+/// `summary_of` — the callee's own (merged) `Summary` — is consulted
+/// per annotated clause to avoid double reporting (fix-wave item 4):
+/// `merge_annotations`'s dedup rule drops an annotated clause from the
+/// callee's merged summary whenever a checker already infers the exact
+/// same formula, on the theory that the checker's own call-site
+/// obligations (which walk the merged summary, e.g. `nil`'s via
+/// `call_site_obligations`) already cover it under its own tag. But this
+/// function walks the callee's RAW `FuncAnnotations` (never the merged
+/// summary — see the doc above), so it would raise a second, redundant
+/// `contract` finding for a clause the checker already flags. Skipping
+/// any annotated clause whose formula matches an `Inferred` clause in
+/// the callee's merged summary restores single ownership: exactly the
+/// same formula-equality rule `merge_annotations` uses, checked against
+/// `Provenance::Inferred` specifically because that's what a
+/// checker-owned (i.e. already-deduped) clause looks like in the merged
+/// summary.
 pub fn contract_obligations(
     p: &Program,
     func: &Function,
     enc: &EncodedFunc,
     own: &Summary,
     ann_of: &dyn Fn(FuncId) -> Option<FuncAnnotations>,
+    summary_of: &dyn Fn(FuncId) -> Summary,
 ) -> Vec<Obligation> {
     let pre: Vec<Term> = own
         .requires
@@ -96,6 +114,7 @@ pub fn contract_obligations(
             if fa.requires.is_empty() {
                 continue;
             }
+            let callee_summary = summary_of(*c);
             let arg_terms: Vec<Option<Term>> =
                 args.iter().map(|a| enc.value(*a).cloned()).collect();
             // A throwaway Summary whose `requires` is JUST this callee's
@@ -111,6 +130,18 @@ pub fn contract_obligations(
                 .into_iter()
                 .zip(&fa.requires)
             {
+                // Double-reporting guard (fix-wave item 4): a checker
+                // already owns this exact fact (it's why
+                // `merge_annotations` deduped the annotated duplicate out
+                // of the merged summary) — that checker's own call-site
+                // obligations already produce a finding for it, so
+                // raising a `contract` finding here too would report the
+                // same violation twice.
+                if callee_summary.requires.iter().any(|sc| {
+                    sc.provenance == Provenance::Inferred && sc.formula == ac.clause.formula
+                }) {
+                    continue;
+                }
                 // None = unbindable (unknown arg, sort mismatch, arity
                 // overflow): cannot evaluate, so no obligation — never a
                 // false positive from a missing term.

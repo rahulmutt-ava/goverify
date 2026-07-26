@@ -39,9 +39,14 @@ and this wave's [task-14 brief](../.superpowers/sdd/2026-07-25-phase6-annotation
      ("the engine compiles each function's pragmas once, at summary
      construction"). That edge cannot exist: `goverify-spec` depends on
      `goverify-analysis` (to resolve/lower against the engine's own
-     `FuncAnnotations`/`Clause` types and to validate `ignore` names
-     against the real checker set), so `goverify-analysis` depending
-     back on `goverify-spec` would cycle. The implementation instead
+     `FuncAnnotations`/`Clause` types), so `goverify-analysis` depending
+     back on `goverify-spec` would cycle. `ignore`-name validation does
+     NOT pull in `goverify-checkers` as a production dependency —
+     `compile_program` takes the known-checker set as a plain
+     `known_checkers: &[&str]` parameter, supplied by the CLI;
+     `goverify-checkers` appears in `goverify-spec`'s `Cargo.toml` only
+     as a `[dev-dependencies]` entry, for `annot_corpus.rs`'s
+     end-to-end test harness. The implementation instead
      compiles at the CLI: `goverify-cli` calls
      `goverify_spec::compile_program(&program, &known_checkers)` once
      per run and passes the resulting `Annotations` into
@@ -229,9 +234,11 @@ Three warm `check` runs (shared cache, `GOVERIFY_TIMINGS=1`):
 | wall (`real`) | 3.35s | 3.49s | 3.45s | 3.49s |
 
 Delta ≈ **+0.10-0.15s** (~3-4%), concentrated in `extract+load` (the
-schema-v2 `.gvir`/`Program` fields are slightly larger to load) rather
-than `analyze` — `analyze`'s own time is flat within noise (2.31-2.39s
-vs. 2.32s baseline). Annotation compilation itself doesn't appear as a
+schema-4 `.gvir`/`Program` fields — the `.gvir` wire schema, distinct
+from the CLI's JSON output `schema_version: 2` reported in G2 above —
+are slightly larger to load) rather than `analyze` — `analyze`'s own
+time is flat within noise (2.31-2.39s vs. 2.32s baseline). Annotation
+compilation itself doesn't appear as a
 separate line (it's the CLI's `compile_program` call, folded into the
 process's overall wall time outside the four timed phases above), and
 with zero pragmas in bbolt it is expected to cost effectively nothing;

@@ -763,6 +763,7 @@ fn render_loc(l: &Loc) -> String {
         Root::Param(i) => format!("p{i}"),
         Root::Global(g) => format!("g:{g}"),
         Root::Alloc(v) => format!("alloc:{v}"),
+        Root::FreeVar(i) => format!("fv:{i}"),
         Root::Unknown => "?".to_string(),
     };
     for f in &l.path {

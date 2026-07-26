@@ -115,3 +115,35 @@ pub fn pkg(path: &str, functions: Vec<gvir::Function>) -> gvir::Package {
         ..Default::default()
     }
 }
+
+/// `register = make(chan T, <cap value id>)` — MakeChan wire shape:
+/// operands [cap], per lower.rs's `"MakeChan" => Op::Make{args: vec![v(0)]}`.
+pub fn gvir_make_chan(register: u32, cap_operand: u32) -> gvir::Instruction {
+    gvir::Instruction {
+        kind: "MakeChan".into(),
+        register,
+        operands: vec![cap_operand],
+        ..Default::default()
+    }
+}
+
+/// Function with FreeVar aux values (ids in order) and no params.
+pub fn func_with_free_vars(
+    id: &str,
+    free_var_ids: Vec<u32>,
+    blocks: Vec<gvir::BasicBlock>,
+) -> gvir::Function {
+    gvir::Function {
+        id: id.into(),
+        aux: free_var_ids
+            .into_iter()
+            .map(|fv| gvir::AuxValue {
+                id: fv,
+                kind: "FreeVar".into(),
+                ..Default::default()
+            })
+            .collect(),
+        blocks,
+        ..Default::default()
+    }
+}

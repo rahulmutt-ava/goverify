@@ -59,6 +59,12 @@ pub enum Root {
     /// only meaningful within its own function; `rebase` maps it to
     /// Unknown when crossing a call boundary.
     Alloc(u32),
+    /// Ordinal into the enclosing function's `free_vars` (phase 7): a
+    /// captured closure variable's identity, meaningful only inside that
+    /// function. `rebase` maps it through the caller's closure-binding
+    /// closure (`caller_fv_loc`) or degrades to `Unknown` when no
+    /// mapping is supplied.
+    FreeVar(u32),
     Unknown,
 }
 
@@ -203,28 +209,52 @@ fn def_map(f: &Function) -> HashMap<ValueId, &Op> {
     m
 }
 
+/// Field-path/def-chain hop cap: `resolve_loc`'s walk (both `FieldAddr`
+/// path-growing hops and the transparent `Load`/`Assign` deref hops)
+/// degrades to `Unknown` past this many iterations, bounding the loop
+/// against a malformed/cyclic def chain (fuzzed input) independent of
+/// `MAX_LOC_DEPTH`, which only bounds path *growth*.
+pub const MAX_LOC_HOPS: usize = 32;
+
 /// Walks `v`'s def chain to find its access-path root (spec §9):
 /// `FieldAddr{base, field}` prepends `field` to the path and recurses on
 /// `base`; a `Param` value roots at its position in `f.params`; a
-/// `Global(name)` value roots at `Global(name)`; an `Alloc{dst}` def
-/// roots at `Alloc(dst.0)`; everything else (loads, phis, calls, opaque,
-/// missing defs) is `Loc::unknown()`. A path deeper than `MAX_LOC_DEPTH`
-/// degrades the whole `Loc` to `Unknown` (never just truncates the
-/// path) — checked every hop, which also bounds the walk against a
-/// malformed/cyclic def chain (fuzzed input).
+/// `FreeVar` value roots at its position in `f.free_vars` (phase 7); a
+/// `Global(name)` value roots at `Global(name)`; an `Alloc{dst}` or
+/// `Make{dst}` def roots at `Alloc(dst.0)` (alloc-site identity — a
+/// `make(chan)`/`make(map)`/`make(slice)` register is exactly as much an
+/// allocation site as `Op::Alloc`); `Load{addr}`/`Assign{src}` are
+/// transparent hops (deref-collapsing: a cell and its loaded/assigned
+/// content share a Loc — sound for effects matching, since over-merging
+/// can only suppress leak findings, never manufacture them); everything
+/// else (phis, calls, opaque, missing defs) is `Loc::unknown()`. A path
+/// deeper than `MAX_LOC_DEPTH` degrades the whole `Loc` to `Unknown`
+/// (never just truncates the path); a walk longer than `MAX_LOC_HOPS`
+/// hops (path-growing or transparent) does too.
 pub fn resolve_loc(f: &Function, v: ValueId) -> Loc {
     let defs = def_map(f);
     let mut cur = v;
     let mut path: Vec<u32> = Vec::new();
+    let mut hops: usize = 0;
     loop {
-        if path.len() > MAX_LOC_DEPTH {
+        if path.len() > MAX_LOC_DEPTH || hops > MAX_LOC_HOPS {
             return Loc::unknown();
         }
+        hops += 1;
         match &f.value(cur).kind {
             ValueKind::Param => {
                 return match f.params.iter().position(|&p| p == cur) {
                     Some(i) => Loc {
                         root: Root::Param(i as u32),
+                        path,
+                    },
+                    None => Loc::unknown(),
+                };
+            }
+            ValueKind::FreeVar => {
+                return match f.free_vars.iter().position(|&fv| fv == cur) {
+                    Some(i) => Loc {
+                        root: Root::FreeVar(i as u32),
                         path,
                     },
                     None => Loc::unknown(),
@@ -243,50 +273,79 @@ pub fn resolve_loc(f: &Function, v: ValueId) -> Loc {
                 path.insert(0, *field);
                 cur = *base;
             }
-            Some(Op::Alloc { dst, .. }) => {
+            Some(Op::Alloc { dst, .. }) | Some(Op::Make { dst, .. }) => {
                 return Loc {
                     root: Root::Alloc(dst.0),
                     path,
                 };
             }
+            // Deref-collapsing transparent hops: a cell and the value
+            // loaded from it share one Loc (a captured `ch := make(chan)`
+            // is an Alloc cell + Store + Load in SSA; collapsing keeps
+            // the spawner-side and closure-side identities equal). Sound
+            // for effects matching: over-merging can only suppress leak
+            // findings, never manufacture them.
+            Some(Op::Load { addr, .. }) => cur = *addr,
+            Some(Op::Assign { src, .. }) => cur = *src,
             _ => return Loc::unknown(),
         }
     }
 }
 
 /// Re-roots a callee's location-keyed effects through the caller's
-/// arguments at a call site (spec §9): a `Param(i)`-rooted entry
-/// re-roots through `caller_arg_loc(i)`, concatenating paths
-/// caller-first (depth-capped ⇒ Unknown); `Global` entries pass through
-/// unchanged (a package-level variable has the same identity regardless
-/// of caller); a callee-local `Alloc` or already-`Unknown` entry becomes
-/// `Unknown` — a callee's local allocation has no caller-visible
-/// identity (phase 7 refines if needed). `spawns` isn't location-scoped,
-/// so it passes through unchanged.
-pub fn rebase(callee: &Effects, caller_arg_loc: &dyn Fn(u32) -> Loc) -> Effects {
+/// arguments (and closure bindings) at a call site (spec §9): a
+/// `Param(i)`-rooted entry re-roots through `caller_arg_loc(i)`, and a
+/// `FreeVar(i)`-rooted entry re-roots through `caller_fv_loc(i)`
+/// (phase 7), both concatenating paths caller-first (depth-capped ⇒
+/// Unknown); `Global` entries pass through unchanged (a package-level
+/// variable has the same identity regardless of caller); a callee-local
+/// `Alloc` or already-`Unknown` entry becomes `Unknown` — a callee's
+/// local allocation has no caller-visible identity (phase 7 refines if
+/// needed). `spawns` isn't location-scoped, so it passes through
+/// unchanged.
+pub fn rebase(
+    callee: &Effects,
+    caller_arg_loc: &dyn Fn(u32) -> Loc,
+    caller_fv_loc: &dyn Fn(u32) -> Loc,
+) -> Effects {
     Effects {
         spawns: callee.spawns,
-        chan_ops: rebase_map(&callee.chan_ops, caller_arg_loc),
-        lock_ops: rebase_map(&callee.lock_ops, caller_arg_loc),
+        chan_ops: rebase_map(&callee.chan_ops, caller_arg_loc, caller_fv_loc),
+        lock_ops: rebase_map(&callee.lock_ops, caller_arg_loc, caller_fv_loc),
     }
 }
 
 fn rebase_map<T: Ord + Copy>(
     m: &BTreeMap<Loc, BTreeSet<T>>,
     caller_arg_loc: &dyn Fn(u32) -> Loc,
+    caller_fv_loc: &dyn Fn(u32) -> Loc,
 ) -> BTreeMap<Loc, BTreeSet<T>> {
     let mut out: BTreeMap<Loc, BTreeSet<T>> = BTreeMap::new();
     for (loc, ops) in m {
-        let new_loc = rebase_loc(loc, caller_arg_loc);
+        let new_loc = rebase_loc(loc, caller_arg_loc, caller_fv_loc);
         out.entry(new_loc).or_default().extend(ops.iter().copied());
     }
     out
 }
 
-fn rebase_loc(loc: &Loc, caller_arg_loc: &dyn Fn(u32) -> Loc) -> Loc {
+fn rebase_loc(
+    loc: &Loc,
+    caller_arg_loc: &dyn Fn(u32) -> Loc,
+    caller_fv_loc: &dyn Fn(u32) -> Loc,
+) -> Loc {
     match &loc.root {
         Root::Param(i) => {
             let caller = caller_arg_loc(*i);
+            let mut path = caller.path.clone();
+            path.extend(loc.path.iter().copied());
+            Loc {
+                root: caller.root,
+                path,
+            }
+            .capped()
+        }
+        Root::FreeVar(i) => {
+            let caller = caller_fv_loc(*i);
             let mut path = caller.path.clone();
             path.extend(loc.path.iter().copied());
             Loc {
@@ -399,7 +458,9 @@ fn record_go_defer_callee(
                 let loc = arg_loc(f, args, 0);
                 e.lock_ops.entry(loc).or_default().insert(op);
             } else {
-                e.join(&rebase(&effects_of(*c), &|i| arg_loc(f, args, i)));
+                e.join(&rebase(&effects_of(*c), &|i| arg_loc(f, args, i), &|_| {
+                    Loc::unknown()
+                }));
             }
             Some(*c)
         }
@@ -492,7 +553,9 @@ pub fn collect(
                     ..
                 } => {
                     static_sites.insert(*c);
-                    e.join(&rebase(&effects_of(*c), &|i| arg_loc(f, args, i)));
+                    e.join(&rebase(&effects_of(*c), &|i| arg_loc(f, args, i), &|_| {
+                        Loc::unknown()
+                    }));
                 }
                 Op::Go { callee, args } => {
                     let s = if cyclic[bi] {
@@ -526,7 +589,9 @@ pub fn collect(
     // could target any implementer.
     for &c in graph.callees(id) {
         if !static_sites.contains(&c) {
-            e.join(&rebase(&effects_of(c), &|_| Loc::unknown()));
+            e.join(&rebase(&effects_of(c), &|_| Loc::unknown(), &|_| {
+                Loc::unknown()
+            }));
         }
     }
 
@@ -689,13 +754,17 @@ mod tests {
             })
             .or_default()
             .insert(LockOp::Lock);
-        let rebased = rebase(&callee, &|i| {
-            assert_eq!(i, 0);
-            Loc {
-                root: Root::Param(3),
-                path: vec![2],
-            }
-        });
+        let rebased = rebase(
+            &callee,
+            &|i| {
+                assert_eq!(i, 0);
+                Loc {
+                    root: Root::Param(3),
+                    path: vec![2],
+                }
+            },
+            &|_| Loc::unknown(),
+        );
         let want = Loc {
             root: Root::Param(3),
             path: vec![2, 1],
@@ -714,10 +783,14 @@ mod tests {
             })
             .or_default()
             .insert(LockOp::Lock);
-        let rebased = rebase(&callee, &|_| Loc {
-            root: Root::Param(0),
-            path: vec![3],
-        });
+        let rebased = rebase(
+            &callee,
+            &|_| Loc {
+                root: Root::Param(0),
+                path: vec![3],
+            },
+            &|_| Loc::unknown(),
+        );
         assert!(
             rebased.lock_ops.contains_key(&Loc::unknown()),
             "3-deep path exceeds MAX_LOC_DEPTH=2: {rebased:?}"
@@ -735,7 +808,7 @@ mod tests {
             })
             .or_default()
             .insert(LockOp::Lock);
-        let rebased = rebase(&callee, &|_| Loc::unknown());
+        let rebased = rebase(&callee, &|_| Loc::unknown(), &|_| Loc::unknown());
         assert_eq!(
             rebased.lock_ops.keys().collect::<Vec<_>>(),
             vec![&Loc::unknown()]
@@ -773,6 +846,148 @@ mod tests {
         let g = CallGraph::build(&p);
         let e = collect(&p, p.lookup_func("t.F").unwrap(), &g, &|_| Effects::empty());
         assert_eq!(e.spawns, Spawns::Bounded);
+    }
+
+    #[test]
+    fn make_chan_dst_roots_at_alloc_site() {
+        // t.F: v2 = MakeChan; Send v2 — the send's Loc must root at
+        // Alloc(2), not Unknown (pre-phase-7 behavior).
+        let mk = crate::testpkg::gvir_make_chan(2, 1); // register 2, cap operand id 1 (helper below)
+        let mut send = instr("Send");
+        send.operands = vec![2, 1];
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![func(
+                "t.F",
+                vec![block(0, vec![mk, send, instr("Return")], vec![])],
+            )],
+        )]);
+        let g = CallGraph::build(&p);
+        let e = collect(&p, p.lookup_func("t.F").unwrap(), &g, &|_| Effects::empty());
+        let want = Loc {
+            root: Root::Alloc(2),
+            path: vec![],
+        };
+        assert!(
+            e.chan_ops
+                .get(&want)
+                .is_some_and(|ops| ops.contains(&ChanOp::Send)),
+            "Send on a make(chan) register must root at the Make's alloc site: {e:?}"
+        );
+    }
+
+    #[test]
+    fn free_var_value_roots_at_free_var_ordinal() {
+        // Anon fn t.F$1 with FreeVar aux id 1; Send on it.
+        // resolve_loc must produce Root::FreeVar(0).
+        let mut send = instr("Send");
+        send.operands = vec![1, 1];
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![crate::testpkg::func_with_free_vars(
+                "t.F$1",
+                vec![1],
+                vec![block(0, vec![send, instr("Return")], vec![])],
+            )],
+        )]);
+        let g = CallGraph::build(&p);
+        let e = collect(&p, p.lookup_func("t.F$1").unwrap(), &g, &|_| {
+            Effects::empty()
+        });
+        let want = Loc {
+            root: Root::FreeVar(0),
+            path: vec![],
+        };
+        assert!(
+            e.chan_ops
+                .get(&want)
+                .is_some_and(|ops| ops.contains(&ChanOp::Send)),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn load_hop_collapses_cell_and_content() {
+        // v2 = Alloc (cell); v3 = Load v2; Send v3 — the loaded channel
+        // shares the cell's Loc: Root::Alloc(2).
+        use goverify_extract::gvir;
+        use goverify_extract::gvir::instruction::Sem;
+
+        let mut alloc = instr("Alloc");
+        alloc.register = 2;
+        alloc.sem = Some(Sem::Alloc(gvir::AllocSem { heap: true }));
+        // gvir has no standalone "Load" wire kind: a dereference load
+        // lowers from "UnOp" with op "*" (lower.rs: `"*" => Op::Load{..}`).
+        let mut load = instr("UnOp");
+        load.register = 3;
+        load.operands = vec![2];
+        load.sem = Some(Sem::Unop(gvir::UnOpSem {
+            op: "*".into(),
+            comma_ok: false,
+        }));
+        let mut send = instr("Send");
+        send.operands = vec![3, 1];
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![func(
+                "t.F",
+                vec![block(0, vec![alloc, load, send, instr("Return")], vec![])],
+            )],
+        )]);
+        let g = CallGraph::build(&p);
+        let e = collect(&p, p.lookup_func("t.F").unwrap(), &g, &|_| Effects::empty());
+        let want = Loc {
+            root: Root::Alloc(2),
+            path: vec![],
+        };
+        assert!(
+            e.chan_ops
+                .get(&want)
+                .is_some_and(|ops| ops.contains(&ChanOp::Send)),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn rebase_free_var_reroots_through_fv_loc() {
+        let mut callee = Effects::empty();
+        callee
+            .chan_ops
+            .entry(Loc {
+                root: Root::FreeVar(0),
+                path: vec![],
+            })
+            .or_default()
+            .insert(ChanOp::Send);
+        let rebased = rebase(&callee, &|_| Loc::unknown(), &|i| {
+            assert_eq!(i, 0);
+            Loc {
+                root: Root::Alloc(7),
+                path: vec![],
+            }
+        });
+        assert!(rebased.chan_ops.contains_key(&Loc {
+            root: Root::Alloc(7),
+            path: vec![]
+        }));
+    }
+
+    #[test]
+    fn rebase_free_var_without_mapping_degrades_to_unknown() {
+        let mut callee = Effects::empty();
+        callee
+            .chan_ops
+            .entry(Loc {
+                root: Root::FreeVar(3),
+                path: vec![],
+            })
+            .or_default()
+            .insert(ChanOp::Send);
+        let rebased = rebase(&callee, &|_| Loc::unknown(), &|_| Loc::unknown());
+        assert_eq!(
+            rebased.chan_ops.keys().collect::<Vec<_>>(),
+            vec![&Loc::unknown()]
+        );
     }
 
     #[test]
@@ -816,6 +1031,7 @@ mod props {
                 (0u32..4).prop_map(Root::Param),
                 Just(Root::Global("t.G".into())),
                 (0u32..8).prop_map(Root::Alloc),
+                (0u32..4).prop_map(Root::FreeVar),
                 Just(Root::Unknown),
             ],
             prop::collection::vec(0u32..4, 0..=2),

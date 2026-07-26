@@ -21,7 +21,7 @@ use crate::summary::{Clause, Formula, Provenance, Summary};
 /// Bump on: entry-format change, any engine/encoding semantic change,
 /// prost major bump, CLI RETRY_FACTOR change (escalated limits are
 /// derived from base limits and deliberately not keyed separately).
-const SCC_CACHE_VERSION: u32 = 2;
+const SCC_CACHE_VERSION: u32 = 3;
 const LAYER: &str = "scc";
 const SCC_ENTRY_FORMAT: u8 = 2;
 
@@ -341,6 +341,10 @@ fn encode_root(r: &Root, out: &mut Vec<u8>) {
             put_u32(out, *i);
         }
         Root::Unknown => out.push(3),
+        Root::FreeVar(i) => {
+            out.push(4);
+            put_u32(out, *i);
+        }
     }
 }
 
@@ -350,6 +354,7 @@ fn decode_root(input: &mut &[u8]) -> Option<Root> {
         1 => Some(Root::Global(take_str(input)?)),
         2 => Some(Root::Alloc(take_u32(input)?)),
         3 => Some(Root::Unknown),
+        4 => Some(Root::FreeVar(take_u32(input)?)),
         _ => None,
     }
 }

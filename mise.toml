@@ -89,3 +89,7 @@ dir = "{{cwd}}"
 [tasks.shakeout]
 description = "phase-4 shakeout: goverify check over pinned bbolt (manual; clones on first run)"
 run = "scripts/shakeout.sh"
+
+[tasks.shakeout-conc]
+description = "phase-7 shakeout: goverify check over pinned golang.org/x/sync (manual; clones on first run)"
+run = "scripts/shakeout_conc.sh"

@@ -534,3 +534,613 @@ $ cd .goverify/shakeout/bbolt && git status --porcelain
   `git log -1 --oneline` → `0d51685 Merge pull request #893 …`.
 - `.goverify/shakeout/{bbolt,cache}` symlinks in this worktree are
   gitignored scaffolding; nothing under `.goverify/` is tracked.
+
+---
+
+# Phase-7 shakeout: the concurrency-heavy pin (`golang.org/x/sync`)
+
+Status: **ALL GATES PASS** (2026-07-27) — concurrency-heavy target,
+Task 12.
+
+Gates per the same spec §9, and this wave's
+[task-12 brief](../../../.superpowers/sdd/2026-07-26-phase7-goroutine-leaks/task-12-brief.md).
+Where bbolt is the *regression* gate, `golang.org/x/sync` is the
+*exercise* gate: `errgroup`, `semaphore` and `singleflight` are the
+densest spawn/channel/WaitGroup code in the stdlib's orbit. The headline
+result is **0 `goroutine-leak` findings, 0 false positives, and a
+sharply-drawn precision boundary**: every channel-blocking op in
+x/sync's non-test code sits one call level below its spawned callee, so
+spec §2 rule 1's nested-helper restriction means the pin cannot
+construct a single candidate. That is documented below per site with IR
+evidence, not assumed.
+
+## Run parameters
+
+- Wave tip (HEAD): `18b71aa` (branch `worktree-phase7-goroutine-leaks`,
+  Tasks 1-11), the same binary Task 11 built — `cargo build --release`
+  inside the script reported `Finished release profile in 0.15s`
+  (no-op). **No EDR first-exec stall**, consistent with Task 11.
+- Pin: **`v0.10.0`**, the brief's default, kept because the tag *does*
+  exist — verified before writing the script:
+
+  ```sh
+  git ls-remote --tags https://github.com/golang/sync | grep v0.10
+  # 913fb63af28f446cd10c684ee847b5606cf328f7  refs/tags/v0.10.0
+  ```
+
+  (22 tags exist, newest `v0.22.0`; no substitution was needed. The
+  script keeps the brief's `GOVERIFY_SHAKEOUT_CONC_REF` override.)
+  Post-run re-verification: `git log -1 --oneline` → `913fb63
+  singleflight: fix typo in singleflight_test.go`, `git describe --tags`
+  → `v0.10.0`.
+- Entrypoint: `scripts/shakeout_conc.sh` (a clone of
+  `scripts/shakeout.sh` with the repo, pin var and `DIR` substituted),
+  exposed as `mise run shakeout-conc`. Clone target
+  `.goverify/shakeout/sync` — a real directory in this worktree
+  (gitignored: `git check-ignore -v` → `.gitignore:2:.goverify/`),
+  created by the first run.
+- Shared shakeout cache: the script inherits `--cache-dir
+  "$(pwd)/../cache"`, i.e. the same pre-warmed
+  `.goverify/shakeout/cache` the bbolt pin uses (reached here through
+  this worktree's existing symlink). x/sync's entries were added by the
+  Step 1 run; `SCC_CACHE_VERSION` is already 3, so no version recompute
+  happened.
+- **Counting convention** — the same finding-header greps as the bbolt
+  section, never `wc -l`.
+- **Scope fact that shapes every number below:** `goverify check ./...`
+  analyzes **non-test packages only**. `debug callgraph ./...` contains
+  no `*_test` entry (`grep -c '_test'` → 1, and that one is
+  `runtime.sync_test_runtime_blockUntilEmptyCleanupQueue`), and `debug
+  summary ./errgroup/...` lists no `errgroup_test` function. So of the
+  **21** `go` statements in the tree, only the **4** in non-test files
+  are in scope:
+
+  ```sh
+  grep -rn --include='*.go' -E '^\s*go\s+(func|[a-zA-Z_])' . | grep -v _test.go
+  # errgroup/errgroup.go:75         go func() { … }()          (*Group).Go
+  # errgroup/errgroup.go:104        go func() { … }()          (*Group).TryGo
+  # singleflight/singleflight.go:138  go g.doCall(c, key, fn)  (*Group).DoChan
+  # singleflight/singleflight.go:167  go panic(e)              doCall$1
+  ```
+
+  `semaphore` and `syncmap` contain **no** `go` statement in non-test
+  code at all. The 17 test-file spawns — including
+  `errgroup_test.go:207`'s textbook `go func() { <-ch }()` — are never
+  seen by this pin.
+
+## Commands
+
+`mise run shakeout-conc` (Step 1) writes findings to stdout and has no
+timings knob, so the gate runs invoke the binary directly with exactly
+the arguments the script uses:
+
+```sh
+W=<this worktree>
+CACHE=/Users/…/goverify/.goverify/shakeout/cache
+export GOVERIFY_EXTRACTOR_DIR="$W/extractor"
+cd .goverify/shakeout/sync
+GOVERIFY_TIMINGS=1 "$W/target/release/goverify" check ./... \
+  --cache-dir "$CACHE" > out.txt 2> out.stderr
+```
+
+Step 1 itself, and a warm repeat of it:
+
+```sh
+mise run shakeout-conc > A-shakeout.txt 2> A-shakeout.stderr
+# stderr tail: "shakeout: exit 1 (0 clean / 1 findings)"
+# warm repeat: real 3.76s (see G3 — the task's wall includes a
+# `git fetch --tags` network round trip and a no-op cargo build)
+```
+
+Fresh-cache (cold) runs substitute `--cache-dir "$(mktemp -d)"`.
+
+## The finding set (2 findings, both pre-existing families)
+
+```
+semaphore/semaphore.go:85:20: nil-deref: call to (*container/list.List).Remove violates its nil-deref requirement [(*golang.org/x/sync/semaphore.Weighted).Acquire]
+singleflight/singleflight.go:31:35: nil-deref: nil dereference in (*golang.org/x/sync/singleflight.panicError).Error [(*golang.org/x/sync/singleflight.panicError).Error]
+```
+
+- nil/bounds-family headers: **2**
+- `chan-(send|recv|select)-leak` headers: **0**
+- output: **845 bytes**, exit **1**, in *every* run recorded here.
+
+Both nil-derefs are nil/bounds-checker output, outside phase-7's remit;
+they are noted only so the total is accounted for. (Neither moved in any
+configuration — see G4, where x/sync showed none of bbolt's
+solver-timeout count drift.)
+
+## Deviations (recorded per the honesty rule)
+
+1. **Test files are out of scope, so the pin exercises far less
+   concurrency than the tree contains.** 17 of 21 `go` sites live in
+   `_test.go` files and are never analyzed (evidence in *Run
+   parameters*). The brief's framing — "dense spawn/channel/WaitGroup
+   usage" — is true of x/sync as a *repository*; it is only partly true
+   of x/sync as an *analysis target*. Stated up front because it caps
+   what a 0-finding result can mean.
+2. **The dominant suppressor is not any single §2 rule but the
+   combination of rule 1 (nested-helper) with `Loc::Unknown`
+   saturation.** All three static spawn sites are silenced by rule 1
+   *before* rules 2-4 are consulted, and all three would additionally
+   be silenced by rule 3, because their spawners' converged effects
+   carry a fully-saturated unknown bucket
+   (`?:[Make,Send,Recv,Close,Select]`). Mechanism, traced in G2c: the
+   `call-dyn` on the user-supplied callback (`f()` in `Go$1`/`TryGo$1`,
+   `fn()` in `doCall$2`) fans the callgraph out to every function value
+   of that signature, which lands these closures in one 208-member
+   recursive SCC that widens to `Provenance::Havoc` / `Effects::top()`
+   after `widen_after = 3` rounds; joining a top summary into the
+   spawner saturates its unknown-loc chan bucket, and rule 3's
+   may-alias clause (`unblocked_at(&Loc::unknown())`) then matches any
+   candidate. **This is the precision boundary for callback-driven
+   concurrency libraries**, and it is a property of the analysis
+   pipeline (dynamic-dispatch fan-out ⇒ SCC widening), not of the leak
+   checker.
+3. **`mise run shakeout-conc` runs `git fetch --tags` on every
+   invocation** (inherited verbatim from `scripts/shakeout.sh`), so the
+   task's wall-clock includes a network round trip: 3.76 s for the task
+   vs 1.12 s for the same analysis invoked directly. Not changed —
+   keeping the two shakeout scripts structurally identical is worth
+   more than shaving 2.6 s off a manual task.
+4. **Cross-lineage byte-identity held here, unlike on bbolt.** bbolt's
+   deviation #2 records that solver counter-model text is only stable
+   within a cache lineage. On x/sync both fresh-cache lineages are
+   `cmp`-silent against the shared-warm output. That is a *weaker,
+   luckier* result, not a change to the invariant: with only two
+   findings, both counter-models (`p0 = (ptr-addr #x0…)`, `p0 =
+   ptr-nil`) happen to be the assignment Z3 returns every time. Byte
+   comparisons in the gates below are still made within a lineage; the
+   cross-lineage `cmp`s are reported as a bonus.
+5. **The clone is clean** — `git status --porcelain` in
+   `.goverify/shakeout/sync` prints nothing, so this pin has none of the
+   stray `.z3-trace` that bbolt's clone carries.
+
+## Gate results
+
+### G1 — determinism: six runs, byte-identical
+
+| run | invocation | cache | bytes | nil/bounds | leak |
+|---|---|---|---|---|---|
+| `A-shakeout` | `mise run shakeout-conc` (Step 1) | shared warm | 845 | 2 | **0** |
+| `W1` | direct, `GOVERIFY_TIMINGS=1` | shared warm | 845 | 2 | **0** |
+| `W2` | direct | shared warm | 845 | 2 | **0** |
+| `W3` | direct | shared warm | 845 | 2 | **0** |
+| `A2-shakeout` | `mise run shakeout-conc` (warm repeat) | shared warm | 845 | 2 | **0** |
+| `R-restore` | direct, after the G2a probe was reverted | shared warm | 845 | 2 | **0** |
+
+```sh
+cmp W1 W2; cmp W1 W3            # silent
+cmp A-shakeout W1; cmp A2 W1    # silent
+cmp R-restore W1                # silent  (probe round-trip)
+```
+
+- All five `cmp`s silent — identical finding set, order, rendered source
+  lines and solver counter-models.
+- No `/Users`, `/private/tmp` or `/var/folders` substring in the output
+  (`grep -cE '/Users|/private/tmp|/var/folders' W1.txt` → 0).
+- Both fresh-cache lineages are additionally `cmp`-silent against `W1`
+  (deviation #4).
+
+→ **G1 PASS** (the brief asks for two byte-identical runs; six were
+measured).
+
+### G2 — triage of every `goroutine-leak` finding on x/sync
+
+**Findings to triage: 0.** No `chan-send-leak`, `chan-recv-leak` or
+`chan-select-leak` header appears in any of the six unprobed runs, or in
+either fresh-cache lineage:
+
+```sh
+grep -cE '^[^ ].*: chan-(send|recv|select)-leak: ' W1.txt   # 0
+```
+
+Per the brief, zero findings is acceptable **only** with a liveness
+proof (G2a) and hand traces of the plausible sites (G2b), plus a written
+account of the FN surface (G2d).
+
+#### G2a — the checker is live on x/sync (dogfood probe)
+
+The canonical reported shape was appended to the x/sync **working
+copy**'s `errgroup/errgroup.go` (a copy of
+`testdata/corpus/leak/leak.go`'s `LeakSendClosure`):
+
+```go
+// goverify shakeout probe (phase-7 Task 12, G2a): the canonical
+// chan-send-leak shape (mirrors testdata/corpus/leak LeakSendClosure).
+func goverifyLeakProbe() {
+	ch := make(chan int)
+	go func() { ch <- 1 }()
+	_ = ch
+}
+```
+
+`go build ./...` clean. `goverify check ./... --cache-dir "$CACHE"` then
+reports exactly one leak finding and leaves the nil/bounds set untouched
+(still 2):
+
+```
+errgroup/errgroup.go:141:2: chan-send-leak: goroutine golang.org/x/sync/errgroup.goverifyLeakProbe$1 may block forever: send on a spawner-created channel with no receive, close, or select in the spawning environment [golang.org/x/sync/errgroup.goverifyLeakProbe]
+  141 |  go func() { ch <- 1 }()
+      |  ^
+    path: errgroup/errgroup.go:140
+```
+
+The probe also **isolates the suppressor**: it fires from inside the
+very package whose other functions carry saturated unknown buckets,
+because rule 3's `env` is the *spawner's own* converged effects, not the
+package's. `debug summary --func goverifyLeakProbe` confirms a clean
+spawner:
+
+```
+errgroup.goverifyLeakProbe    effects={spawns:Bounded chan:{alloc:1:[Send] alloc:2:[Make]} locks:{}}
+errgroup.goverifyLeakProbe$1  effects={spawns:None    chan:{fv:0:[Send]}                locks:{}}
+```
+
+— no `?` entry, so nothing suppresses it, and `fv:0` shows the phase-7
+`Root::FreeVar` machinery resolving the captured channel. Cleanup: `git
+checkout -- errgroup/errgroup.go`, re-run, `cmp` against the pre-probe
+warm output → **silent** (`R-restore` in G1); `git status --porcelain`
+empty.
+
+#### G2b — per-`go`-site hand traces (why x/sync is genuinely silent)
+
+All four in-scope sites are traced against spec §2's rules. Outcome:
+**zero false positives**; three sites are silent *and* leak-free in
+ground truth; one is not a candidate at all. IR quotes are from
+`goverify debug ir`, effects quotes from `goverify debug summary`.
+
+**1. `errgroup/errgroup.go:75` — `go func() { defer g.done(); … }()` in
+`(*Group).Go` → not a candidate (rule 1, nested-helper)**
+
+```go
+69: func (g *Group) Go(f func() error) {
+70: 	if g.sem != nil {
+71: 		g.sem <- token{}
+72: 	}
+73:
+74: 	g.wg.Add(1)
+75: 	go func() {
+76: 		defer g.done()
+77:
+78: 		if err := f(); err != nil {
+79: 			g.errOnce.Do(func() { … })
+85: 		}
+86: 	}()
+```
+
+```go
+36: func (g *Group) done() {
+37: 	if g.sem != nil {
+38: 		<-g.sem
+39: 	}
+40: 	g.wg.Done()
+41: }
+```
+
+Rule 1 requires a `Send`/`Recv`/blocking `Select` **syntactically in the
+spawned callee's own body**. `Go$1`'s lowered body contains none — the
+whole body is a defer, a dynamic call and a `sync.Once.Do`:
+
+```
+func (*errgroup.Group).Go$1 ()
+  b0: v3 = load v1
+      defer call (*errgroup.Group).done(v3 v0)
+      v4 = alloc heap=true
+      v5 = load v2
+      v6 = call-dyn v5()          ← f()
+      …
+  b2: v11 = make-closure (*errgroup.Group).Go$1$1 [v1 v4]
+      v12 = call (*sync.Once).Do(v10 v11)
+```
+
+The only channel op the goroutine can reach, `<-g.sem`, lives in
+`done` — reached through the `defer`, one call level down. Per spec §2
+rule 1, "a nested-helper op is never itself the subject of a finding"
+(§10's deferred "nested-helper blocking ops / cross-function obligation
+anchoring"). **No candidate is constructed**, so rules 2-4 are never
+consulted.
+
+Two independent suppressors would have applied had rule 1 been relaxed.
+`done`'s Recv is keyed `p0.f2` (i.e. `Param(0).sem`), and the `Go` site's
+`make-closure … [v3 v4]` binds `v3`, the heap cell holding the receiver —
+so the rebased spawner-side key is `alloc:3.f2`, exactly where `Go`'s own
+effects record the counterpart:
+
+```
+(*errgroup.Group).Go  effects={spawns:Unbounded
+  chan:{alloc:3.f2:[Send]  ?:[Make,Send,Recv,Close,Select]} …}
+```
+
+- **Rule 3, same `Loc`:** `alloc:3.f2:[Send]` — the `g.sem <- token{}`
+  at line 71 is a `Send`, an unblocker for a blocked `Recv`.
+- **Rule 3, `Loc::unknown()`:** the saturated `?` bucket matches
+  anything (deviation #2).
+
+**Verdict: correctly silent. Not a leak** — every `Go` that takes a
+`sem` slot sends exactly one token, and the `done` deferred on the same
+goroutine takes exactly one back; `g.sem` is buffered to the limit, so
+neither side can park forever.
+
+**2. `errgroup/errgroup.go:104` — the same closure in `(*Group).TryGo`
+ → not a candidate (rule 1, nested-helper)**
+
+```go
+93: func (g *Group) TryGo(f func() error) bool {
+94: 	if g.sem != nil {
+95: 		select {
+96: 		case g.sem <- token{}:
+98: 		default:
+99: 			return false
+100: 		}
+101: 	}
+103: 	g.wg.Add(1)
+104: 	go func() { … defer g.done() … }()
+```
+
+`TryGo$1`'s lowered body is instruction-for-instruction the same shape
+as `Go$1`'s (defer `done`, `call-dyn v5()`, `sync.Once.Do`) — no channel
+op of its own. **Rule 1: no candidate**, same nested-helper reason.
+
+Secondary suppressors, again both live:
+
+```
+(*errgroup.Group).TryGo  effects={spawns:Unbounded
+  chan:{alloc:3.f2:[Select]  ?:[Make,Send,Recv,Close,Select]} …}
+```
+
+- **Rule 3, same `Loc`:** `alloc:3.f2:[Select]` — the lowered
+  `v12 = select blocking=false [send v11 <- v20]`. `Select` is in a
+  `Recv` candidate's unblocker set. Worth naming the sharp edge: that
+  entry is *direction-blind* (spec §10's "`ChanOp::Select` direction
+  refinement"), so the match is not evidence the analysis understood
+  which arm it was. Here the arm genuinely *is* the counterpart send, so
+  direction-blindness costs nothing at this site — but it is luck, not
+  reasoning.
+- **Rule 3, `Loc::unknown()`:** saturated `?` bucket.
+
+**Verdict: correctly silent. Not a leak** — identical token discipline
+to site 1, with the send made conditional by a non-blocking select
+(which by construction never blocks the spawner either).
+
+**3. `singleflight/singleflight.go:138` — `go g.doCall(c, key, fn)` in
+`(*Group).DoChan` → not a candidate (rule 1); would also fail rule 2 and
+rule 3**
+
+```go
+121: func (g *Group) DoChan(key string, fn func() (interface{}, error)) <-chan Result {
+122: 	ch := make(chan Result, 1)
+…
+133: 	c := &call{chans: []chan<- Result{ch}}
+134: 	c.wg.Add(1)
+135: 	g.m[key] = c
+136: 	g.mu.Unlock()
+137:
+138: 	go g.doCall(c, key, fn)
+139:
+140: 	return ch
+141: }
+```
+
+- **Rule 1:** `doCall`'s own lowered body is six allocs, two
+  `make-closure`s, a `defer call … doCall$1`, a `call … doCall$2` and a
+  branch — **no `send`, `recv` or `select`**. Every channel op is in
+  `doCall$1`, the deferred closure: `send v60 <- v75` (the
+  `ch <- Result{…}` loop at singleflight.go:177) and
+  `v48 = select blocking=true []` (the `select {}` at :168). Both are
+  one call level below the spawned callee ⇒ nested-helper ⇒ no
+  candidate.
+- **Rule 2 (escape) would also fail.** `ch` is `v4 = make Chan v45` in
+  `DoChan`, and `DoChan`'s IR spills it three ways: `v25 = assign v4;
+  store v24 <- v25` where `v24 = index-addr v23 …` and
+  `v23 = alloc heap=true` — a `Store` of a tracked value into an
+  untracked, non-channel cell (the slice backing for
+  `[]chan<- Result{ch}`); `v27 = call-builtin append(v22 v26)` — a
+  builtin outside the `close`/`len`/`cap` whitelist; and `return v31` /
+  `return v44` — returned.
+- **Rule 3 would also fire:**
+
+  ```
+  (*singleflight.Group).DoChan  effects={spawns:Unbounded
+    chan:{alloc:4:[Make]  ?:[Make,Send,Recv,Close,Select]} …}
+  ```
+
+  The `?` bucket contains `Recv`/`Select`/`Close`, all unblockers for a
+  blocked send.
+
+**Verdict: correctly silent. Not a leak** — `ch` is
+`make(chan Result, 1)`, and `doCall$1` sends **exactly one** `Result`
+per registered channel (`for _, ch := range c.chans`), so the send
+cannot block even though `DoChan`'s doc says "The returned channel will
+not be closed" and a caller may abandon it. The cap-1 buffer is
+precisely the mechanism that makes abandonment safe, and ground truth
+agrees with the silence for a reason the checker's rule 2 (escape) also
+happens to reach.
+
+**4. `singleflight/singleflight.go:167` — `go panic(e)` inside
+`doCall$1` → not a candidate (non-static `go` callee)**
+
+```go
+163: 		if e, ok := c.err.(*panicError); ok {
+166: 			if len(c.chans) > 0 {
+167: 				go panic(e)
+168: 				select {} // Keep this goroutine around so that it will appear in the crash dump.
+169: 			} else {
+170: 				panic(e)
+171: 			}
+```
+
+Lowered:
+
+```
+  b9: v47 = make-interface v35
+      go call-builtin panic(v47)
+      v48 = select blocking=true []
+      v49 = extract v48 #0
+      v50 = make-interface v84
+      panic v50
+```
+
+`candidates` matches only `Op::Go { callee: Callee::Static(c) }` whose
+target has a body; a `Callee::Builtin` go callee is skipped outright.
+**No candidate.**
+
+The adjacent `select {}` deserves an explicit note because it is a
+*deliberately* permanently-blocked goroutine — exactly the shape the
+checker's name suggests it should flag — and v1 is silent on it twice
+over, both times correctly:
+
+- v1's finding definition anchors **only at an `Op::Go`**. This
+  `select {}` blocks the goroutine that is already running (the one
+  spawned back at DoChan:138), and rule 1 requires the op to be in *that
+  `Go`'s* spawned callee's own body — it is in `doCall$1`, one level
+  down.
+- Even reached, `candidates` has `if arms.is_empty() { continue; }`, so
+  a zero-arm select can never become a candidate.
+
+**Verdict: correctly silent, and correctly so on the merits** — the
+comment on line 168 says the block is intentional (keep the goroutine in
+the crash dump while the sibling `go panic` crashes the process). A tool
+that flagged it would be wrong.
+
+**`semaphore` — no `go` statement, hence no candidate anywhere.**
+Recorded because the brief names it: `semaphore.go`'s channel machinery
+(`ready := make(chan struct{})` at :69, the blocking `select` at :74-106,
+`close(w.ready)` at :158) all executes on the **caller's** goroutine.
+With no `Op::Go` in the package there is nothing for this checker to
+anchor on, by definition — not a silence rule firing, an absence of
+subject matter. (The one `semaphore` nil-deref finding, at
+`s.waiters.Remove(elem)` on the cancellation path of that same
+`Acquire` select, is the nil checker's output, not this checker's.)
+
+#### G2c — the `Loc::Unknown` saturation, traced to its cause
+
+Deviation #2's mechanism, since "Unknown contamination" is only a useful
+finding if its origin is named:
+
+```sh
+goverify debug sccs ./errgroup/... | grep 'errgroup.Group).Go\$1'
+# scc 2094 [recursive]: (*context.afterFuncCtx).cancel, … ,
+#   (*golang.org/x/sync/errgroup.Group).Go$1, …          (208 members)
+```
+
+`Go$1` contains `v6 = call-dyn v5()` — the user's `f()`. Dynamic
+dispatch fans out to every function value of that signature, which drags
+208 functions (context cancellation closures, runtime internals,
+`sync.OnceFunc$1`, …) into one recursive SCC. `Options::widen_after` is
+3, so the SCC widens to `Summary::havoc()` — `Effects::top()`,
+`provenance=Havoc`:
+
+```
+(*errgroup.Group).Go$1     … chan:{?:[Make,Send,Recv,Close,Select]} … provenance=Havoc
+(*errgroup.Group).TryGo$1  … chan:{?:[Make,Send,Recv,Close,Select]} … provenance=Havoc
+```
+
+`effects::collect` joins a spawned goroutine's summary into its
+spawner's, so `Go`/`TryGo`/`DoChan`/`doCall` all inherit the saturated
+`?` bucket, and rule 3's may-alias clause matches every candidate in
+them. **Consequence to carry forward:** even after §10's nested-helper
+anchoring lands, callback-shaped concurrency code will stay silent until
+dynamic-dispatch fan-out stops widening these SCCs to top. That is an
+*analysis-pipeline* limit, upstream of the leak checker, and it is the
+single most important thing this pin measured.
+
+#### G2d — observed false-negative surface (documented, not failures)
+
+- **WaitGroup ops are invisible to v1** (spec §10, phase B second half),
+  and x/sync's *primary* blocking discipline is WaitGroup-based, not
+  channel-based: `errgroup`'s `g.wg.Add(1)` / `g.wg.Done()` (in `done`)
+  / `g.wg.Wait()` (in `Wait`), and `singleflight`'s `c.wg.Add(1)` /
+  `c.wg.Wait()` (in `Do`) / `c.wg.Done()` (in `doCall$1`). In the IR
+  these are ordinary `call (*sync.WaitGroup).Add/Done/Wait` instructions
+  with no channel effect at all. A caller that misuses `errgroup`
+  (`Go` after `Wait`, or a task that never returns) hangs in
+  `g.wg.Wait()`, and v1 has no vocabulary for it. Observed FN surface,
+  per the brief — not a gate failure.
+- **Nested-helper anchoring (rule 1)** is the binding limit on this
+  target: *all three* static spawn sites put their blocking op one call
+  level below the spawned callee (`done`, `doCall$1`). Until §10's
+  cross-function obligation anchoring lands, the checker's candidate
+  scan cannot see any real x/sync channel op. This is the concrete
+  real-world motivation for that queued item, alongside bbolt's
+  `(*Tx).Check`.
+- **`Loc::Unknown` saturation (G2c)** would be the next barrier even
+  after that.
+- No **can't-tell** verdicts: every site resolved to either
+  "correctly silent, not a leak" or "not a candidate", each with IR
+  evidence.
+
+**G2 summary:** 0 findings; **0 false positives**; 4 in-scope sites
+traced (3 correctly silent with ground truth agreeing, 1 not a candidate
+at all); 1 deliberate-block site (`select {}`) correctly not flagged;
+0 spawn sites in `semaphore`/`syncmap`; 2 documented FN surfaces
+(WaitGroup, nested-helper anchoring) and 1 documented upstream precision
+limit (SCC widening ⇒ Unknown saturation).
+→ **G2 PASS** (no FP ⇒ no blocker).
+
+### G3 — cold/warm wall-clock
+
+| run | cache | extract cache | extract+load | analyze | scc cache | wall (`real`) |
+|---|---|---|---|---|---|---|
+| `W1` | shared warm | 67 hit / 0 | 0.40s | 0.70s | 7782 hit / 0 miss | **1.12s** |
+| `W2` | shared warm | 67 hit / 0 | 0.42s | 0.67s | 7782 / 0 | **1.11s** |
+| `W3` | shared warm | 67 hit / 0 | 0.38s | 0.71s | 7782 / 0 | **1.12s** |
+| `C-cold` | fresh #1 | 0 hit / 67 extracted | 1.06s | 91.03s | 0 hit / 7782 miss | **1:32.1** |
+| `C-warm1` | fresh #1, warm | 67 / 0 | 0.43s | 0.62s | 7782 / 0 | 1.10s |
+| `C-warm2` | fresh #1, warm | 67 / 0 | 0.41s | 0.69s | 7782 / 0 | 1.13s |
+| `NF2-cold` | fresh #2 | 0 / 67 | 1.02s | 92.95s | 0 / 7782 | **1:34.0** |
+| `NF2-warm` | fresh #2, warm | 67 / 0 | 0.54s | 0.64s | 7782 / 0 | 1.27s |
+
+- Warm mean (shared lineage): **1.117 s**. Cold: **92.1 s / 94.0 s**.
+- Comfortably under bbolt's, as the brief expected: **3.1× faster warm**
+  (1.12 s vs 3.41 s) and **2.3× faster cold** (92 s vs 3:29.9), on 67
+  packages / 7782 SCCs vs bbolt's 220 / 18965.
+- Cold→warm speedup: **~82×** (92.1 s → 1.12 s).
+- `mise run shakeout-conc` measures **3.76 s** warm — 1.12 s of analysis
+  plus a no-op `cargo build --release` and a `git fetch --tags` network
+  round trip (deviation #3).
+- Solver escalations to the retry tier: 31 on the Step 1 run (partly
+  cold against the bbolt-shaped shared cache), 60 and 69 on the two
+  cold runs, 0 on every fully-warm replay. Unlike bbolt, **no count
+  ever drifted**: 2 nil/bounds + 0 leak in all eight runs.
+
+→ **G3 PASS**.
+
+### G4 — cold vs. warm byte-identical (cache correctness)
+
+Two independent `mktemp -d` lineages, each one cold run followed by warm
+replays of the same binary:
+
+| lineage | comparison | result | nil/bounds | leak |
+|---|---|---|---|---|
+| fresh #1 | `cmp C-cold C-warm1` | **silent** | 2 | 0 |
+| fresh #1 | `cmp C-cold C-warm2` | **silent** | 2 | 0 |
+| fresh #2 | `cmp NF2-cold NF2-warm` | **silent** | 2 | 0 |
+
+- All six outputs are 845 bytes with identical counts.
+- Bonus (deviation #4): `cmp C-cold W1` and `cmp NF2-cold W1` are also
+  silent — cross-lineage byte-identity, which bbolt could only achieve
+  at signature level.
+
+→ **G4 PASS** (cache replay is output-preserving, in both lineages).
+
+## Cleanup verification
+
+```
+$ cd .goverify/shakeout/sync && git status --porcelain
+$ git log -1 --oneline
+913fb63 singleflight: fix typo in singleflight_test.go
+$ git describe --tags
+v0.10.0
+```
+
+- `errgroup/errgroup.go` restored via `git checkout --` after the G2a
+  probe; post-restore `check` output `cmp`-identical to the pre-probe
+  warm run (`R-restore` in G1). Working tree fully clean — no stray
+  files at all.
+- Both `mktemp -d` caches removed.
+- `.goverify/shakeout/sync` (the clone) and `.goverify/shakeout/cache`
+  (symlink to the shared cache) are gitignored scaffolding;
+  `git ls-files .goverify` is empty.
+- No `.gvir` schema drift: `git diff --stat proto/ extractor/` is empty
+  (this wave never touches them).

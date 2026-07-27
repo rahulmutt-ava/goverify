@@ -476,6 +476,34 @@ pub(crate) fn go_call_via_closure(target: &str, closure_register: u32) -> gvir::
     }
 }
 
+/// `defer <target>(args…)` — static deferred call; same operand
+/// convention as `go_call_args` (`[callee slot, args…]`, slot dropped by
+/// lowering — lower.rs's "Call" | "Defer" | "Go" arm).
+pub(crate) fn defer_call_args(target: &str, args: Vec<u32>) -> gvir::Instruction {
+    let mut operands = vec![0];
+    operands.extend(args);
+    gvir::Instruction {
+        kind: "Defer".into(),
+        operands,
+        sem: Some(Sem::Call(gvir::CallSem {
+            static_callee: target.into(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+}
+
+/// `defer <closure>()` where `<target>` is invoked through a
+/// `MakeClosure` register — mirrors `go_call_via_closure`: operands are
+/// just `[closure_register]`, bindings carried by the MakeClosure site.
+#[allow(dead_code)]
+pub(crate) fn defer_call_via_closure(target: &str, closure_register: u32) -> gvir::Instruction {
+    gvir::Instruction {
+        operands: vec![closure_register],
+        ..defer_call_args(target, vec![])
+    }
+}
+
 /// `go` through a dynamic (function-value) callee: empty
 /// `static_callee`/`builtin`/`invoke` in `CallSem` is exactly the "none
 /// of the above" shape lower.rs's `Call`/`Defer`/`Go` arm falls through

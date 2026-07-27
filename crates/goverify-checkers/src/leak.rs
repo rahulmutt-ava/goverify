@@ -42,6 +42,7 @@ pub(crate) enum CandKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HopKind {
     Call,
+    Defer,
 }
 
 /// The one-hop record (spec §2 rule 1 case 2): the blocking op lives in
@@ -331,6 +332,10 @@ pub(crate) fn candidates(p: &Program, f: &Function) -> Vec<Candidate> {
                             args,
                             ..
                         } => (HopKind::Call, *h, args),
+                        Op::Defer {
+                            callee: Callee::Static(h),
+                            args,
+                        } => (HopKind::Defer, *h, args),
                         _ => continue,
                     };
                     if h == c {
@@ -1130,11 +1135,13 @@ mod tests {
     use goverify_solver::{Logic, SolverLimits, Sort, Z3Native};
 
     use super::*;
+    #[allow(unused_imports)] // wired for Task 4 (deferred-closure hop test)
+    use crate::testfix::defer_call_via_closure;
     use crate::testfix::{
         alloc_instr, block, branch_on, call_builtin, call_static, change_type_instr, const_int_aux,
-        field_addr_on, fn_aux, func_with_aux, func_with_free_vars, func_with_params, go_call_args,
-        go_call_dynamic, go_call_via_closure, gvir_make_chan, instr, load_instr, make_closure,
-        make_interface_instr, pkg, recv, ret, select, send, store,
+        defer_call_args, field_addr_on, fn_aux, func_with_aux, func_with_free_vars,
+        func_with_params, go_call_args, go_call_dynamic, go_call_via_closure, gvir_make_chan,
+        instr, load_instr, make_closure, make_interface_instr, pkg, recv, ret, select, send, store,
     };
 
     /// F: v2 = make(chan); go t.G(v2). G(p1): p1 <- x.
@@ -1254,6 +1261,44 @@ mod tests {
                 path: vec![]
             }
         );
+    }
+
+    /// G(p1): defer t.H(p1); H(p1): <-p1 — the errgroup (*Group).done
+    /// shape. The defer instruction is the anchor (spec §5.2's documented
+    /// over-approximation).
+    #[test]
+    fn defer_static_hop_recv_yields_hop_candidate() {
+        let param_c = || gvir::Param {
+            id: 1,
+            name: "c".into(),
+            r#type: 0,
+        };
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux("t.F", vec![const_int_aux(1, 0)], hop_f_blocks()),
+                func_with_params(
+                    "t.G",
+                    vec![param_c()],
+                    vec![block(
+                        0,
+                        vec![defer_call_args("t.H", vec![1]), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.H",
+                    vec![param_c()],
+                    vec![block(0, vec![recv(2, 1), ret(vec![])], vec![])],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let cands = candidates(&p, f);
+        assert_eq!(cands.len(), 1, "one defer hop candidate: {cands:?}");
+        assert_eq!(cands[0].kind, CandKind::Recv);
+        assert_eq!(cands[0].hop.as_ref().map(|h| h.kind), Some(HopKind::Defer));
+        assert_eq!(cands[0].alloc_value, ValueId(2));
     }
 
     /// G both sends AND calls itself recursively: the direct scan anchors

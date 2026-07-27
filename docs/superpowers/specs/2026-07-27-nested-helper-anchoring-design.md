@@ -114,15 +114,6 @@ roots at a `g`-local `Alloc` after the first mapping, which the second
 mapping degrades to `Unknown` — so goroutine-internal channels drop
 out, as today.
 
-Scan shape: inside the existing per-`Go`-site loop, after the direct
-scan of `g`'s body, iterate `g`'s blocks in index order for
-`Op::Call`/`Op::Defer` with a static bodied callee `h ≠ g`, and scan
-`h`'s body in block/instr order for the same three op shapes with the
-double rebase above. A blocking `Select` in `h` requires **every** arm
-to map to `Root::Alloc` in `f` through both hops (mirror of the direct
-rule). All lookups bounds-checked, total, panic-free; unmapped shapes
-yield no candidate. Scan order is fully index-ordered in both frames —
-no map iteration reaches the output.
 
 **Implementation amendment (Task 4):** the hop-site mapping is
 `map_through_hop`, which adds one rule `map_through_site` doesn't
@@ -134,6 +125,17 @@ deferred-closure shape (§1's `doCall$1`) dead-ends: go/ssa spills a
 closure-captured param to a cell and binds the cell, so the naive
 mapping roots at Alloc-in-`g` and degrades. Two stores into the cell,
 or non-Param/FreeVar content, degrade to Unknown as before.
+
+Scan shape: inside the existing per-`Go`-site loop, after the direct
+scan of `g`'s body, iterate `g`'s blocks in index order for
+`Op::Call`/`Op::Defer` with a static bodied callee `h ≠ g`, and scan
+`h`'s body in block/instr order for the same three op shapes with the
+double rebase above. A blocking `Select` in `h` requires **every** arm
+to map to `Root::Alloc` in `f` through both hops (mirror of the direct
+rule). All lookups bounds-checked, total, panic-free; unmapped shapes
+yield no candidate. Scan order is fully index-ordered in both frames —
+no map iteration reaches the output.
+
 
 ## 4. Obligation query
 

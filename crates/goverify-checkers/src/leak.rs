@@ -885,6 +885,17 @@ pub(crate) fn cap_class(p: &Program, f: &Function, cand: &Candidate) -> CapClass
         Some(n) => {
             // Only `Send` remains: `Select` returned above, `Recv`
             // matched the prior arm regardless of its capacity value.
+            if cand.hop.is_some() {
+                // Spec §5.1: a hop candidate's fill count would span
+                // two frames, and for a Defer hop the DAG-ancestor rule
+                // is wrong outright (a deferred helper runs after ALL
+                // of g, not after the defer site). Never emit a wrong
+                // ordinal — buffered hop sends are Silent. This also
+                // guards the cyclic check below, whose `cand.op_block`
+                // indexes the helper's frame for a hop candidate, not
+                // `cand.callee`'s.
+                return CapClass::Silent;
+            }
             let Some(callee_fn) = p.func(cand.callee) else {
                 return CapClass::Silent;
             };
@@ -2984,6 +2995,58 @@ mod tests {
             candidates(&p, f).is_empty(),
             "double-stored cell must not bridge"
         );
+    }
+
+    /// Buffered (cap 1) send via a hop: the ordinal fill-count would span
+    /// two frames (and is wrong outright for Defer hops), so
+    /// hop+BufferedConst degrades to Silent (spec §5.1).
+    #[test]
+    fn hop_buffered_send_is_silent() {
+        let p = hop_send_pkg(hop_f_blocks(), 1);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let cands = candidates(&p, f);
+        assert_eq!(cands.len(), 1, "one hop candidate: {cands:?}");
+        assert!(cands[0].hop.is_some());
+        assert_eq!(cap_class(&p, f, &cands[0]), CapClass::Silent);
+    }
+
+    /// Buffered recv via a hop stays reachability-only (Unbuffered): a
+    /// recv with zero senders blocks regardless of buffer size — no
+    /// ordinal is ever involved, so the hop changes nothing.
+    #[test]
+    fn hop_buffered_recv_stays_unbuffered() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux("t.F", vec![const_int_aux(1, 1)], hop_f_blocks()),
+                func_with_params(
+                    "t.G",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(
+                        0,
+                        vec![call_static("t.H", 2, 0, vec![1]), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.H",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(0, vec![recv(2, 1), ret(vec![])], vec![])],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let cands = candidates(&p, f);
+        assert_eq!(cands.len(), 1, "one hop recv candidate: {cands:?}");
+        assert_eq!(cap_class(&p, f, &cands[0]), CapClass::Unbuffered);
     }
 
     #[test]

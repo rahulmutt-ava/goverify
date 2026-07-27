@@ -126,6 +126,125 @@ fn map_through_site(
     }
 }
 
+/// One blocking op found in a host function's own body whose channel
+/// (every arm's channel, for a Select) maps to `Root::Alloc` in the
+/// spawner under the caller-supplied `map` — the raw material
+/// `candidates` wraps into a `Candidate`. `map` is the frame-mapping
+/// composition: go-site only for the direct scan; hop-site then go-site
+/// for the helper scan (Task 2 of the 2026-07-27 wave).
+struct BodyHit {
+    op_block: usize,
+    op_instr: usize,
+    kind: CandKind,
+    /// Resolved in the host's own frame; `Loc::unknown()` for Select.
+    callee_loc: Loc,
+    /// Spawner-frame; `Root::Alloc` guaranteed by construction (first
+    /// arm's loc, for a Select).
+    mapped: Loc,
+    /// Select only: every arm's spawner-frame loc, paired with the
+    /// arm's dir (1 = send, 2 = recv). Empty for Send/Recv.
+    arm_locs: Vec<(u32, Loc)>,
+}
+
+/// Scans `host_f`'s own body, in block/instr index order, for
+/// `Send`/`Recv`/blocking-`Select` ops whose channel maps to a
+/// `Root::Alloc` in the spawner under `map`. A blocking `Select` needs
+/// EVERY arm mapped to `Root::Alloc`. Total and panic-free: an
+/// unmapped or unrecognized shape yields no hit.
+fn scan_body(host_f: &Function, map: &dyn Fn(&Loc) -> Loc) -> Vec<BodyHit> {
+    let mut out = Vec::new();
+    for (op_block, blk) in host_f.blocks.iter().enumerate() {
+        for (op_instr, ins) in blk.instrs.iter().enumerate() {
+            match &ins.op {
+                Op::Send { chan, .. } | Op::Recv { chan, .. } => {
+                    let callee_loc = resolve_loc(host_f, *chan);
+                    let mapped = map(&callee_loc);
+                    if matches!(mapped.root, Root::Alloc(_)) {
+                        let kind = if matches!(ins.op, Op::Send { .. }) {
+                            CandKind::Send
+                        } else {
+                            CandKind::Recv
+                        };
+                        out.push(BodyHit {
+                            op_block,
+                            op_instr,
+                            kind,
+                            callee_loc,
+                            mapped,
+                            arm_locs: Vec::new(),
+                        });
+                    }
+                }
+                Op::Select {
+                    arms,
+                    blocking: true,
+                    ..
+                } => {
+                    if arms.is_empty() {
+                        continue;
+                    }
+                    let mut mapped_arms: Vec<(u32, Loc)> = Vec::with_capacity(arms.len());
+                    let mut all_alloc = true;
+                    for arm in arms {
+                        let arm_loc = resolve_loc(host_f, arm.chan);
+                        let mapped = map(&arm_loc);
+                        if !matches!(mapped.root, Root::Alloc(_)) {
+                            all_alloc = false;
+                            break;
+                        }
+                        mapped_arms.push((arm.dir, mapped));
+                    }
+                    if !all_alloc {
+                        continue;
+                    }
+                    let Some(first) = mapped_arms.first().map(|(_, l)| l.clone()) else {
+                        continue;
+                    };
+                    out.push(BodyHit {
+                        op_block,
+                        op_instr,
+                        kind: CandKind::Select,
+                        callee_loc: Loc::unknown(),
+                        mapped: first,
+                        arm_locs: mapped_arms,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Wraps a `BodyHit` into a `Candidate` at this go site. `None` only on
+/// a non-Alloc `mapped` root, which `scan_body` never produces — kept
+/// total rather than panicking on that invariant.
+fn candidate_from(
+    go_block: usize,
+    go_pos: Option<Pos>,
+    callee: FuncId,
+    hit: BodyHit,
+) -> Option<Candidate> {
+    let Root::Alloc(a) = hit.mapped.root else {
+        return None;
+    };
+    Some(Candidate {
+        go_block,
+        go_pos,
+        callee,
+        op_block: hit.op_block,
+        op_instr: hit.op_instr,
+        kind: hit.kind,
+        callee_loc: hit.callee_loc,
+        alloc_value: ValueId(a),
+        spawner_loc: Loc {
+            root: Root::Alloc(a),
+            path: hit.mapped.path,
+        },
+        arm_locs: hit.arm_locs,
+    })
+}
+
 /// Scans `f`'s blocks in index order for `Op::Go { callee: Callee::Static
 /// }` sites whose target has a body, then scans that target's *own* body
 /// (v1: syntactically-direct only — a blocking op reached only through a
@@ -137,8 +256,8 @@ fn map_through_site(
 /// nothing. A blocking `Select` needs *every* arm mapped to `Root::Alloc`
 /// (the first arm's alloc/loc becomes the `Candidate`'s own fields;
 /// `arm_locs` carries all of them, for Task 6 to re-check each one).
-/// Total and panic-free: every id lookup is bounds-checked; an
-/// unrecognized or unmapped shape simply yields no candidate.
+/// The per-op scan now lives in `scan_body`, parameterized over the
+/// loc-mapping function.
 pub(crate) fn candidates(p: &Program, f: &Function) -> Vec<Candidate> {
     let cb = closure_bindings(f);
     let mut out = Vec::new();
@@ -158,88 +277,9 @@ pub(crate) fn candidates(p: &Program, f: &Function) -> Vec<Candidate> {
             if callee_f.blocks.is_empty() {
                 continue;
             }
-            for (op_block, cblk) in callee_f.blocks.iter().enumerate() {
-                for (op_instr, cins) in cblk.instrs.iter().enumerate() {
-                    match &cins.op {
-                        Op::Send { chan, .. } => {
-                            let callee_loc = resolve_loc(callee_f, *chan);
-                            let mapped = map_through_site(&callee_loc, f, args, &cb, c);
-                            if let Root::Alloc(a) = mapped.root {
-                                out.push(Candidate {
-                                    go_block: bi,
-                                    go_pos: ins.pos.clone(),
-                                    callee: c,
-                                    op_block,
-                                    op_instr,
-                                    kind: CandKind::Send,
-                                    callee_loc,
-                                    alloc_value: ValueId(a),
-                                    spawner_loc: mapped,
-                                    arm_locs: Vec::new(),
-                                });
-                            }
-                        }
-                        Op::Recv { chan, .. } => {
-                            let callee_loc = resolve_loc(callee_f, *chan);
-                            let mapped = map_through_site(&callee_loc, f, args, &cb, c);
-                            if let Root::Alloc(a) = mapped.root {
-                                out.push(Candidate {
-                                    go_block: bi,
-                                    go_pos: ins.pos.clone(),
-                                    callee: c,
-                                    op_block,
-                                    op_instr,
-                                    kind: CandKind::Recv,
-                                    callee_loc,
-                                    alloc_value: ValueId(a),
-                                    spawner_loc: mapped,
-                                    arm_locs: Vec::new(),
-                                });
-                            }
-                        }
-                        Op::Select {
-                            arms,
-                            blocking: true,
-                            ..
-                        } => {
-                            if arms.is_empty() {
-                                continue;
-                            }
-                            let mut mapped_arms: Vec<(u32, Loc)> = Vec::with_capacity(arms.len());
-                            let mut all_alloc = true;
-                            for arm in arms {
-                                let callee_loc = resolve_loc(callee_f, arm.chan);
-                                let mapped = map_through_site(&callee_loc, f, args, &cb, c);
-                                if !matches!(mapped.root, Root::Alloc(_)) {
-                                    all_alloc = false;
-                                    break;
-                                }
-                                mapped_arms.push((arm.dir, mapped));
-                            }
-                            if !all_alloc {
-                                continue;
-                            }
-                            let Some(Root::Alloc(a)) =
-                                mapped_arms.first().map(|(_, l)| l.root.clone())
-                            else {
-                                continue;
-                            };
-                            out.push(Candidate {
-                                go_block: bi,
-                                go_pos: ins.pos.clone(),
-                                callee: c,
-                                op_block,
-                                op_instr,
-                                kind: CandKind::Select,
-                                callee_loc: Loc::unknown(),
-                                alloc_value: ValueId(a),
-                                spawner_loc: mapped_arms[0].1.clone(),
-                                arm_locs: mapped_arms,
-                            });
-                        }
-                        _ => {}
-                    }
-                }
+            let go_map = |l: &Loc| map_through_site(l, f, args, &cb, c);
+            for hit in scan_body(callee_f, &go_map) {
+                out.extend(candidate_from(bi, ins.pos.clone(), c, hit));
             }
         }
     }

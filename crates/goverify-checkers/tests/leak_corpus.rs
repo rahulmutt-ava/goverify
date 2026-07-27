@@ -114,8 +114,8 @@ fn run_with_cache_and_emit(cache_dir: std::path::PathBuf, emit: std::path::PathB
 
 #[test]
 fn emit_smt_disables_scc_cache() {
-    // Finding 2 regression: --emit-smt is a debug/audit mode whose point
-    // is a COMPLETE query dump. An SCC cache hit replays without
+    // --emit-smt is a debug/audit mode whose point is a COMPLETE query
+    // dump. An SCC cache hit replays without
     // re-entering discharge, so a warm run would emit only the missed
     // SCCs' queries. With emit_smt set, the SCC cache must be fully
     // disabled — zero hits AND zero misses (never even constructed) —

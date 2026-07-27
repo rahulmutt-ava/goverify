@@ -23,7 +23,7 @@ use crate::summary::{Clause, Formula, Provenance, Summary};
 /// derived from base limits and deliberately not keyed separately).
 /// Versions:
 /// 1: initial
-/// 2: ?
+/// 2: phase-6 Finding::severity — entry format 2 (severity byte per finding)
 /// 3: phase-7 Root::FreeVar + Make/Load rooting in resolve_loc
 const SCC_CACHE_VERSION: u32 = 3;
 const LAYER: &str = "scc";

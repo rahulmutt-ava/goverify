@@ -342,6 +342,16 @@ bbolt remains the regression gate per §8.
   is direction-blind today; v1 handles it conservatively — a Select
   counterpart matches either direction, and a blocking select
   candidate requires all arms unmatched).
+- Buffered-channel classification is inconsistent between a lone `Recv`
+  candidate and an all-recv-arm blocking `select`: `cap_class` gives the
+  lone recv the buffered-recv refinement (a recv with no sender anywhere
+  blocks forever regardless of capacity, so const cap `N > 0` still
+  classifies `Unbuffered`), while a select whose arms are ALL recv-dir
+  falls to `Silent` unless every arm's capacity is const 0 — the same
+  reasoning applies arm-wise and would extend. False-negative only
+  (`Silent` never reports). Adjacent to the direction-refinement bullet
+  above but not covered by it: this one needs no new effect precision,
+  only a per-arm application of the rule `cap_class` already has.
 - Arg-passing to summarized callees could stop escaping once effects
   model param stores (§2 rule 2).
 - Nested-helper blocking ops (cross-function obligation anchoring) —

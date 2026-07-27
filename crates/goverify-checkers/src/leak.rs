@@ -720,10 +720,19 @@ fn prefixed(q: &Query, prefix: &str) -> Option<Query> {
 }
 
 /// f-side query ∧ prefix-renamed callee-side query. Both encodings share
-/// the same two datatype decls (Ptr, GoSeq), so `fq`'s set is kept as-is
-/// (`cq`'s would be a duplicate declaration). Consts are sorted and
-/// deduped for canonical determinism.
+/// the same two datatype decls (Ptr, GoSeq — `encode_func_with` installs
+/// them unconditionally), so `fq`'s set is kept as-is (`cq`'s would be a
+/// duplicate declaration, which the printer would emit twice). The
+/// `debug_assert` is a tripwire on exactly that assumption: if the encoder
+/// ever declares datatypes conditionally, dropping `cq`'s set would
+/// silently produce a query referencing an undeclared sort, so fail loudly
+/// in debug builds rather than hand the solver a malformed script.
+/// Consts are sorted and deduped for canonical determinism.
 fn conjoin(mut fq: Query, cq: Query) -> Query {
+    debug_assert_eq!(
+        fq.datatypes, cq.datatypes,
+        "conjoin assumes identical datatype decls on both sides"
+    );
     fq.consts.extend(cq.consts);
     fq.consts.sort();
     fq.consts.dedup();
@@ -994,9 +1003,9 @@ mod tests {
 
     use super::*;
     use crate::testfix::{
-        alloc_instr, block, call_builtin, call_static, change_type_instr, const_int_aux,
+        alloc_instr, block, branch_on, call_builtin, call_static, change_type_instr, const_int_aux,
         field_addr_on, fn_aux, func_with_aux, func_with_free_vars, func_with_params, go_call_args,
-        go_call_dynamic, go_call_via_closure, gvir_make_chan, load_instr, make_closure,
+        go_call_dynamic, go_call_via_closure, gvir_make_chan, instr, load_instr, make_closure,
         make_interface_instr, pkg, recv, ret, select, send, store,
     };
 
@@ -2232,6 +2241,120 @@ mod tests {
         assert!(
             findings.iter().all(|f| f.tag == "chan-send-leak"),
             "{findings:?}"
+        );
+    }
+
+    /// A MULTI-block callee, so the ordinal conjunct's ancestor summation
+    /// (`strict_ancestors` + the guarded `ite` sum) actually runs — every
+    /// other fixture here has a single-block callee, where the ancestor set
+    /// is empty and only the in-block `op_instr` half is exercised.
+    ///
+    /// `t.G(c, cond)`: block 0 branches on `cond` to blocks 1 and 2; block
+    /// 1 sends once on `c` and falls through to block 2; block 2 is the
+    /// join AND holds the candidate's blocking send (first instruction, so
+    /// its own block contributes 0). So
+    /// `pending = 0 + ite(g1, 1, 0)` — the ancestor's send is the ONLY
+    /// contribution, and the finding can fire only if it is counted.
+    ///
+    /// Also pins `op_block` vs `go_block`: the candidate sits at callee
+    /// block 2 while the `go` site is spawner block 0, so confusing the two
+    /// collapses `pending` to 0 and this test fails (Task 6 left that
+    /// discrimination untested — every callee there was single-block).
+    /// `conditional == false` makes block 0 an unconditional `Jump` to
+    /// block 1, so block 1 DOMINATES the candidate: `g1` is forced true on
+    /// every path reaching block 2. That variant is what discriminates the
+    /// `ite`'s polarity (see
+    /// `buffered_send_dominating_ancestor_send_is_forced`) — in the
+    /// conditional/diamond variant both polarities stay satisfiable,
+    /// because reaching the join via the ¬cond edge makes `¬g1` true.
+    fn ancestor_send_pkg(cap: i64, conditional: bool) -> Program {
+        let (entry_instrs, entry_succs) = if conditional {
+            (vec![branch_on(2)], vec![1, 2])
+        } else {
+            (vec![instr("Jump")], vec![1])
+        };
+        Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![const_int_aux(1, cap)],
+                    vec![block(
+                        0,
+                        vec![
+                            gvir_make_chan(2, 1),
+                            go_call_args("t.G", vec![2]),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.G",
+                    vec![
+                        gvir::Param {
+                            id: 1,
+                            name: "c".into(),
+                            r#type: 0,
+                        },
+                        gvir::Param {
+                            id: 2,
+                            name: "cond".into(),
+                            r#type: 0,
+                        },
+                    ],
+                    vec![
+                        block(0, entry_instrs, entry_succs),
+                        block(1, vec![send(1, 1)], vec![2]),
+                        block(2, vec![send(1, 1), ret(vec![])], vec![]),
+                    ],
+                ),
+            ],
+        )])
+    }
+
+    /// cap 1: `pending = ite(g1, 1, 0) >= 1` is satisfiable (take the
+    /// branch through block 1), so the join's send is blocked and reports.
+    /// The sibling candidate (block 1's own send) has an empty ancestor set
+    /// and `pending = 0 >= 1`, i.e. Unsat — hence exactly one finding.
+    #[test]
+    fn buffered_send_counts_guarded_ancestor_block_sends() {
+        let findings = run_leak(&ancestor_send_pkg(1, true));
+        assert_eq!(
+            findings.len(),
+            1,
+            "the guarded ancestor's send fills the 1-slot buffer: {findings:?}"
+        );
+        assert_eq!(findings[0].tag, "chan-send-leak");
+    }
+
+    /// The chain variant (block 1 dominates the candidate, so `g1` is
+    /// forced true): `pending` is then unconditionally 1, and cap 1 fires.
+    /// This is the polarity pin — an `ite(g_b, 0, n)` mix-up evaluates to 0
+    /// here and reports nothing, whereas in the diamond variant above both
+    /// polarities stay satisfiable via the two different paths to the join.
+    #[test]
+    fn buffered_send_dominating_ancestor_send_is_forced() {
+        let findings = run_leak(&ancestor_send_pkg(1, false));
+        assert_eq!(
+            findings.len(),
+            1,
+            "a dominating ancestor's send always counts: {findings:?}"
+        );
+        assert_eq!(findings[0].tag, "chan-send-leak");
+    }
+
+    /// cap 2, same shape: `pending` can reach at most 1, so
+    /// `pending >= 2` is Unsat on every path and NOTHING reports. The
+    /// negative direction — an ancestor summation that over-counts (e.g.
+    /// summing unguarded, or counting the candidate's own send) would fire
+    /// here.
+    #[test]
+    fn buffered_send_below_capacity_with_ancestors_stays_silent() {
+        let findings = run_leak(&ancestor_send_pkg(2, true));
+        assert!(
+            findings.is_empty(),
+            "one ancestor send cannot fill a 2-slot buffer: {findings:?}"
         );
     }
 

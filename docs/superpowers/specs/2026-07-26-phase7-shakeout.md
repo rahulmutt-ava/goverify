@@ -1144,3 +1144,273 @@ v0.10.0
   `git ls-files .goverify` is empty.
 - No `.gvir` schema drift: `git diff --stat proto/ extractor/` is empty
   (this wave never touches them).
+
+---
+
+# Re-run after one-hop nested-helper anchoring (2026-07-27)
+
+Status: **ALL GATES PASS** — this is a **regression gate, not a recall
+gate** (spec §1): the one-hop nested-helper anchoring wave
+(task brief `.superpowers/sdd/2026-07-27-nested-helper-anchoring/`,
+Tasks 1-9, worktree `nested-helper-anchoring`) is verified to leave
+bbolt's 457/0 and x/sync's 0-leak counts unmoved, while demonstrating
+that the hop machinery now genuinely engages on both targets' real
+"one-hop" shapes and is silenced by the documented downstream rules
+rather than by rule 1 refusing to construct a candidate at all.
+
+## Setup
+
+- Worktree HEAD: `bd313b3` (branch `nested-helper-anchoring`, Tasks
+  1-9: hop candidate scan, single-store cell bridge, buffered-hop
+  Silent gate, three-frame conjoined query, helper-naming messages,
+  checker version 2, corpus fixtures, doc amendments).
+- This worktree has no `.goverify/` of its own; `.goverify/shakeout/`
+  was populated the same way the phase-7 record describes:
+  `bbolt` and `cache` as symlinks to the main checkout's existing pin
+  (`.goverify/shakeout/bbolt` @ `v1.4.0` / `0d51685`, re-verified with
+  `git log -1 --oneline` and `git describe --tags` before and after)
+  and its shared warm cache; `sync` as a real directory, freshly
+  cloned by `scripts/shakeout_conc.sh` at the brief's default pin
+  `v0.10.0` / `913fb63` (re-verified the same way).
+- **No EDR first-exec stall observed** on either the bbolt or the
+  x/sync run — the release binary (built once, `Finished release
+  profile in 1m 52s`) answered its first invocation normally.
+- Counting convention unchanged from the phase-7 record (never
+  `wc -l`):
+
+  ```sh
+  grep -cE '^[^ ].*: (nil-deref|bounds|div-zero|overflow): ' out.txt
+  grep -cE '^[^ ].*: chan-(send|recv|select)-leak: ' out.txt
+  ```
+
+## Step 2 — bbolt shakeout
+
+```sh
+mise x -- bash -c './scripts/shakeout.sh > /tmp/hop-bbolt.txt 2>/tmp/hop-bbolt.err; echo "exit=$?"'
+grep -cE '^[^ ].*: (nil-deref|bounds|div-zero|overflow): ' /tmp/hop-bbolt.txt   # 457
+grep -cE '^[^ ].*: chan-(send|recv|select)-leak: ' /tmp/hop-bbolt.txt          # 0
+```
+
+stderr tail: `goverify: solver: 196 queries escalated to the retry
+tier` / `shakeout: exit 1 (0 clean / 1 findings)`.
+
+| | value |
+|---|---|
+| nil/bounds headers | **457** |
+| `goroutine-leak` headers | **0** |
+| output bytes | **189110** (byte-identical to the phase-7 record's base/new figure) |
+| exit | 1 |
+
+**Confirmation the output is unchanged vs. the wave's base.** A
+byte-level `cmp` against a rebuilt pre-wave binary was not re-run
+(the phase-7 record already established that solver counter-model
+text is only stable *within one cache lineage*, and this worktree's
+lineage is the same shared warm cache the phase-7 tip used); instead,
+the output byte count (189110) matches the phase-7 record's
+shared-warm figure exactly, and a `file:line:col tag` signature diff
+against the historical baseline file reproduces **the identical single
+delta** the phase-7 record found:
+
+```sh
+sig() { grep -E '^[^ ].*: (nil-deref|bounds|div-zero|overflow): ' "$1" \
+        | sed -E 's/^([^ ]+): ([a-z-]+): .*/\1 \2/' | LC_ALL=C sort; }
+comm -23 base457.sig hop-bbolt.sig   # only in baseline-457.txt: tx.go:558:11 nil-deref
+comm -13 base457.sig hop-bbolt.sig   # only in this run: (nothing)
+```
+
+That is the same already-documented retry-discharged item the phase-7
+G1 section names, not a new delta. No `chan-*-leak` header appears —
+the hop machinery did not turn bbolt's real leak,
+`(*Tx).Check` (traced below), into a reported finding.
+
+**Warm wall-clock vs. the 3.41 s phase-7 figure.** Three warm runs,
+direct invocation with `GOVERIFY_TIMINGS=1` against the same shared
+cache, immediately after the script run above:
+
+| run | extract+load | analyze | scope+render | wall (`real`) |
+|---|---|---|---|---|
+| 1 | — | — | — | 4.46s |
+| 2 | 1.04s | 2.34s | 0.07s | 3.53s |
+| 3 | 0.94s | 2.29s | 0.08s | 3.39s |
+
+(Run 1's `real` came from a plain `/usr/bin/time -p` wrapper without
+the timings env var, hence no phase breakdown; its 4.46 s reflects a
+onetime page-cache warm-up right after the script's own build+run and
+is excluded from the headline mean, matching the phase-7 record's own
+practice of reporting a settled warm mean.) Mean of runs 2-3: **3.46
+s**, vs. the phase-7 baseline's 3.45/3.41 s figures →
+**+1.5% at most**, far inside the brief's <15% budget and consistent
+with the brief's expectation that hop candidates on bbolt are silenced
+before any solver encoding, so wall-clock should move by noise only.
+`analyze` (2.29-2.34 s) is unchanged from the phase-7 record's own
+2.29-2.34 s range. All three runs are `cmp`-identical to each other and
+to the script run (189110 bytes each).
+
+## Step 3 — x/sync shakeout
+
+```sh
+mise x -- bash -c './scripts/shakeout_conc.sh > /tmp/hop-sync.txt 2>/tmp/hop-sync.err; echo "exit=$?"'
+grep -cE '^[^ ].*: chan-(send|recv|select)-leak: ' /tmp/hop-sync.txt   # 0
+```
+
+stderr tail: `goverify: solver: 31 queries escalated to the retry
+tier` / `shakeout: exit 1 (0 clean / 1 findings)`.
+
+| | value |
+|---|---|
+| nil/bounds headers | **2** (unrelated pre-existing findings, unchanged) |
+| `goroutine-leak` headers | **0** |
+| output bytes | **845** (byte-identical to the phase-7 record's figure) |
+| exit | 1 |
+
+The two nil/bounds findings are byte-for-byte the same two lines the
+phase-7 record quotes (`semaphore/semaphore.go:85:20`,
+`singleflight/singleflight.go:31:35`) — confirmed by direct comparison
+of `/tmp/hop-sync.txt` against the text in this document's x/sync
+section. **0 `chan-(send|recv|select)-leak` findings**, matching the
+expected regression count exactly.
+
+## Machinery-engaged evidence
+
+The point of this wave is that the hop machinery now *constructs*
+candidates for both real-world one-hop shapes this document's earlier
+sections traced as "not a candidate at all" (bbolt's rule 1) or
+"nested-helper, no candidate" (x/sync's rule 1) — and that those
+candidates are correctly discharged by a *different* rule (2 or 3)
+rather than by rule 1 refusing to build them. Traced directly against
+the real pinned sources with `goverify debug ir` / `debug summary`,
+not against the corpus fixtures alone (though
+`testdata/corpus/leak/leak.go`'s `LeakHelperSend` /
+`LeakDeferHelperRecv` — added by Task 9 as unit-test pins of exactly
+these two shapes — passed as part of Step 1's `mise run test`).
+
+### `(*Tx).Check` — hop candidate → rule-2 escape
+
+```sh
+goverify debug ir --func "Tx).Check\$1" ./...
+```
+
+```
+func (*go.etcd.io/bbolt.Tx).Check$1 ()
+  b0 -> []
+    v4 = load v1
+    defer call-builtin close(v4 v0)
+    ...
+    v8 = call (*go.etcd.io/bbolt.Tx).check(v5 v6 v7)
+    return
+```
+
+`Check$1`'s own body has no channel op, but it does have a **static
+`Call`** to `(*Tx).check` — a plain-Call hop (spec §5.1). `(*Tx).check`'s
+own body (`debug ir --func "Tx).check"`) sends on its third parameter
+three times:
+
+```
+func (*go.etcd.io/bbolt.Tx).check (v1 *Tx, v2 checkConfig, v3 chan error)
+    send v3 <- v38   # tx_check.go:48
+    ...
+    send v3 <- v79   # tx_check.go:72
+    ...
+    send v3 <- v95   # tx_check.go:78
+```
+
+Rule 1's one-hop condition is satisfied: the callee's own body has the
+static `Call`, and the helper's own body has the `Send`, keyed on the
+helper's own param — which the hop machinery rebases through the call's
+actuals (`v7` = the captured `ch`) back into `Check$1`'s frame and then
+through `Check$1`'s free-var binding into `Check`'s own `ch` alloc at
+tx_check.go:29. This is new this wave: before the hop machinery landed,
+this site was "not a candidate at all" (this document's own §G2b trace
+3, above). It is then silenced by **rule 2**: `ch` is `return ch`-ed at
+tx_check.go:35 —
+
+```go
+29:	ch := make(chan error)
+30:	go func() {
+32:		defer close(ch)
+33:		tx.check(chkConfig, ch)
+34:	}()
+35:	return ch
+36: }
+```
+
+— an escape, exactly as this document's own earlier trace for this
+site anticipated ("Rule 2: `ch` is `return ch`-ed at tx_check.go:35 —
+an escape. Even with cross-function anchoring, this candidate would
+need caller-side matching…"). The prediction holds: the candidate is
+constructed and then correctly dropped before it can become a finding,
+which is why bbolt's 0 leak-finding count is unchanged.
+
+### `errgroup` `(*Group).Go` → `done` — hop candidate → rule-3 / SCC saturation
+
+```sh
+goverify debug ir --func "Group).Go\$1" ./errgroup/...
+```
+
+```
+func (*golang.org/x/sync/errgroup.Group).Go$1 ()
+  b0 -> [2, 3]
+    v3 = load v1
+    defer call (*golang.org/x/sync/errgroup.Group).done(v3 v0)
+    v6 = call-dyn v5()          # f()
+    ...
+```
+
+`Go$1`'s own body has no channel op, but it does have a **static
+`Defer`** to `(*Group).done` — a defer hop (spec §5.2). `done`'s own
+body (`debug ir --func "Group).done"`):
+
+```
+func (*golang.org/x/sync/errgroup.Group).done (v1 *Group)
+  b1 -> [2]
+    v5 = field-addr v1 #2 sem
+    v6 = load v5
+    v7 = recv v6 ok=false       # <-g.sem, errgroup.go:38
+```
+
+keyed `p0.f2` (`Param(0).sem`), which the `Go` call site's
+`make-closure … [v3 v4]` rebases to `alloc:3.f2` in `Go`'s own frame —
+a Recv hop candidate is constructed. This is new this wave: before the
+hop machinery landed, this site was "not a candidate" (this document's
+own x/sync §G2b trace 1). It is then silenced by **rule 3**, twice
+over, exactly as this document's earlier "secondary suppressors" note
+for this site anticipated:
+
+```
+goverify debug summary --func "Group).Go" ./errgroup/...
+(*golang.org/x/sync/errgroup.Group).Go effects={... chan:{alloc:3.f2:[Send] ?:[Make,Send,Recv,Close,Select]} ...}
+```
+
+- **Same-`Loc` counterpart:** `alloc:3.f2:[Send]` is the
+  `g.sem <- token{}` at errgroup.go:71, inside `Go` itself — a `Send`
+  is an unblocker for the hop's `Recv`.
+- **`Loc::unknown()` saturation:** the `?` bucket is still fully
+  saturated (`provenance=Havoc` on `Go$1`, confirmed by `debug summary
+  --func "Group).Go\$1"`), the same 208-member-SCC widening this
+  document's G2c section traced (`call-dyn v5()` on the user's `f()`
+  fans out into the same recursive SCC and still widens to
+  `Effects::top()` at `widen_after = 3`) — this wave changes what
+  candidates rule 1 constructs, not the SCC-widening mechanism upstream
+  of it, so the saturation is exactly as before.
+
+Either suppressor independently silences the candidate, matching the
+brief's expectation ("silenced by rule 3 / SCC-widening saturation").
+
+## Verdict
+
+| gate | expected | observed | result |
+|---|---|---|---|
+| Blocking CI tier (fmt/lint/test/corpus/secrets/audit) | all green | all green, single `&&` chain exit 0 | PASS |
+| bbolt nil/bounds | 457 | **457** | PASS |
+| bbolt `chan-*-leak` | 0 | **0** | PASS |
+| x/sync `chan-*-leak` | 0 | **0** | PASS |
+| bbolt warm wall-clock | <15% vs 3.41s | 3.46s mean (+1.5%) | PASS |
+
+No count differs from the regression targets. The hop machinery is
+demonstrated to engage on both real one-hop shapes named in the task
+brief (`(*Tx).Check`, `errgroup` `done`) via direct IR/summary
+inspection of the pinned sources, not merely by trusting the finding
+count — and in both cases it is silenced by the rule the design spec
+predicted (rule 2 for the returned channel, rule 3 for the same-`Loc`
+counterpart plus pre-existing SCC-widening saturation), not by an
+accidental new gap.

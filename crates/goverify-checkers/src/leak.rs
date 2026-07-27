@@ -158,6 +158,90 @@ fn map_through_site(
     }
 }
 
+/// `map_through_site` for the g→h hop, with one extra rule the go-site
+/// mapping doesn't need: a base rooted at a g-LOCAL `Alloc` cell is
+/// bridged through the cell's single stored value (go/ssa spills a
+/// closure-captured param to a cell and binds the cell, so the
+/// deferred-closure shape — spec §1's doCall$1 — otherwise dead-ends at
+/// an Alloc-in-g root). One bridge application only: a cell whose
+/// content is another cell degrades to Unknown — the observed real
+/// shape is one cell deep, and each extra level multiplies the
+/// unsoundness surface (spec §3 amendment, 2026-07-27).
+fn map_through_hop(
+    callee_loc: &Loc,
+    g: &Function,
+    args: &[ValueId],
+    cb: &HashMap<FuncId, Option<Vec<ValueId>>>,
+    h: FuncId,
+) -> Loc {
+    let mut base = match &callee_loc.root {
+        Root::Param(i) => arg_loc(g, args, *i),
+        Root::FreeVar(i) => fv_loc(g, cb, h, *i),
+        _ => return Loc::unknown(),
+    };
+    if let Root::Alloc(a) = base.root {
+        base = bridge_cell(g, ValueId(a), base.path);
+    }
+    if base.root == Root::Unknown {
+        return Loc::unknown();
+    }
+    let mut path = base.path;
+    path.extend(callee_loc.path.iter().copied());
+    if path.len() > MAX_LOC_DEPTH {
+        return Loc::unknown();
+    }
+    Loc {
+        root: base.root,
+        path,
+    }
+}
+
+/// The single-store cell bridge (mirrors `cap_of`'s cell form, one
+/// level only): `cell` must be defined by an `Op::Alloc` in `g`, have
+/// exactly one `Store{addr == cell}`, and that store's value must
+/// canonically resolve to a `Param`/`FreeVar`-rooted `Loc` of `g` —
+/// returned with `tail` appended (the path the caller had accumulated
+/// past the cell). Anything else — no alloc def, zero or two stores,
+/// non-Param/FreeVar content, a path past `MAX_LOC_DEPTH` — degrades to
+/// `Loc::unknown()`. Total and panic-free.
+fn bridge_cell(g: &Function, cell: ValueId, tail: Vec<u32>) -> Loc {
+    let is_alloc = g
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instrs)
+        .any(|ins| matches!(&ins.op, Op::Alloc { dst, .. } if *dst == cell));
+    if !is_alloc {
+        return Loc::unknown();
+    }
+    let mut stores = g
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instrs)
+        .filter_map(|ins| match &ins.op {
+            Op::Store { addr, val } if *addr == cell => Some(*val),
+            _ => None,
+        });
+    let Some(first) = stores.next() else {
+        return Loc::unknown();
+    };
+    if stores.next().is_some() {
+        return Loc::unknown(); // two stores: content unresolvable
+    }
+    let content = resolve_loc(g, canonical_value(g, first));
+    if !matches!(content.root, Root::Param(_) | Root::FreeVar(_)) {
+        return Loc::unknown();
+    }
+    let mut path = content.path;
+    path.extend(tail);
+    if path.len() > MAX_LOC_DEPTH {
+        return Loc::unknown();
+    }
+    Loc {
+        root: content.root,
+        path,
+    }
+}
+
 /// One blocking op found in a host function's own body whose channel
 /// (every arm's channel, for a Select) maps to `Root::Alloc` in the
 /// spawner under the caller-supplied `map` — the raw material
@@ -348,7 +432,7 @@ pub(crate) fn candidates(p: &Program, f: &Function) -> Vec<Candidate> {
                         continue;
                     }
                     let hop_map = |l: &Loc| {
-                        let g_loc = map_through_site(l, callee_f, hargs, &cb_g, h);
+                        let g_loc = map_through_hop(l, callee_f, hargs, &cb_g, h);
                         map_through_site(&g_loc, f, args, &cb, c)
                     };
                     for hit in scan_body(helper_f, &hop_map) {
@@ -1135,13 +1219,12 @@ mod tests {
     use goverify_solver::{Logic, SolverLimits, Sort, Z3Native};
 
     use super::*;
-    #[allow(unused_imports)] // wired for Task 4 (deferred-closure hop test)
-    use crate::testfix::defer_call_via_closure;
     use crate::testfix::{
         alloc_instr, block, branch_on, call_builtin, call_static, change_type_instr, const_int_aux,
-        defer_call_args, field_addr_on, fn_aux, func_with_aux, func_with_free_vars,
-        func_with_params, go_call_args, go_call_dynamic, go_call_via_closure, gvir_make_chan,
-        instr, load_instr, make_closure, make_interface_instr, pkg, recv, ret, select, send, store,
+        defer_call_args, defer_call_via_closure, field_addr_on, fn_aux, func_with_aux,
+        func_with_free_vars, func_with_params, go_call_args, go_call_dynamic, go_call_via_closure,
+        gvir_make_chan, instr, load_instr, make_closure, make_interface_instr, pkg, recv, ret,
+        select, send, store,
     };
 
     /// F: v2 = make(chan); go t.G(v2). G(p1): p1 <- x.
@@ -2792,6 +2875,115 @@ mod tests {
         assert_eq!(findings[0].checker, "goroutine-leak");
         assert_eq!(findings[0].tag, "chan-select-leak");
         assert_eq!(findings[0].severity, Severity::Error);
+    }
+
+    /// F: v2 = make(chan,0); go t.G(v2). G(p1): cell v3 = alloc;
+    /// store v3 <- p1; v4 = make_closure t.H [v3]; defer via v4.
+    /// H(fv1): v2 = load fv1; send v2 <- v2 — the singleflight doCall$1
+    /// shape: the captured param spills to a g-local cell; the hop
+    /// mapping's single-store bridge re-roots it back to Param(0), then
+    /// through the go site to F's alloc.
+    #[test]
+    fn deferred_closure_capturing_param_bridges_cell_to_hop_candidate() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux("t.F", vec![const_int_aux(1, 0)], hop_f_blocks()),
+                gvir::Function {
+                    id: "t.G".into(),
+                    params: vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    aux: vec![fn_aux(2, "t.H")],
+                    blocks: vec![block(
+                        0,
+                        vec![
+                            alloc_instr(3),
+                            store(3, 1),
+                            make_closure(4, 2, vec![3]),
+                            defer_call_via_closure("t.H", 4),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                    ..Default::default()
+                },
+                func_with_free_vars(
+                    "t.H",
+                    vec![1],
+                    vec![block(
+                        0,
+                        vec![load_instr(2, 1), send(2, 2), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let cands = candidates(&p, f);
+        assert_eq!(cands.len(), 1, "cell-bridged hop candidate: {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.kind, CandKind::Send);
+        assert_eq!(c.hop.as_ref().map(|h| h.kind), Some(HopKind::Defer));
+        assert_eq!(c.alloc_value, ValueId(2));
+        assert_eq!(
+            c.spawner_loc,
+            Loc {
+                root: Root::Alloc(2),
+                path: vec![]
+            }
+        );
+    }
+
+    /// Same shape but the cell is stored twice: content is unresolvable
+    /// (mirrors cap_of's rule), so the bridge degrades and no candidate
+    /// survives.
+    #[test]
+    fn double_stored_cell_yields_no_hop_candidate() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux("t.F", vec![const_int_aux(1, 0)], hop_f_blocks()),
+                gvir::Function {
+                    id: "t.G".into(),
+                    params: vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    aux: vec![fn_aux(2, "t.H")],
+                    blocks: vec![block(
+                        0,
+                        vec![
+                            alloc_instr(3),
+                            store(3, 1),
+                            store(3, 1),
+                            make_closure(4, 2, vec![3]),
+                            defer_call_via_closure("t.H", 4),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                    ..Default::default()
+                },
+                func_with_free_vars(
+                    "t.H",
+                    vec![1],
+                    vec![block(
+                        0,
+                        vec![load_instr(2, 1), send(2, 2), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        assert!(
+            candidates(&p, f).is_empty(),
+            "double-stored cell must not bridge"
+        );
     }
 
     #[test]

@@ -35,6 +35,29 @@ pub(crate) enum CandKind {
     Select,
 }
 
+/// How a hop candidate's helper is reached from the spawned callee's
+/// body. Documentation/message value only — the obligation anchors on
+/// `call_block` reachability either way (a Defer hop's over-approximation
+/// is a documented spec §5.2 boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HopKind {
+    Call,
+}
+
+/// The one-hop record (spec §2 rule 1 case 2): the blocking op lives in
+/// `helper`'s own body, reached by the static `Call`/`Defer` at
+/// (`call_block`, `call_instr`) in the spawned callee's body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Hop {
+    /// `h` — the function hosting the blocking op.
+    pub helper: FuncId,
+    /// Block index of the `Call`/`Defer` in the spawned callee `g`.
+    pub call_block: usize,
+    /// Instruction index within `call_block`.
+    pub call_instr: usize,
+    pub kind: HopKind,
+}
+
 /// A syntactically-direct blocking op, found in a spawned goroutine's own
 /// body, whose channel is rooted at an `Alloc` site back in the spawner
 /// (`f`). Task 6 re-checks each one against the spawner's own channel-op
@@ -48,7 +71,8 @@ pub(crate) struct Candidate {
     pub go_pos: Option<Pos>,
     /// The spawned function (has a body).
     pub callee: FuncId,
-    /// Block index of the blocking op in `callee`.
+    /// Block index of the blocking op in the op's host frame (the spawned
+    /// callee, or `hop.helper` for a hop candidate).
     pub op_block: usize,
     /// Instruction index of the blocking op within `op_block` — the
     /// buffered-send ordinal conjunct counts the sends that precede the
@@ -56,10 +80,11 @@ pub(crate) struct Candidate {
     /// the block.
     pub op_instr: usize,
     pub kind: CandKind,
-    /// The blocking op's channel resolved in the CALLEE's own frame
-    /// (before `map_through_site` re-roots it into `f`) — the key the
-    /// ordinal conjunct counts callee-side sends against. `Loc::unknown()`
-    /// for a `Select` candidate (whose arms each have their own, and which
+    /// The blocking op's channel resolved in the op's host frame (the
+    /// spawned callee, or `hop.helper` for a hop candidate), before
+    /// `map_through_site` re-roots it into `f` — the key the ordinal
+    /// conjunct counts host-side sends against. `Loc::unknown()` for a
+    /// `Select` candidate (whose arms each have their own, and which
     /// never gets an ordinal conjunct: `cap_class` classifies a select as
     /// `Unbuffered` or `Silent`, never `BufferedConst`).
     pub callee_loc: Loc,
@@ -71,6 +96,12 @@ pub(crate) struct Candidate {
     /// with the arm's dir (1 = send, 2 = recv). Empty for Send/Recv
     /// candidates.
     pub arm_locs: Vec<(u32, Loc)>,
+    /// `None` for a direct candidate (op in the spawned callee's own
+    /// body); `Some` when the op sits one static Call/Defer below it,
+    /// in `hop.helper`'s body — `op_block`/`op_instr`/`callee_loc` then
+    /// index/resolve in the HELPER's frame, and the obligation becomes
+    /// a three-frame conjunction (2026-07-27 wave).
+    pub hop: Option<Hop>,
 }
 
 /// `resolve_loc(f, args[i])` — a `Go` call site's `i`th argument,
@@ -224,6 +255,7 @@ fn candidate_from(
     go_pos: Option<Pos>,
     callee: FuncId,
     hit: BodyHit,
+    hop: Option<Hop>,
 ) -> Option<Candidate> {
     let Root::Alloc(a) = hit.mapped.root else {
         return None;
@@ -242,6 +274,7 @@ fn candidate_from(
             path: hit.mapped.path,
         },
         arm_locs: hit.arm_locs,
+        hop,
     })
 }
 
@@ -279,7 +312,55 @@ pub(crate) fn candidates(p: &Program, f: &Function) -> Vec<Candidate> {
             }
             let go_map = |l: &Loc| map_through_site(l, f, args, &cb, c);
             for hit in scan_body(callee_f, &go_map) {
-                out.extend(candidate_from(bi, ins.pos.clone(), c, hit));
+                out.extend(candidate_from(bi, ins.pos.clone(), c, hit, None));
+            }
+            // One-hop scan (spec §2 rule 1 case 2): a blocking op in a
+            // helper h reached by a single static Call/Defer in g's own
+            // body. h == g is skipped — g's own ops are already directly
+            // anchored, and a recursive-call anchor would double-report
+            // them. Go edges are NOT hop edges (a nested spawn is a
+            // different goroutine; spec §10). Order stays fully
+            // index-ordered: direct hits first, then hop sites in g's
+            // block/instr order, then op order within each helper.
+            let cb_g = closure_bindings(callee_f);
+            for (hb, hblk) in callee_f.blocks.iter().enumerate() {
+                for (hi, hins) in hblk.instrs.iter().enumerate() {
+                    let (hop_kind, h, hargs) = match &hins.op {
+                        Op::Call {
+                            callee: Callee::Static(h),
+                            args,
+                            ..
+                        } => (HopKind::Call, *h, args),
+                        _ => continue,
+                    };
+                    if h == c {
+                        continue;
+                    }
+                    let Some(helper_f) = p.func(h) else {
+                        continue;
+                    };
+                    if helper_f.blocks.is_empty() {
+                        continue;
+                    }
+                    let hop_map = |l: &Loc| {
+                        let g_loc = map_through_site(l, callee_f, hargs, &cb_g, h);
+                        map_through_site(&g_loc, f, args, &cb, c)
+                    };
+                    for hit in scan_body(helper_f, &hop_map) {
+                        out.extend(candidate_from(
+                            bi,
+                            ins.pos.clone(),
+                            c,
+                            hit,
+                            Some(Hop {
+                                helper: h,
+                                call_block: hb,
+                                call_instr: hi,
+                                kind: hop_kind,
+                            }),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -974,6 +1055,13 @@ impl Checker for LeakChecker {
         // belongs post-discharge at the findings layer.
         let mut out = Vec::new();
         for cand in candidates(p, func) {
+            if cand.hop.is_some() {
+                // Transitional (this wave's obligations task replaces it
+                // with the three-frame query): a hop candidate's
+                // op_block indexes the HELPER's frame, and the two-frame
+                // query below would anchor it against g's encoding.
+                continue;
+            }
             // Select: every arm's channel must pass the escape check, and
             // no arm may have a counterpart — per arm, via
             // `arm_has_counterpart` (dir 1 = send arm, 2 = recv arm),
@@ -1093,6 +1181,223 @@ mod tests {
             }
         );
         assert_eq!(cands[0].callee, p.lookup_func("t.G").unwrap());
+    }
+
+    /// F: v2 = make(chan, cap); go t.G(v2) [+ extra F instrs]. G(p1):
+    /// call t.H(p1). H(p1): p1 <- p1 — the bbolt (*Tx).check shape.
+    /// Shared by the hop candidate/cap_class/obligations/e2e tests.
+    fn hop_send_pkg(f_blocks: Vec<gvir::BasicBlock>, cap: i64) -> Program {
+        Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux("t.F", vec![const_int_aux(1, cap)], f_blocks),
+                func_with_params(
+                    "t.G",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(
+                        0,
+                        vec![call_static("t.H", 2, 0, vec![1]), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.H",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(0, vec![send(1, 1), ret(vec![])], vec![])],
+                ),
+            ],
+        )])
+    }
+
+    /// The default spawner block for `hop_send_pkg`: make + go + return.
+    fn hop_f_blocks() -> Vec<gvir::BasicBlock> {
+        vec![block(
+            0,
+            vec![
+                gvir_make_chan(2, 1),
+                go_call_args("t.G", vec![2]),
+                ret(vec![]),
+            ],
+            vec![],
+        )]
+    }
+
+    /// One Send hop candidate: the op lives in H, one plain Call below G,
+    /// anchored at G's call site (spec §2 rule 1 case 2).
+    #[test]
+    fn plain_call_hop_send_yields_hop_candidate() {
+        let p = hop_send_pkg(hop_f_blocks(), 0);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let cands = candidates(&p, f);
+        assert_eq!(cands.len(), 1, "exactly one hop candidate: {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.kind, CandKind::Send);
+        assert_eq!(c.callee, p.lookup_func("t.G").unwrap());
+        let hop = c.hop.as_ref().expect("hop candidate");
+        assert_eq!(hop.helper, p.lookup_func("t.H").unwrap());
+        assert_eq!(hop.kind, HopKind::Call);
+        assert_eq!((hop.call_block, hop.call_instr), (0, 0));
+        assert_eq!((c.op_block, c.op_instr), (0, 0));
+        assert_eq!(c.alloc_value, ValueId(2));
+        assert_eq!(
+            c.spawner_loc,
+            Loc {
+                root: Root::Alloc(2),
+                path: vec![]
+            }
+        );
+    }
+
+    /// G both sends AND calls itself recursively: the direct scan anchors
+    /// the send; the recursive call site (h == g) must NOT anchor it again.
+    #[test]
+    fn recursive_callee_yields_single_direct_candidate() {
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux("t.F", vec![const_int_aux(1, 0)], hop_f_blocks()),
+                func_with_params(
+                    "t.G",
+                    vec![gvir::Param {
+                        id: 1,
+                        name: "c".into(),
+                        r#type: 0,
+                    }],
+                    vec![block(
+                        0,
+                        vec![call_static("t.G", 2, 0, vec![1]), send(1, 1), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let cands = candidates(&p, f);
+        assert_eq!(cands.len(), 1, "one direct candidate only: {cands:?}");
+        assert!(cands[0].hop.is_none(), "recursive site must not anchor");
+    }
+
+    /// G calls M, M calls H, H sends: two hops down — no candidate (the v1
+    /// boundary this wave deliberately keeps; spec §2 exclusions).
+    #[test]
+    fn depth_two_helper_yields_no_candidate() {
+        let param_c = || gvir::Param {
+            id: 1,
+            name: "c".into(),
+            r#type: 0,
+        };
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux("t.F", vec![const_int_aux(1, 0)], hop_f_blocks()),
+                func_with_params(
+                    "t.G",
+                    vec![param_c()],
+                    vec![block(
+                        0,
+                        vec![call_static("t.M", 2, 0, vec![1]), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.M",
+                    vec![param_c()],
+                    vec![block(
+                        0,
+                        vec![call_static("t.H", 2, 0, vec![1]), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.H",
+                    vec![param_c()],
+                    vec![block(0, vec![send(1, 1), ret(vec![])], vec![])],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        assert!(
+            candidates(&p, f).is_empty(),
+            "depth-2 op must stay suppression-only"
+        );
+    }
+
+    /// F: two chans; go t.G(a, b); G calls t.H(a, b); H: blocking select
+    /// [recv a, send b]. Every arm must map through BOTH hops (mirror of
+    /// the direct all-arms rule).
+    #[test]
+    fn select_in_helper_all_arms_yield_select_hop_candidate() {
+        let param2 = || {
+            vec![
+                gvir::Param {
+                    id: 1,
+                    name: "a".into(),
+                    r#type: 0,
+                },
+                gvir::Param {
+                    id: 2,
+                    name: "b".into(),
+                    r#type: 0,
+                },
+            ]
+        };
+        let p = Program::from_packages(vec![pkg(
+            "t",
+            vec![
+                func_with_aux(
+                    "t.F",
+                    vec![const_int_aux(1, 0)],
+                    vec![block(
+                        0,
+                        vec![
+                            gvir_make_chan(2, 1),
+                            gvir_make_chan(3, 1),
+                            go_call_args("t.G", vec![2, 3]),
+                            ret(vec![]),
+                        ],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.G",
+                    param2(),
+                    vec![block(
+                        0,
+                        vec![call_static("t.H", 3, 0, vec![1, 2]), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+                func_with_params(
+                    "t.H",
+                    param2(),
+                    vec![block(
+                        0,
+                        vec![select(3, vec![(2, 1, 0), (1, 2, 2)], true), ret(vec![])],
+                        vec![],
+                    )],
+                ),
+            ],
+        )]);
+        let f = p.func(p.lookup_func("t.F").unwrap()).unwrap();
+        let cands = candidates(&p, f);
+        assert_eq!(cands.len(), 1, "one select hop candidate: {cands:?}");
+        assert_eq!(cands[0].kind, CandKind::Select);
+        assert!(cands[0].hop.is_some());
+        assert_eq!(cands[0].arm_locs.len(), 2);
+        assert!(
+            cands[0]
+                .arm_locs
+                .iter()
+                .all(|(_, l)| matches!(l.root, Root::Alloc(_)))
+        );
     }
 
     /// Return of the channel is an escape.
@@ -2007,6 +2312,7 @@ mod tests {
                 path: vec![],
             },
             arm_locs: vec![],
+            hop: None,
         };
         assert_eq!(cap_class(&p, f, &cand), CapClass::BufferedConst(3));
     }
@@ -2052,6 +2358,7 @@ mod tests {
                 path: vec![],
             },
             arm_locs: vec![],
+            hop: None,
         };
         assert_eq!(cap_class(&p, f, &cand), CapClass::Silent);
     }

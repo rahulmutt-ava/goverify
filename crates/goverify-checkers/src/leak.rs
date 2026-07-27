@@ -1069,23 +1069,27 @@ fn ordinal_conjunct(
 /// is deterministic and independent of where it sits in the file.
 fn tag_and_message(p: &Program, cand: &Candidate) -> (&'static str, String) {
     let callee = p.func_name(cand.callee);
+    let via = match &cand.hop {
+        Some(h) => format!(" in helper {}", p.func_name(h.helper)),
+        None => String::new(),
+    };
     match cand.kind {
         CandKind::Send => (
             "chan-send-leak",
             format!(
-                "goroutine {callee} may block forever: send on a spawner-created channel with no receive, close, or select in the spawning environment"
+                "goroutine {callee} may block forever: send{via} on a spawner-created channel with no receive, close, or select in the spawning environment"
             ),
         ),
         CandKind::Recv => (
             "chan-recv-leak",
             format!(
-                "goroutine {callee} may block forever: receive on a spawner-created channel with no send, close, or select"
+                "goroutine {callee} may block forever: receive{via} on a spawner-created channel with no send, close, or select"
             ),
         ),
         CandKind::Select => (
             "chan-select-leak",
             format!(
-                "goroutine {callee} may block forever: blocking select whose channels have no counterpart operations"
+                "goroutine {callee} may block forever: blocking select{via} whose channels have no counterpart operations"
             ),
         ),
     }
@@ -1102,8 +1106,11 @@ impl Checker for LeakChecker {
     }
 
     // bump on any semantic change to this checker's obligations.
+    // 2 (2026-07-27): one-hop nested-helper anchoring — checker
+    // (name, version) salts the SCC cache, so this rotates every cached
+    // findings entry; no SCC_CACHE_VERSION bump (codec unchanged).
     fn version(&self) -> u32 {
-        1
+        2
     }
 
     fn infer_requires(
@@ -1134,9 +1141,10 @@ impl Checker for LeakChecker {
         let own = summary_of(f);
         let env = &own.effects;
         let pre_f = own_preconditions(&own);
-        // Several `go` sites often share a callee; encode each at most
-        // once. Lookup-only (never iterated), so no map order can reach
-        // the output.
+        // Several `go` sites often share a callee, and a hop candidate
+        // needs both the g- and h-side queries' encodings; each function
+        // id is encoded at most once. Lookup-only (never iterated), so
+        // no map order can reach the output.
         let mut enc_cache: HashMap<FuncId, Option<EncodedFunc>> = HashMap::new();
         // One obligation per blocking op, siblings included: two blocking
         // ops on the same channel in one goroutine (`go func() { ch <- 1;
@@ -1155,13 +1163,6 @@ impl Checker for LeakChecker {
         // belongs post-discharge at the findings layer.
         let mut out = Vec::new();
         for cand in candidates(p, func) {
-            if cand.hop.is_some() {
-                // Transitional (this wave's obligations task replaces it
-                // with the three-frame query): a hop candidate's
-                // op_block indexes the HELPER's frame, and the two-frame
-                // query below would anchor it against g's encoding.
-                continue;
-            }
             // Select: every arm's channel must pass the escape check, and
             // no arm may have a counterpart — per arm, via
             // `arm_has_counterpart` (dir 1 = send arm, 2 = recv arm),
@@ -1194,28 +1195,63 @@ impl Checker for LeakChecker {
             let Some(callee_f) = p.func(cand.callee) else {
                 continue;
             };
-            let enc_c = enc_cache
-                .entry(cand.callee)
-                .or_insert_with(|| encode_func_with(p, cand.callee, summary_of).ok());
-            let Some(enc_c) = enc_c.as_ref() else {
+            // Populate the needed per-function encodings first, then
+            // re-borrow immutably: the hop case needs g's AND h's
+            // EncodedFunc at once, and two live `entry()` results would
+            // be two simultaneous mutable borrows.
+            let helper = cand.hop.as_ref().map(|h| h.helper);
+            for id in std::iter::once(cand.callee).chain(helper) {
+                enc_cache
+                    .entry(id)
+                    .or_insert_with(|| encode_func_with(p, id, summary_of).ok());
+            }
+            let Some(enc_c) = enc_cache.get(&cand.callee).and_then(Option::as_ref) else {
                 continue; // callee encoding failed: skip, never report
             };
-            let mut extra = own_preconditions(&summary_of(cand.callee));
-            if let CapClass::BufferedConst(cap) = class {
-                let Some(full) = ordinal_conjunct(callee_f, enc_c, &cand, cap) else {
-                    continue;
-                };
-                extra.push(full);
-            }
-            let Some(cq) = prefixed(&enc_c.reach_query(cand.op_block, extra), "s_") else {
-                continue;
+            let query = match &cand.hop {
+                None => {
+                    let mut extra = own_preconditions(&summary_of(cand.callee));
+                    if let CapClass::BufferedConst(cap) = class {
+                        let Some(full) = ordinal_conjunct(callee_f, enc_c, &cand, cap) else {
+                            continue;
+                        };
+                        extra.push(full);
+                    }
+                    let Some(cq) = prefixed(&enc_c.reach_query(cand.op_block, extra), "s_") else {
+                        continue;
+                    };
+                    conjoin(enc_f.reach_query(cand.go_block, pre_f.clone()), cq)
+                }
+                Some(hop) => {
+                    // Three-frame conjunction (spec §4): f reaches the
+                    // go site ∧ g reaches the call/defer site ∧ h
+                    // reaches the op, each frame prefix-renamed apart.
+                    // cap_class never hands a hop candidate
+                    // BufferedConst (spec §5.1), so no ordinal conjunct
+                    // on this path.
+                    let Some(enc_h) = enc_cache.get(&hop.helper).and_then(Option::as_ref) else {
+                        continue; // helper encoding failed: skip, never report
+                    };
+                    let pre_g = own_preconditions(&summary_of(cand.callee));
+                    let pre_h = own_preconditions(&summary_of(hop.helper));
+                    let Some(gq) = prefixed(&enc_c.reach_query(hop.call_block, pre_g), "s_") else {
+                        continue;
+                    };
+                    let Some(hq) = prefixed(&enc_h.reach_query(cand.op_block, pre_h), "t_") else {
+                        continue;
+                    };
+                    conjoin(
+                        conjoin(enc_f.reach_query(cand.go_block, pre_f.clone()), gq),
+                        hq,
+                    )
+                }
             };
             let (tag, message) = tag_and_message(p, &cand);
             out.push(Obligation {
                 tag: tag.into(),
                 message,
                 pos: cand.go_pos.clone(),
-                query: conjoin(enc_f.reach_query(cand.go_block, pre_f.clone()), cq),
+                query,
             });
         }
         out
@@ -1234,8 +1270,8 @@ mod tests {
         alloc_instr, block, branch_on, call_builtin, call_static, change_type_instr, const_int_aux,
         defer_call_args, defer_call_via_closure, field_addr_on, fn_aux, func_with_aux,
         func_with_free_vars, func_with_params, go_call_args, go_call_dynamic, go_call_via_closure,
-        gvir_make_chan, instr, load_instr, make_closure, make_interface_instr, pkg, recv, ret,
-        select, send, store,
+        gvir_make_chan, instr, load_instr, make_closure, make_interface_instr, no_summaries, pkg,
+        recv, ret, select, send, store,
     };
 
     /// F: v2 = make(chan); go t.G(v2). G(p1): p1 <- x.
@@ -1354,6 +1390,60 @@ mod tests {
                 root: Root::Alloc(2),
                 path: vec![]
             }
+        );
+    }
+
+    /// obligations() on the plain-call hop program: one obligation whose
+    /// message names the helper and whose query carries three disjoint
+    /// const namespaces (unprefixed f, s_ g, t_ h).
+    #[test]
+    fn hop_obligation_query_has_three_disjoint_frames() {
+        let p = hop_send_pkg(hop_f_blocks(), 0);
+        let f = p.lookup_func("t.F").unwrap();
+        let obs = LeakChecker.obligations(&p, f, &no_summaries);
+        assert_eq!(obs.len(), 1, "one hop obligation: {obs:?}");
+        assert_eq!(obs[0].tag, "chan-send-leak");
+        assert_eq!(
+            obs[0].message,
+            "goroutine t.G may block forever: send in helper t.H on a spawner-created channel with no receive, close, or select in the spawning environment"
+        );
+        let (mut plain, mut s, mut t) = (0u32, 0u32, 0u32);
+        for (n, _) in &obs[0].query.consts {
+            if n.starts_with("s_") {
+                s += 1;
+            } else if n.starts_with("t_") {
+                t += 1;
+            } else {
+                plain += 1;
+            }
+        }
+        assert!(
+            plain > 0 && s > 0 && t > 0,
+            "three frames expected: {:?}",
+            obs[0].query.consts
+        );
+    }
+
+    /// An f-side escape (the channel is returned) silences a hop candidate
+    /// exactly as it silences a direct one — the escape walk is untouched.
+    #[test]
+    fn hop_obligation_silenced_by_f_side_escape() {
+        let p = hop_send_pkg(
+            vec![block(
+                0,
+                vec![
+                    gvir_make_chan(2, 1),
+                    go_call_args("t.G", vec![2]),
+                    ret(vec![2]),
+                ],
+                vec![],
+            )],
+            0,
+        );
+        let f = p.lookup_func("t.F").unwrap();
+        assert!(
+            LeakChecker.obligations(&p, f, &no_summaries).is_empty(),
+            "returned channel must silence the hop candidate"
         );
     }
 

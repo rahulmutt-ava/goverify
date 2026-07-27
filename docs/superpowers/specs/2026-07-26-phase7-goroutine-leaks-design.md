@@ -53,19 +53,20 @@ rule is a documented precision boundary).
 A finding is raised at an `Op::Go` in function `f` when ALL hold:
 
 1. **Blocking op on an identified channel.** A `Send`, `Recv`, or
-   blocking `Select` **syntactically present in the spawned callee's
-   own body** — never a blocking op reached only through a helper the
-   goroutine calls — whose channel operand, rebased through the go
-   site's arguments and closure bindings, resolves to a `Loc` rooted at
-   an **`Alloc` in `f`** (a `make(chan …)` in the spawner reaching the
-   goroutine via argument or capture). A helper's own blocking ops still
-   flow into the goroutine's *summarized* `chan_ops` (rebased in by
-   `effects::collect`), and rule 3's counterpart match consults that
-   summary — so a nested-helper op can suppress a sibling candidate —
-   but v1 has no callee-side instruction to anchor a reachability query
-   on across a call boundary, so a nested-helper op is never itself the
-   subject of a finding (§10: "nested-helper blocking ops (cross-function
-   obligation anchoring)").
+   blocking `Select` syntactically present either **in the spawned
+   callee's own body**, or — one-hop anchoring, added 2026-07-27, see
+   `2026-07-27-nested-helper-anchoring-design.md` — **in the own body
+   of a helper reached by a single static `Call`/`Defer` instruction
+   in the spawned callee's body**, whose channel operand, rebased
+   through the hop site's arguments/closure bindings (with a
+   single-store cell bridge for captured params) and then through the
+   go site's, resolves to a `Loc` rooted at an **`Alloc` in `f`** (a
+   `make(chan …)` in the spawner reaching the goroutine via argument
+   or capture). Blocking ops two or more call levels down still flow
+   into the goroutine's *summarized* `chan_ops` (rebased in by
+   `effects::collect`) and can suppress via rule 3's counterpart
+   match, but are never themselves the subject of a finding (§10:
+   "depth ≥ 2 anchoring").
 2. **No escape.** The tracked channel value never: appears as the
    stored value of a `Store{addr, val}` whose `addr` is itself
    untracked (`val` tracked, `addr` not — a tracked value spilled into
@@ -354,9 +355,9 @@ bbolt remains the regression gate per §8.
   only a per-arm application of the rule `cap_class` already has.
 - Arg-passing to summarized callees could stop escaping once effects
   model param stores (§2 rule 2).
-- Nested-helper blocking ops (cross-function obligation anchoring) —
-  §2 rule 1's helper-side ops suppress via summaries today but can
-  never anchor a finding of their own.
+- depth ≥ 2 anchoring (one-hop shipped 2026-07-27; see that wave's
+  spec §10 for its own residuals: cross-frame buffered fill counting,
+  Defer-hop exit-reachability, nested-spawn anchoring).
 - Dynamic-call effect contamination (signature-keyed may-call joins
   all-Unknown effects; type-flow or assignment-based narrowing would
   recover the FN surface) — §8.

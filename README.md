@@ -127,15 +127,16 @@ above the pragma, is truly invisible to `--diff-base`).
   `chan-recv-leak`, `chan-select-leak`): flags a `go` statement that
   spawns a goroutine which, on some satisfiable execution, blocks
   forever on a channel send/receive/select that nothing reachable from
-  the spawning function can ever unblock. A channel that escapes the
+  the spawning function can ever unblock. A blocking op sitting one static call or `defer` below the spawned
+  callee is anchored too (one hop); deeper nesting is deliberately
+  silent. A channel that escapes the
   spawner (stored to the heap, returned, passed as an argument to any
   plain call, or captured by an untracked closure), is rooted at a
   parameter or a package-level `var`, is spawned through a dynamic
   (function-value) `go` callee rather than a named function, or has a
   non-constant/cyclically-filled buffered capacity is deliberately
   silent in v1 — see the [design
-  spec](docs/superpowers/specs/2026-07-26-phase7-goroutine-leaks-design.md)
-  for the full scope boundary.
+  spec](docs/superpowers/specs/2026-07-26-phase7-goroutine-leaks-design.md) and the [one-hop anchoring spec](docs/superpowers/specs/2026-07-27-nested-helper-anchoring-design.md) for the full scope boundary.
 
 ```go
 func leaks() {

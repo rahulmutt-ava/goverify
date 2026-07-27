@@ -124,6 +124,17 @@ rule). All lookups bounds-checked, total, panic-free; unmapped shapes
 yield no candidate. Scan order is fully index-ordered in both frames —
 no map iteration reaches the output.
 
+**Implementation amendment (Task 4):** the hop-site mapping is
+`map_through_hop`, which adds one rule `map_through_site` doesn't
+have: a base rooted at a *g-local* `Alloc` cell is bridged through
+the cell's single stored value when that value canonically resolves
+to a `Param`/`FreeVar` of `g` (mirroring `cap_of`'s cell form, one
+level only — nested cells degrade to Unknown). Without it the
+deferred-closure shape (§1's `doCall$1`) dead-ends: go/ssa spills a
+closure-captured param to a cell and binds the cell, so the naive
+mapping roots at Alloc-in-`g` and degrades. Two stores into the cell,
+or non-Param/FreeVar content, degrade to Unknown as before.
+
 ## 4. Obligation query
 
 A hop candidate's query is a **three-frame conjunction** (the direct

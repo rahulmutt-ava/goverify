@@ -1514,7 +1514,7 @@ git commit -m "phase7: x/sync concurrency shakeout pin + gates record"
 - Phase C data races (lock-set over Effects; `DeferredUnlock` + captured-mutex Locs now ready).
 - Buffered-cyclic send counting (loop-bound reasoning).
 - Param-rooted channels via caller-side obligation placement.
-- Nested-helper blocking ops (cross-function obligation anchoring — Task 10 amendment 2).
+- ~~Nested-helper blocking ops (cross-function obligation anchoring — Task 10 amendment 2).~~ SHIPPED 2026-07-27 (one hop): docs/superpowers/specs/2026-07-27-nested-helper-anchoring-design.md.
 - Escape rule: stop treating args-to-summarized-callees as escapes once effects model param stores (Task 10 amendment 1).
 - Counterpart flow-sensitivity (path-aware matching — the spec §2 documented FN class).
 - `ChanOp::Select` direction refinement in effects (direction-blind today; v1 selects are conservative both ways).

@@ -145,3 +145,74 @@ func LeakSelectAllBlocked() {
 		}
 	}()
 }
+
+// Reported (one hop, plain call): the bbolt (*Tx).check shape — every
+// send lives in a helper the goroutine calls.
+func LeakHelperSend() {
+	ch := make(chan int)
+	go spawnHelperSend(ch) // want: chan-send-leak
+}
+
+func spawnHelperSend(c chan int) { helperSend(c) }
+
+func helperSend(c chan int) { c <- 1 }
+
+// Reported (one hop, deferred call): the errgroup (*Group).done shape —
+// the recv is reached through a defer in the spawned callee.
+func LeakDeferHelperRecv() {
+	ch := make(chan int)
+	go spawnDeferRecv(ch) // want: chan-recv-leak
+}
+
+func spawnDeferRecv(c chan int) { defer helperRecv(c) }
+
+func helperRecv(c chan int) { <-c }
+
+// Reported (one hop, deferred closure): the singleflight doCall$1
+// shape — the send lives in a closure the spawned callee defers; the
+// captured param spills to a cell the hop mapping's single-store
+// bridge resolves.
+func LeakDeferClosureSend() {
+	ch := make(chan int)
+	go spawnDeferClosure(ch) // want: chan-send-leak
+}
+
+func spawnDeferClosure(c chan int) {
+	defer func() { c <- 1 }()
+}
+
+// Silent: the hop candidate's counterpart recv exists in the spawner
+// (rule 3 consults summarized helper ops — nothing hop-specific).
+func NoLeakHelperPaired() int {
+	ch := make(chan int)
+	go spawnHelperSend(ch)
+	return <-ch
+}
+
+// Silent (v1 boundary pin — a REAL leak the one-hop rule cannot see):
+// the blocking send is two calls below the spawned callee. Tripwire
+// for any future depth change (spec §10 "depth ≥ 2 anchoring").
+func SilentHelperDepth2() {
+	ch := make(chan int)
+	go depth2Spawnee(ch)
+}
+
+func depth2Spawnee(c chan int) { depth2Mid(c) }
+
+func depth2Mid(c chan int) { helperSend(c) }
+
+// Silent (v1 boundary pin — a REAL leak, documented): a buffered-const
+// send via a hop never gets the ordinal fill-count argument (spec
+// §5.1), so the second helper call's send — genuinely blocked, cap 1,
+// two sends, no drain — stays silent.
+func SilentHelperBuffered() {
+	ch := make(chan int, 1)
+	go bufSpawnee(ch)
+}
+
+func bufSpawnee(c chan int) {
+	bufHelper(c)
+	bufHelper(c)
+}
+
+func bufHelper(c chan int) { c <- 1 }

@@ -2726,6 +2726,48 @@ mod tests {
         );
     }
 
+    /// The three-frame conjoined query end to end: F spawns G, G calls H,
+    /// H sends on F's channel — a real Z3 must find the composed path Sat.
+    #[test]
+    fn hop_send_reports_via_z3() {
+        let p = hop_send_pkg(hop_f_blocks(), 0);
+        let findings = run_leak(&p);
+        assert_eq!(findings.len(), 1, "exactly one finding: {findings:?}");
+        assert_eq!(findings[0].checker, "goroutine-leak");
+        assert_eq!(findings[0].tag, "chan-send-leak");
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(
+            findings[0].message.contains("in helper t.H"),
+            "message names the helper: {}",
+            findings[0].message
+        );
+    }
+
+    /// Rule 3 through the hop: a receive in the spawning environment
+    /// unblocks the helper's send — silent (the counterpart env already
+    /// contains helper ops via effects rebasing; nothing hop-specific).
+    #[test]
+    fn hop_send_suppressed_when_spawner_recvs() {
+        let p = hop_send_pkg(
+            vec![block(
+                0,
+                vec![
+                    gvir_make_chan(2, 1),
+                    go_call_args("t.G", vec![2]),
+                    recv(3, 2),
+                    ret(vec![]),
+                ],
+                vec![],
+            )],
+            0,
+        );
+        let findings = run_leak(&p);
+        assert!(
+            findings.is_empty(),
+            "spawner recv unblocks the helper send: {findings:?}"
+        );
+    }
+
     /// The buffered-capacity ordinal conjunct: cap 3, four sends on the
     /// channel in one acyclic callee block. The first three fit in the
     /// buffer (pending < cap ⇒ the conjunct is false ⇒ Unsat ⇒ silent);

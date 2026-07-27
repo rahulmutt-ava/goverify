@@ -75,10 +75,11 @@ pub(crate) struct Candidate {
     /// Block index of the blocking op in the op's host frame (the spawned
     /// callee, or `hop.helper` for a hop candidate).
     pub op_block: usize,
-    /// Instruction index of the blocking op within `op_block` — the
-    /// buffered-send ordinal conjunct counts the sends that precede the
-    /// candidate inside its own block, so it needs the offset, not just
-    /// the block.
+    /// Instruction index of the blocking op within `op_block`, in the op's
+    /// host frame (the spawned callee, or `hop.helper` for a hop
+    /// candidate) — the buffered-send ordinal conjunct counts the sends
+    /// that precede the candidate inside its own block, so it needs the
+    /// offset, not just the block.
     pub op_instr: usize,
     pub kind: CandKind,
     /// The blocking op's channel resolved in the op's host frame (the
@@ -1066,7 +1067,9 @@ fn ordinal_conjunct(
 
 /// The obligation tag/message pair for a candidate's shape. Position-free
 /// by construction (`Obligation::message`'s invariant): the callee's name
-/// is deterministic and independent of where it sits in the file.
+/// is deterministic and independent of where it sits in the file. For a
+/// hop candidate, the message also embeds `hop.helper`'s name (`" in
+/// helper {name}"`), equally deterministic and position-free.
 fn tag_and_message(p: &Program, cand: &Candidate) -> (&'static str, String) {
     let callee = p.func_name(cand.callee);
     let via = match &cand.hop {
@@ -1223,6 +1226,10 @@ impl Checker for LeakChecker {
                     conjoin(enc_f.reach_query(cand.go_block, pre_f.clone()), cq)
                 }
                 Some(hop) => {
+                    debug_assert!(
+                        !matches!(class, CapClass::BufferedConst(_)),
+                        "cap_class must never hand a hop candidate BufferedConst (spec 5.1 gate)"
+                    );
                     // Three-frame conjunction (spec §4): f reaches the
                     // go site ∧ g reaches the call/defer site ∧ h
                     // reaches the op, each frame prefix-renamed apart.

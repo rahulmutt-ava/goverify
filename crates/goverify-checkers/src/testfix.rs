@@ -496,7 +496,6 @@ pub(crate) fn defer_call_args(target: &str, args: Vec<u32>) -> gvir::Instruction
 /// `defer <closure>()` where `<target>` is invoked through a
 /// `MakeClosure` register — mirrors `go_call_via_closure`: operands are
 /// just `[closure_register]`, bindings carried by the MakeClosure site.
-#[allow(dead_code)]
 pub(crate) fn defer_call_via_closure(target: &str, closure_register: u32) -> gvir::Instruction {
     gvir::Instruction {
         operands: vec![closure_register],

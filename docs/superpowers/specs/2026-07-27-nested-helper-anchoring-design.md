@@ -114,7 +114,6 @@ roots at a `g`-local `Alloc` after the first mapping, which the second
 mapping degrades to `Unknown` — so goroutine-internal channels drop
 out, as today.
 
-
 **Implementation amendment (Task 4):** the hop-site mapping is
 `map_through_hop`, which adds one rule `map_through_site` doesn't
 have: a base rooted at a *g-local* `Alloc` cell is bridged through
@@ -135,7 +134,6 @@ to map to `Root::Alloc` in `f` through both hops (mirror of the direct
 rule). All lookups bounds-checked, total, panic-free; unmapped shapes
 yield no candidate. Scan order is fully index-ordered in both frames —
 no map iteration reaches the output.
-
 
 ## 4. Obligation query
 
